@@ -42,23 +42,20 @@ class GitBackupConfig:
     token_file: Path | None
     ref_prefix: str = "opendraft"
     ca_bundle: Path | None = None
+    allow_insecure_http: bool = False
 
     @classmethod
     def from_env(cls) -> "GitBackupConfig":
-        enabled_value = os.environ.get(
-            "OPENDRAFT_GIT_BACKUP_ENABLED", ""
-        ).strip().lower()
-        if enabled_value not in _TRUE_VALUES | _FALSE_VALUES:
-            raise GitBackupConfigError(
-                "OPENDRAFT_GIT_BACKUP_ENABLED must be a boolean value"
-            )
         token_file = os.environ.get("OPENDRAFT_GIT_BACKUP_TOKEN_FILE", "").strip()
         ca_bundle = os.environ.get("OPENDRAFT_GIT_BACKUP_CA_BUNDLE", "").strip()
         return cls(
-            enabled=enabled_value in _TRUE_VALUES,
+            enabled=_read_bool_env("OPENDRAFT_GIT_BACKUP_ENABLED"),
             remote_url=os.environ.get("OPENDRAFT_GIT_BACKUP_URL", "").strip(),
             username=os.environ.get("OPENDRAFT_GIT_BACKUP_USERNAME", "").strip(),
             token_file=Path(token_file) if token_file else None,
+            allow_insecure_http=_read_bool_env(
+                "OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP"
+            ),
             ref_prefix=os.environ.get(
                 "OPENDRAFT_GIT_BACKUP_REF_PREFIX", "opendraft"
             ).strip(),
@@ -71,9 +68,14 @@ class GitBackupConfig:
             return
 
         parsed = urlsplit(self.remote_url)
-        if parsed.scheme != "https" or not parsed.hostname:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise GitBackupConfigError(
-                "OPENDRAFT_GIT_BACKUP_URL must be an absolute HTTPS URL"
+                "OPENDRAFT_GIT_BACKUP_URL must be an absolute HTTP(S) URL"
+            )
+        if parsed.scheme == "http" and not self.allow_insecure_http:
+            raise GitBackupConfigError(
+                "HTTP Git backup requires "
+                "OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP=true"
             )
         if parsed.username or parsed.password:
             raise GitBackupConfigError(
@@ -137,6 +139,13 @@ def _read_token(token_file: Path) -> str:
     return token
 
 
+def _read_bool_env(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value not in _TRUE_VALUES | _FALSE_VALUES:
+        raise GitBackupConfigError(f"{name} must be a boolean value")
+    return value in _TRUE_VALUES
+
+
 def _ref_component(value: str) -> str:
     """Return a readable, collision-resistant safe Git ref component."""
     raw = value.strip()
@@ -170,7 +179,11 @@ def _redact_error(exc: Exception, token: str = "") -> str:
     text = str(exc)
     if token:
         text = text.replace(token, "[REDACTED]")
-    text = re.sub(r"https://[^/@\s]+:[^/@\s]+@", "https://[REDACTED]@", text)
+    text = re.sub(
+        r"https?://[^/@\s]+:[^/@\s]+@",
+        "https://[REDACTED]@",
+        text,
+    )
     return text[:500]
 
 

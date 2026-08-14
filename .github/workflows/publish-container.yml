@@ -8,6 +8,9 @@ on:
         required: true
         default: latest
         type: string
+  push:
+    tags:
+      - container-*
 
 permissions:
   contents: read
@@ -53,6 +56,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ inputs.tag || 'latest' }}
+            type=ref,event=tag
             type=sha,format=short
 
       - name: Build and push

@@ -47,14 +47,35 @@ class GitBackupTests(unittest.TestCase):
         result = push_project(Path("/unused"), "user", "film", config=config)
         self.assertEqual(result["status"], "disabled")
 
-    def test_requires_https_and_credential_free_url(self):
+    def test_http_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config, _ = self.make_config(
+                root,
+                remote_url="http://gitea.internal/backup.git",
+            )
+            with self.assertRaises(GitBackupConfigError):
+                config.validate()
+
+            opted_in, _ = self.make_config(
+                root,
+                remote_url="http://gitea.internal/backup.git",
+                allow_insecure_http=True,
+            )
+            opted_in.validate()
+
+    def test_url_rejects_credentials_and_unsupported_schemes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             for url in (
-                "http://gitea.example.test/backup.git",
                 "https://user:secret@gitea.example.test/backup.git",
+                "ftp://gitea.example.test/backup.git",
             ):
-                config, _ = self.make_config(root, remote_url=url)
+                config, _ = self.make_config(
+                    root,
+                    remote_url=url,
+                    allow_insecure_http=True,
+                )
                 with self.assertRaises(GitBackupConfigError):
                     config.validate()
 
@@ -67,6 +88,15 @@ class GitBackupTests(unittest.TestCase):
             with self.assertRaises(GitBackupConfigError):
                 GitBackupConfig.from_env()
 
+    def test_invalid_insecure_http_value_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {"OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP": "sometimes"},
+            clear=True,
+        ):
+            with self.assertRaises(GitBackupConfigError):
+                GitBackupConfig.from_env()
+
     def test_enabled_value_is_trimmed_and_case_insensitive(self):
         with patch.dict(
             os.environ,
@@ -74,6 +104,16 @@ class GitBackupTests(unittest.TestCase):
             clear=True,
         ):
             self.assertTrue(GitBackupConfig.from_env().enabled)
+
+    def test_insecure_http_opt_in_is_trimmed_and_case_insensitive(self):
+        with patch.dict(
+            os.environ,
+            {"OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP": " True "},
+            clear=True,
+        ):
+            self.assertTrue(
+                GitBackupConfig.from_env().allow_insecure_http
+            )
 
     def test_ref_is_scoped_by_user_and_project(self):
         config = GitBackupConfig(False, "", "", None)

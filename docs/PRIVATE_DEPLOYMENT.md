@@ -97,6 +97,7 @@ Add this to **deploy/.env**:
 ~~~dotenv
 OPENDRAFT_GIT_BACKUP_ENABLED=true
 OPENDRAFT_GIT_BACKUP_URL=https://gitea.example.com/film/opendraft-backups.git
+OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP=false
 OPENDRAFT_GIT_BACKUP_USERNAME=opendraft-backup
 OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE=/secure/path/opendraft-gitea-token
 OPENDRAFT_GIT_BACKUP_REF_PREFIX=opendraft
@@ -122,9 +123,15 @@ does not roll back the local checkpoint; the UI reports that the version is
 local-only. Running Check In again, even with no new changes, retries the
 backup.
 
-Only use an HTTPS Gitea URL. For a private certificate authority, set
+HTTPS is required by default. For a private certificate authority, set
 **OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE** to a full CA bundle. The
 deployment script mounts it read-only and configures the backend to use it.
+
+After verifying that Gitea and OpenDraft communicate only over an isolated,
+trusted local transport, an operator can explicitly set
+**OPENDRAFT_GIT_BACKUP_ALLOW_INSECURE_HTTP=true** and use an **http://** URL.
+This sends the repository token without transport encryption, so never enable
+it for traffic that crosses an untrusted host or network.
 
 ## Account deletion and backup retention
 
