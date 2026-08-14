@@ -66,7 +66,10 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-opendraft-collab}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-opendraft-backend}
+      JWT_ACCESS_EXPIRY: ${JWT_ACCESS_EXPIRY:-15m}
+      JWT_REFRESH_EXPIRY: ${JWT_REFRESH_EXPIRY:-7d}
       APP_URL: https://${DEMO_HOST}
+      LOCAL_LOGIN_ENABLED: ${LOCAL_LOGIN_ENABLED:-true}
       LOCAL_REGISTRATION_ENABLED: ${LOCAL_REGISTRATION_ENABLED:-true}
       # Safe here because collab is only exposed inside the Caddy network.
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-loopback,linklocal,uniquelocal}

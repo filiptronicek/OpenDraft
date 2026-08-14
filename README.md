@@ -270,8 +270,9 @@ cd OpenDraft
 
 Installs dependencies, builds the app, and opens it at **http://localhost:8000**.
 
-For a private Docker deployment with local accounts and optional Gitea checkpoint
-mirroring, see [Private OpenDraft deployment](docs/PRIVATE_DEPLOYMENT.md).
+For a private Docker deployment with local or OpenID Connect accounts and
+optional Gitea checkpoint mirroring, see
+[Private OpenDraft deployment](docs/PRIVATE_DEPLOYMENT.md).
 
 Requires Python 3.12+, Node.js 18+, and Git. See [docs/INSTALLATION.md](docs/INSTALLATION.md) for details.
 

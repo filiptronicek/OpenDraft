@@ -10,12 +10,30 @@ import * as deviceService from '../services/deviceService';
 import * as passwordResetService from '../services/passwordResetService';
 import type { DeviceInfo } from '../services/deviceService';
 import { requireAuth } from '../middleware/auth';
-import { strictLimiter, veryStrictLimiter } from '../middleware/rateLimit';
+import {
+  oidcCallbackLimiter,
+  oidcExchangeLimiter,
+  oidcStartLimiter,
+  strictLimiter,
+  veryStrictLimiter,
+} from '../middleware/rateLimit';
 import { config } from '../config';
 import { accountLifecycle } from '../services/accountLifecycle';
 import { revokeOwnedCollaborationSessions } from '../services/collaborationSessionService';
+import { OidcClientService } from '../services/oidcClientService';
+import {
+  clearOidcTransactionCookie,
+  OIDC_HANDOFF_TTL_MS,
+  OIDC_TRANSACTION_COOKIE,
+  OIDC_TRANSACTION_TTL_MS,
+  oidcStateStore,
+  oidcTransactionCookie,
+  parseCookie,
+  safeReturnTo,
+} from '../services/oidcStateService';
 
 const router = Router();
+const oidcClient = config.oidc ? new OidcClientService(config.oidc) : null;
 
 // ── Validation schemas ──
 
@@ -61,6 +79,11 @@ const googleLoginSchema = z.object({
   device: deviceInfoSchema,
 });
 
+const oidcExchangeSchema = z.object({
+  code: z.string().min(32).max(256),
+  device: deviceInfoSchema,
+});
+
 const verifyDeviceSchema = z.object({
   challengeId: z.string().min(8).max(128),
   code: z.string().length(6),
@@ -96,12 +119,18 @@ const deleteAccountSchema = z.object({
 
 function userResponse(user: UserRow | null) {
   if (!user) return null;
+  const authMethods: string[] = [];
+  if (user.password_hash) authMethods.push('local');
+  if (user.google_id) authMethods.push('google');
+  if (Number(user.external_identity_count || 0) > 0) authMethods.push('oidc');
   return {
     id: user.id,
     email: user.email,
     displayName: user.display_name,
     emailVerified: Boolean(user.email_verified),
     twoFactorEnabled: Boolean(user.two_factor_enabled),
+    hasPassword: Boolean(user.password_hash),
+    authMethods,
   };
 }
 
@@ -112,6 +141,12 @@ function accessTokenFor(user: UserRow): string {
     user.display_name,
     Boolean(user.email_verified),
   );
+}
+
+function isOidcOnly(user: UserRow): boolean {
+  return Number(user.external_identity_count || 0) > 0
+    && !user.password_hash
+    && !user.google_id;
 }
 
 function getClientIp(req: any): string {
@@ -129,6 +164,42 @@ function pickDeviceInfo(req: any, body: any): DeviceInfo | null {
     platform: typeof device.platform === 'string' ? device.platform : null,
     userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
     ipAddress: getClientIp(req),
+  };
+}
+
+function oidcFrontendCallback(parameters: Record<string, string>): string {
+  const callback = new URL('/auth/oidc/callback', config.appUrl);
+  for (const [name, value] of Object.entries(parameters)) {
+    callback.searchParams.set(name, value);
+  }
+  return callback.toString();
+}
+
+function oidcCallbackFailure(res: any, error: string): void {
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.redirect(302, oidcFrontendCallback({ error }));
+}
+
+async function beginOidcTransaction(input: {
+  returnTo: string;
+  linkUserId?: string | null;
+}): Promise<{ authorizationUrl: string; cookie: string }> {
+  if (!oidcClient) throw new Error('OIDC is not configured');
+  const transaction = oidcStateStore.createTransaction(
+    input.returnTo,
+    input.linkUserId || null,
+  );
+  const authorizationUrl = await oidcClient.authorizationUrl({
+    state: transaction.state,
+    nonce: transaction.nonce,
+    codeChallenge: transaction.codeChallenge,
+  });
+  return {
+    authorizationUrl,
+    cookie: oidcTransactionCookie(
+      transaction.cookieValue,
+      Math.ceil(OIDC_TRANSACTION_TTL_MS / 1000),
+    ),
   };
 }
 
@@ -226,6 +297,10 @@ router.post('/register', veryStrictLimiter, async (req, res) => {
 
 router.post('/login', strictLimiter, async (req, res) => {
   try {
+    if (!config.localLoginEnabled) {
+      res.status(403).json({ error: 'Local password login is disabled on this server' });
+      return;
+    }
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid input' });
@@ -599,6 +674,193 @@ router.post('/resend-verification', requireAuth, veryStrictLimiter, async (req, 
   }
 });
 
+// ── Generic OpenID Connect (Authorization Code + PKCE) ──
+
+router.get('/oidc/start', oidcStartLimiter, async (req, res) => {
+  if (!oidcClient) {
+    res.status(501).json({ error: 'OpenID Connect is not configured on this server' });
+    return;
+  }
+  try {
+    const started = await beginOidcTransaction({
+      returnTo: safeReturnTo(req.query.returnTo),
+    });
+    res.setHeader('Set-Cookie', started.cookie);
+    res.setHeader('Cache-Control', 'no-store');
+    res.redirect(302, started.authorizationUrl);
+  } catch (error) {
+    console.error(
+      'OIDC authorization start failed:',
+      error instanceof Error ? error.name : 'UnknownError',
+    );
+    res.status(503).json({ error: 'OpenID Connect provider is temporarily unavailable' });
+  }
+});
+
+router.post('/oidc/link/start', requireAuth, oidcStartLimiter, async (req, res) => {
+  if (!oidcClient) {
+    res.status(501).json({ error: 'OpenID Connect is not configured on this server' });
+    return;
+  }
+  try {
+    const started = await beginOidcTransaction({
+      returnTo: safeReturnTo(req.body?.returnTo),
+      linkUserId: req.user!.id,
+    });
+    res.setHeader('Set-Cookie', started.cookie);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ authorizationUrl: started.authorizationUrl });
+  } catch (error) {
+    console.error(
+      'OIDC link start failed:',
+      error instanceof Error ? error.name : 'UnknownError',
+    );
+    res.status(503).json({ error: 'OpenID Connect provider is temporarily unavailable' });
+  }
+});
+
+router.get('/oidc/callback', oidcCallbackLimiter, async (req, res) => {
+  res.setHeader('Set-Cookie', clearOidcTransactionCookie());
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (!oidcClient || !config.oidc) {
+    oidcCallbackFailure(res, 'oidc_unavailable');
+    return;
+  }
+
+  const state = typeof req.query.state === 'string' && req.query.state.length <= 256
+    ? req.query.state
+    : null;
+  const cookieValue = parseCookie(req.headers.cookie, OIDC_TRANSACTION_COOKIE);
+  const transaction = state
+    ? oidcStateStore.consumeTransaction(state, cookieValue)
+    : null;
+  if (!state || !transaction) {
+    oidcCallbackFailure(res, 'invalid_state');
+    return;
+  }
+  if (typeof req.query.error === 'string') {
+    oidcCallbackFailure(res, 'provider_error');
+    return;
+  }
+  const code = typeof req.query.code === 'string' && req.query.code.length <= 4096
+    ? req.query.code
+    : null;
+  if (!code) {
+    oidcCallbackFailure(res, 'invalid_response');
+    return;
+  }
+
+  try {
+    const identity = await oidcClient.verifyCallback({
+      code,
+      state,
+      nonce: transaction.nonce,
+      codeVerifier: transaction.codeVerifier,
+    });
+    const user = transaction.linkUserId
+      ? await userService.linkExternalIdentity(transaction.linkUserId, identity)
+      : await userService.findOrCreateExternalUser(identity);
+    if (transaction.linkUserId) {
+      await auditService.logEvent(
+        'oidc_link',
+        user.id,
+        null,
+        { issuer: identity.issuer },
+        getClientIp(req),
+      );
+    }
+    const handoff = oidcStateStore.createHandoff(user.id, transaction.returnTo);
+    // Rotate the browser binding: possession of a handoff URL alone is not
+    // sufficient to redeem OpenDraft credentials.
+    res.setHeader(
+      'Set-Cookie',
+      oidcTransactionCookie(
+        handoff.cookieValue,
+        Math.ceil(OIDC_HANDOFF_TTL_MS / 1000),
+      ),
+    );
+    res.redirect(302, oidcFrontendCallback({ code: handoff.code }));
+  } catch (error) {
+    // Never forward provider errors, codes, or token details to the browser.
+    console.error(
+      'OIDC callback failed:',
+      error instanceof Error ? error.name : 'UnknownError',
+    );
+    if (error instanceof userService.ExternalIdentityEmailConflictError) {
+      oidcCallbackFailure(res, 'account_link_required');
+      return;
+    }
+    if (error instanceof userService.ExternalIdentityAlreadyLinkedError) {
+      oidcCallbackFailure(res, 'identity_already_linked');
+      return;
+    }
+    if (error instanceof userService.ExternalIdentityEmailMismatchError) {
+      oidcCallbackFailure(res, 'link_email_mismatch');
+      return;
+    }
+    oidcCallbackFailure(res, 'authentication_failed');
+  }
+});
+
+router.post('/oidc/exchange', oidcExchangeLimiter, async (req, res) => {
+  res.setHeader('Set-Cookie', clearOidcTransactionCookie());
+  res.setHeader('Cache-Control', 'no-store');
+  if (!oidcClient) {
+    res.status(501).json({ error: 'OpenID Connect is not configured on this server' });
+    return;
+  }
+  const parsed = oidcExchangeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid input' });
+    return;
+  }
+  const bindingCookie = parseCookie(req.headers.cookie, OIDC_TRANSACTION_COOKIE);
+  const handoff = oidcStateStore.consumeHandoff(parsed.data.code, bindingCookie);
+  if (!handoff) {
+    res.status(400).json({ error: 'Invalid or expired sign-in code' });
+    return;
+  }
+
+  try {
+    const user = await userService.findUserById(handoff.userId);
+    if (!user) {
+      res.status(400).json({ error: 'Invalid or expired sign-in code' });
+      return;
+    }
+    const deviceInfo = pickDeviceInfo(req, parsed.data);
+    // Authentik is authoritative for MFA. A device supplied after a successful
+    // OIDC flow is trusted without invoking OpenDraft's email challenge.
+    if (deviceInfo) {
+      await deviceService.recordTrustedDevice(user.id, deviceInfo);
+    }
+    const accessToken = accessTokenFor(user);
+    const { token: refreshToken } = await tokenService.generateRefreshToken(
+      user.id,
+      deviceInfo?.deviceId ?? null,
+    );
+    await auditService.logEvent(
+      'oidc_login',
+      user.id,
+      null,
+      null,
+      getClientIp(req),
+    );
+    res.json({
+      user: userResponse(user),
+      accessToken,
+      refreshToken,
+      returnTo: handoff.returnTo,
+    });
+  } catch (error) {
+    console.error(
+      'OIDC handoff exchange failed:',
+      error instanceof Error ? error.name : 'UnknownError',
+    );
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.post('/google', strictLimiter, async (req, res) => {
   try {
     if (!config.googleClientId) {
@@ -671,8 +933,11 @@ router.get('/me', requireAuth, async (req, res) => {
 // Return whether Google login is available (for frontend UI)
 router.get('/config', (req, res) => {
   res.json({
+    localLoginEnabled: config.localLoginEnabled,
     localRegistrationEnabled: config.localRegistrationEnabled,
     googleEnabled: Boolean(config.googleClientId),
+    oidcEnabled: Boolean(config.oidc),
+    oidcDisplayName: config.oidc?.displayName || '',
     emailVerificationRequired: Boolean(config.smtpHost),
     // Whether outbound email is wired up. UI gates 2FA on this — without
     // SMTP, the new-device code can't be delivered, so enabling it would
@@ -697,10 +962,7 @@ router.post('/change-password', requireAuth, veryStrictLimiter, async (req, res)
     }
 
     if (!user.password_hash) {
-      // Google-only account: no password to change. The user can set one by
-      // signing out and going through the "Forgot password" flow, which
-      // accepts a Google-linked account and writes a password_hash.
-      res.status(400).json({ error: 'This account does not use a password (signed in with Google).' });
+      res.status(400).json({ error: 'This account does not use a local password.' });
       return;
     }
 
@@ -785,7 +1047,9 @@ router.post('/forgot-password', veryStrictLimiter, async (req, res) => {
       'The link expires in 30 minutes.';
 
     const user = await userService.findUserByEmail(parsed.data.email);
-    if (user) {
+    // Recovery for OIDC-only users belongs to the identity provider. Keep the
+    // same generic response so this does not reveal account or auth methods.
+    if (user && !isOidcOnly(user)) {
       const created = await passwordResetService.createResetToken(user.id, getClientIp(req));
       try {
         await emailService.sendPasswordResetEmail(user.email, created.token, getClientIp(req));
@@ -801,12 +1065,20 @@ router.post('/forgot-password', veryStrictLimiter, async (req, res) => {
         { email: user.email },
         getClientIp(req),
       );
-    } else {
+    } else if (!user) {
       await auditService.logEvent(
         'password_reset_requested',
         null,
         null,
         { email: parsed.data.email, reason: 'user_not_found' },
+        getClientIp(req),
+      );
+    } else {
+      await auditService.logEvent(
+        'password_reset_requested',
+        user.id,
+        null,
+        { reason: 'managed_by_oidc_provider' },
         getClientIp(req),
       );
     }
@@ -927,6 +1199,17 @@ router.post('/two-factor', requireAuth, async (req, res) => {
     const parsed = twoFactorSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid input' });
+      return;
+    }
+    const currentUser = await userService.findUserById(req.user!.id);
+    if (!currentUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    if (isOidcOnly(currentUser)) {
+      res.status(400).json({
+        error: 'Two-factor authentication for this account is managed by the identity provider.',
+      });
       return;
     }
     // Reject enabling 2FA when outbound email isn't wired up — without it,

@@ -139,8 +139,12 @@ export function isDeviceChallenge(r: LoginResponse): r is DeviceChallengeRespons
 }
 
 export interface CollabServerConfig {
+  /** Missing on older servers and therefore treated as enabled by clients. */
+  localLoginEnabled?: boolean;
   localRegistrationEnabled: boolean;
   googleEnabled: boolean;
+  oidcEnabled: boolean;
+  oidcDisplayName: string;
   emailVerificationRequired: boolean;
   /** Whether outbound SMTP is configured. When false, 2FA cannot be enabled. */
   smtpConfigured?: boolean;
@@ -156,6 +160,11 @@ export interface DeviceRecord {
   firstSeenAt: string;
   lastSeenAt: string;
   current: boolean;
+}
+
+/** Backward compatible: local login existed before the config flag did. */
+export function isLocalLoginEnabled(config: CollabServerConfig | null | undefined): boolean {
+  return config?.localLoginEnabled !== false;
 }
 
 // ── API methods ──
@@ -224,6 +233,22 @@ export const collabAuthApi = {
     backendAuthRequest<AuthResponse>('/google', {
       method: 'POST',
       body: JSON.stringify({ idToken, device: getDeviceInfo() }),
+    }),
+
+  /** Exchange the short-lived, one-use browser handoff for normal app tokens. */
+  exchangeOidcCode: (code: string) =>
+    backendAuthRequest<AuthResponse>('/oidc/exchange', {
+      method: 'POST',
+      credentials: 'include',
+      body: JSON.stringify({ code, device: getDeviceInfo() }),
+    }),
+
+  /** Begin explicit linking for an already-authenticated local account. */
+  startOidcLink: () =>
+    backendAuthedRequest<{ authorizationUrl: string }>('/oidc/link/start', {
+      method: 'POST',
+      credentials: 'include',
+      body: JSON.stringify({ device: getDeviceInfo() }),
     }),
 
   /** Change the password for the authenticated user. Server also revokes
@@ -316,6 +341,27 @@ export const collabAuthApi = {
   revokeMyCollabSessions: () =>
     collabAuthedRequest<{ message: string }>('/api/collab/my-sessions', { method: 'DELETE' }),
 };
+
+/**
+ * Older server responses predate auth-method metadata, so absence must retain
+ * the legacy local-account UI. New external-only accounts explicitly return
+ * `hasPassword: false` or an authMethods list without a local method.
+ */
+export function hasLocalPassword(user: CollabUser | null | undefined): boolean {
+  if (!user) return false;
+  if (typeof user.hasPassword === 'boolean') return user.hasPassword;
+  if (Array.isArray(user.authMethods)) {
+    return user.authMethods.some((method) => {
+      const normalized = method.toLowerCase();
+      return normalized === 'password' || normalized === 'local';
+    });
+  }
+  return true;
+}
+
+export function isOidcUser(user: CollabUser | null | undefined): boolean {
+  return Boolean(user?.authMethods?.some((method) => method.toLowerCase() === 'oidc'));
+}
 
 // ── Helper: check if current auth is valid (token present and not expired) ──
 

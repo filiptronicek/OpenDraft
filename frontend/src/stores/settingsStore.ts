@@ -8,6 +8,10 @@ export interface CollabUser {
   emailVerified: boolean;
   /** Optional for compatibility with auth state persisted by older clients. */
   twoFactorEnabled?: boolean;
+  /** Authentication methods attached to this account (for example `password` or `oidc`). */
+  authMethods?: string[];
+  /** Explicit server signal used to hide local-password controls for SSO-only users. */
+  hasPassword?: boolean;
 }
 
 export interface CollabAuth {

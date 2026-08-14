@@ -10295,6 +10295,12 @@ html.android .version-history-panel {
   color: var(--fd-text-muted);
 }
 
+.settings-user-provider {
+  margin-top: 3px;
+  color: var(--fd-accent);
+  font-size: 12px;
+}
+
 .settings-email-unverified {
   font-size: 13px;
   color: #ffb74d;
@@ -10350,7 +10356,7 @@ html.android .version-history-panel {
 
 .settings-verify-input:focus { border-color: var(--fd-accent); }
 
-/* ── Google sign-in ── */
+/* ── External sign-in ── */
 
 .collab-remember-section {
   margin-top: 12px;
@@ -10384,8 +10390,11 @@ html.android .version-history-panel {
   border-radius: 4px;
   line-height: 1.4;
 }
-.settings-google-section {
+.settings-sso-section {
   margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .settings-divider {
@@ -10405,7 +10414,7 @@ html.android .version-history-panel {
   background: var(--fd-border);
 }
 
-.settings-google-btn {
+.settings-sso-btn {
   width: 100%;
   display: flex;
   align-items: center;
@@ -10420,8 +10429,51 @@ html.android .version-history-panel {
   cursor: pointer;
 }
 
-.settings-google-btn:hover {
+.settings-sso-btn:hover {
   background: var(--fd-toolbar-hover);
+}
+
+.settings-sso-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-provider-status {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--fd-accent);
+  background: rgba(74, 144, 226, 0.12);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.auth-callback-page {
+  min-height: 70vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-callback-card {
+  width: 100%;
+  max-width: 440px;
+  padding: 24px;
+  border: 1px solid var(--fd-border);
+  border-radius: 8px;
+  background: var(--fd-panel-bg);
+  color: var(--fd-text);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+  text-align: center;
+}
+
+.auth-callback-card h2 {
+  margin-top: 0;
+}
+
+.auth-callback-card p {
+  color: var(--fd-text-muted);
 }
 
 /* ============ ACCOUNT & SECURITY ============ */

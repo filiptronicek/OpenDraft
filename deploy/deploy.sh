@@ -40,11 +40,13 @@ done
 
 if [ "$USE_COMBINED" = "1" ]; then
   COMPOSE_FILE="docker-compose.combined.yml"
+  OIDC_COMPOSE_FILE="docker-compose.combined.oidc.yml"
   BACKUP_COMPOSE_FILE="docker-compose.combined.gitea.yml"
   BACKUP_CA_COMPOSE_FILE="docker-compose.combined.gitea-ca.yml"
   MODE_LABEL="combined image (registry pull)"
 else
   COMPOSE_FILE="docker-compose.yml"
+  OIDC_COMPOSE_FILE="docker-compose.oidc.yml"
   BACKUP_COMPOSE_FILE="docker-compose.gitea.yml"
   BACKUP_CA_COMPOSE_FILE="docker-compose.gitea-ca.yml"
   MODE_LABEL="per-service build"
@@ -82,6 +84,25 @@ for var in DEMO_HOST COLLAB_HOST ACME_EMAIL JWT_SECRET CORS_ORIGINS; do
     exit 1
   fi
 done
+
+OIDC_VALUE_COUNT=0
+for var in OIDC_ISSUER_URL OIDC_CLIENT_ID OIDC_REDIRECT_URI OIDC_CLIENT_SECRET_HOST_FILE; do
+  if [ -n "${!var:-}" ]; then
+    OIDC_VALUE_COUNT=$((OIDC_VALUE_COUNT + 1))
+  fi
+done
+if [ "$OIDC_VALUE_COUNT" -ne 0 ]; then
+  if [ "$OIDC_VALUE_COUNT" -ne 4 ]; then
+    echo "ERROR: OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_REDIRECT_URI, and OIDC_CLIENT_SECRET_HOST_FILE must be configured together"
+    exit 1
+  fi
+  if [ ! -f "$OIDC_CLIENT_SECRET_HOST_FILE" ]; then
+    echo "ERROR: OIDC client secret file does not exist: $OIDC_CLIENT_SECRET_HOST_FILE"
+    exit 1
+  fi
+  COMPOSE_ARGS+=(-f "$OIDC_COMPOSE_FILE")
+fi
+
 BACKUP_ENABLED="${OPENDRAFT_GIT_BACKUP_ENABLED:-false}"
 case "${BACKUP_ENABLED,,}" in
   1|true|yes|on)

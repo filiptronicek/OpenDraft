@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useSettingsStore } from '../stores/settingsStore';
 import {
   collabAuthApi,
+  hasLocalPassword,
+  isOidcUser,
+  isLocalLoginEnabled,
   performLogout,
   setLogoutCollabTeardown,
   setLogoutEditorReset,
@@ -41,5 +44,47 @@ describe('logout credential revocation', () => {
 
     expect(logout).toHaveBeenCalledWith('rotated-refresh');
     expect(useSettingsStore.getState().collabAuth.refreshToken).toBeNull();
+  });
+});
+
+describe('provider-aware account controls', () => {
+  const baseUser = {
+    id: 'user-1',
+    email: 'writer@example.com',
+    displayName: 'Writer',
+    emailVerified: true,
+  };
+
+  it('keeps local controls for legacy and password-linked accounts', () => {
+    expect(hasLocalPassword(baseUser)).toBe(true);
+    expect(hasLocalPassword({ ...baseUser, authMethods: ['oidc', 'password'] })).toBe(true);
+    expect(hasLocalPassword({ ...baseUser, hasPassword: true, authMethods: ['oidc'] })).toBe(true);
+  });
+
+  it('recognises an OIDC-only account without treating email as identity', () => {
+    const oidcUser = { ...baseUser, hasPassword: false, authMethods: ['oidc'] };
+    expect(isOidcUser(oidcUser)).toBe(true);
+    expect(hasLocalPassword(oidcUser)).toBe(false);
+  });
+});
+
+describe('server auth configuration compatibility', () => {
+  it('defaults local login on for older servers and honours an explicit disable', () => {
+    expect(isLocalLoginEnabled(null)).toBe(true);
+    expect(isLocalLoginEnabled({
+      localRegistrationEnabled: false,
+      googleEnabled: false,
+      oidcEnabled: true,
+      oidcDisplayName: 'Authentik',
+      emailVerificationRequired: false,
+    })).toBe(true);
+    expect(isLocalLoginEnabled({
+      localLoginEnabled: false,
+      localRegistrationEnabled: false,
+      googleEnabled: false,
+      oidcEnabled: true,
+      oidcDisplayName: 'Authentik',
+      emailVerificationRequired: false,
+    })).toBe(false);
   });
 });

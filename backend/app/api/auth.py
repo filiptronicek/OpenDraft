@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -30,7 +31,13 @@ router = APIRouter()
 # The collab server uses x-device-id for the current-device flag and User-Agent
 # for new-device records and security notices.
 _FORWARD_REQUEST_HEADERS = {
-    "authorization", "content-type", "accept", "accept-language", "x-device-id", "user-agent",
+    "authorization",
+    "content-type",
+    "accept",
+    "accept-language",
+    "cookie",
+    "x-device-id",
+    "user-agent",
 }
 
 # Headers to forward back from collab to the client (skip hop-by-hop).
@@ -48,12 +55,52 @@ _HOP_BY_HOP = {
 }
 
 
+def _validate_redirect_location(location: str) -> None:
+    """Reject redirect targets that a browser could interpret as active data.
+
+    The identity service legitimately redirects to the configured OIDC
+    provider and back to the OpenDraft web app, so absolute HTTP(S) and local
+    relative targets are allowed. Network-path references and non-web schemes
+    are not needed by the web OIDC flow.
+    """
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in location):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Auth server returned an invalid redirect",
+        )
+
+    parsed = urlsplit(location)
+    valid_absolute = (
+        parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and "\\" not in location
+    )
+    valid_relative = (
+        bool(location)
+        and not parsed.scheme
+        and not parsed.netloc
+        and not location.startswith("//")
+        and "\\" not in location
+    )
+    if not (valid_absolute or valid_relative):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Auth server returned an invalid redirect",
+        )
+
+
 async def _proxy(
     request: Request,
     method: str,
     path: str,
 ) -> Response:
-    url = f"{COLLAB_SERVER_URL}/auth/{path}"
+    upstream_endpoint = f"{COLLAB_SERVER_URL}/auth/{path}"
+    url = httpx.URL(upstream_endpoint)
+    query = request.scope.get("query_string", b"")
+    if query:
+        url = url.copy_with(query=query)
     forward_headers = {
         k: v for k, v in request.headers.items() if k.lower() in _FORWARD_REQUEST_HEADERS
     }
@@ -70,23 +117,36 @@ async def _proxy(
                 url,
                 content=body if body else None,
                 headers=forward_headers,
+                follow_redirects=False,
             )
     except httpx.TimeoutException:
-        logger.warning("Collab server timeout on %s %s", method, url)
+        # Authorization callbacks carry short-lived codes in their query
+        # strings. Never write those values to logs.
+        logger.warning("Collab server timeout on %s %s", method, upstream_endpoint)
         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Auth server timeout")
     except httpx.RequestError as exc:
-        logger.error("Collab server unreachable at %s: %s", url, exc)
+        logger.error(
+            "Collab server unreachable at %s (%s)",
+            upstream_endpoint,
+            type(exc).__name__,
+        )
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Auth server unavailable")
 
-    resp_headers = {
-        k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP
-    }
-    return Response(
+    location = upstream.headers.get("location")
+    if location is not None:
+        _validate_redirect_location(location)
+
+    # Append headers individually so multiple Set-Cookie fields remain
+    # separate. A dict (or Headers.items()) folds them into one field, which
+    # breaks OIDC state-cookie rotation and deletion in browsers.
+    response = Response(
         content=upstream.content,
         status_code=upstream.status_code,
-        headers=resp_headers,
-        media_type=upstream.headers.get("content-type"),
     )
+    for key, value in upstream.headers.multi_items():
+        if key.lower() not in _HOP_BY_HOP:
+            response.headers.append(key, value)
+    return response
 
 
 @router.post("/register")
@@ -128,6 +188,33 @@ async def logout(request: Request) -> Response:
 @router.post("/google")
 async def google_login(request: Request) -> Response:
     return await _proxy(request, "POST", "google")
+
+
+@router.get("/oidc/start")
+async def oidc_start(request: Request) -> Response:
+    """Start the server-owned OIDC authorization-code flow."""
+    return await _proxy(request, "GET", "oidc/start")
+
+
+@router.get("/oidc/callback")
+async def oidc_callback(request: Request) -> Response:
+    """Forward the provider callback, including code, state, and flow cookie."""
+    return await _proxy(request, "GET", "oidc/callback")
+
+
+@router.post("/oidc/exchange")
+async def oidc_exchange(request: Request) -> Response:
+    """Exchange a single-use OIDC handoff code for OpenDraft tokens."""
+    return await _proxy(request, "POST", "oidc/exchange")
+
+
+@router.post("/oidc/link/start")
+async def oidc_link_start(
+    request: Request,
+    _user: AuthUser = Depends(require_user),
+) -> Response:
+    """Start an OIDC flow that links to the authenticated OpenDraft account."""
+    return await _proxy(request, "POST", "oidc/link/start")
 
 
 @router.get("/config")

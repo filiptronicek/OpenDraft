@@ -25,7 +25,10 @@ os.environ["COLLAB_JWT_AUDIENCE"] = "opendraft-backend"
 os.environ["COLLAB_DB_PATH"] = ""
 
 import jwt  # noqa: E402
+import httpx  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from fastapi.security import HTTPAuthorizationCredentials  # noqa: E402
+from starlette.requests import Request  # noqa: E402
 
 import app.dependencies as auth_dependencies  # noqa: E402
 import app.api.auth as auth_api  # noqa: E402
@@ -255,6 +258,214 @@ def test_auth_proxy_forwards_browser_device_context():
     print("  ok: auth proxy forwards browser device context")
 
 
+def _make_request(
+    *,
+    method: str = "GET",
+    query: bytes = b"",
+    headers: list[tuple[bytes, bytes]] | None = None,
+    body: bytes = b"",
+) -> Request:
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "https",
+            "path": "/api/auth/oidc/callback",
+            "raw_path": b"/api/auth/oidc/callback",
+            "query_string": query,
+            "root_path": "",
+            "headers": headers or [],
+            "client": ("203.0.113.17", 43210),
+            "server": ("scripts.example.test", 443),
+        },
+        receive,
+    )
+
+
+def _run_proxy_with_response(
+    request: Request,
+    upstream: httpx.Response,
+    path: str = "oidc/callback",
+):
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            captured.update({"method": method, "url": url, **kwargs})
+            return upstream
+
+    original_client = auth_api.httpx.AsyncClient
+    auth_api.httpx.AsyncClient = FakeAsyncClient
+    try:
+        response = asyncio.run(auth_api._proxy(request, request.method, path))
+    finally:
+        auth_api.httpx.AsyncClient = original_client
+    return response, captured
+
+
+def test_oidc_proxy_preserves_query_cookie_redirect_and_set_cookie_headers():
+    query = b"code=a%2Fb&state=x+y&scope=openid&scope=email"
+    request = _make_request(
+        query=query,
+        headers=[
+            (b"cookie", b"opendraft_oidc_state=state-cookie"),
+            (b"user-agent", b"OpenDraft proxy test"),
+            (b"x-not-forwarded", b"internal-value"),
+        ],
+    )
+    cookies = [
+        "opendraft_oidc_state=; Path=/api/auth/oidc; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        "opendraft_oidc_flow=next; Path=/api/auth/oidc; HttpOnly; Secure; SameSite=Lax",
+    ]
+    upstream = httpx.Response(
+        302,
+        headers=[
+            ("location", "https://scripts.example.test/auth/callback?handoff=one-time"),
+            ("set-cookie", cookies[0]),
+            ("set-cookie", cookies[1]),
+            ("connection", "keep-alive"),
+            ("content-type", "text/plain"),
+        ],
+        content=b"redirecting",
+    )
+
+    response, captured = _run_proxy_with_response(request, upstream)
+
+    assert captured["method"] == "GET"
+    assert captured["url"].query == query
+    assert captured["headers"]["cookie"] == "opendraft_oidc_state=state-cookie"
+    assert captured["headers"]["user-agent"] == "OpenDraft proxy test"
+    assert captured["headers"]["x-forwarded-for"] == "203.0.113.17"
+    assert "x-not-forwarded" not in captured["headers"]
+    assert captured["follow_redirects"] is False
+    assert response.status_code == 302
+    assert response.headers["location"] == (
+        "https://scripts.example.test/auth/callback?handoff=one-time"
+    )
+    assert response.headers.getlist("set-cookie") == cookies
+    assert "connection" not in response.headers
+    assert response.body == b"redirecting"
+    print("  ok: OIDC proxy preserves query, cookies, and redirect response")
+
+
+def test_auth_proxy_rejects_non_web_redirects():
+    for location in (
+        "javascript:alert(document.domain)",
+        "data:text/html,unsafe",
+        "//attacker.example/redirect",
+        "////attacker.example/redirect",
+        "\\\\attacker.example\\redirect",
+        "/\\attacker.example/redirect",
+        "https://user:password@safe.example/redirect",
+        "https://safe.example/\nunsafe",
+    ):
+        request = _make_request()
+        upstream = httpx.Response(302, headers={"location": location})
+        try:
+            _run_proxy_with_response(request, upstream)
+        except HTTPException as exc:
+            assert exc.status_code == 502
+        else:
+            raise AssertionError(f"unsafe redirect was forwarded: {location!r}")
+    print("  ok: auth proxy rejects non-web redirects")
+
+
+def test_oidc_link_start_forwards_authenticated_browser_context():
+    body = b'{"returnTo":"/settings"}'
+    request = _make_request(
+        method="POST",
+        headers=[
+            (b"authorization", b"Bearer opendraft-access-token"),
+            (b"content-type", b"application/json"),
+            (b"cookie", b"existing_session=context"),
+            (b"user-agent", b"OpenDraft link test"),
+            (b"x-device-id", b"browser-device-1"),
+        ],
+        body=body,
+    )
+    state_cookie = (
+        "opendraft_oidc_state=link-state; Path=/api/auth/oidc; "
+        "HttpOnly; Secure; SameSite=Lax"
+    )
+    upstream = httpx.Response(
+        200,
+        headers=[("content-type", "application/json"), ("set-cookie", state_cookie)],
+        content=b'{"authorizationUrl":"https://auth.example/authorize"}',
+    )
+
+    response, captured = _run_proxy_with_response(
+        request,
+        upstream,
+        "oidc/link/start",
+    )
+
+    assert captured["method"] == "POST"
+    assert str(captured["url"]).endswith("/auth/oidc/link/start")
+    assert captured["content"] == body
+    assert captured["headers"]["authorization"] == "Bearer opendraft-access-token"
+    assert captured["headers"]["content-type"] == "application/json"
+    assert captured["headers"]["cookie"] == "existing_session=context"
+    assert captured["headers"]["user-agent"] == "OpenDraft link test"
+    assert captured["headers"]["x-device-id"] == "browser-device-1"
+    assert response.status_code == 200
+    assert response.headers.getlist("set-cookie") == [state_cookie]
+    print("  ok: OIDC account linking preserves auth and browser context")
+
+
+def test_oidc_routes_proxy_only_fixed_identity_paths():
+    calls = []
+    sentinel = object()
+
+    async def fake_proxy(request, method, path):
+        calls.append((request, method, path))
+        return sentinel
+
+    original_proxy = auth_api._proxy
+    auth_api._proxy = fake_proxy
+    requests = [object(), object(), object(), object()]
+    user = auth_service.AuthUser(
+        id="user-1",
+        email="alice@example.com",
+        display_name="Alice",
+        email_verified=True,
+    )
+    try:
+        assert asyncio.run(auth_api.oidc_start(requests[0])) is sentinel
+        assert asyncio.run(auth_api.oidc_callback(requests[1])) is sentinel
+        assert asyncio.run(auth_api.oidc_exchange(requests[2])) is sentinel
+        assert asyncio.run(auth_api.oidc_link_start(requests[3], user)) is sentinel
+    finally:
+        auth_api._proxy = original_proxy
+
+    assert calls == [
+        (requests[0], "GET", "oidc/start"),
+        (requests[1], "GET", "oidc/callback"),
+        (requests[2], "POST", "oidc/exchange"),
+        (requests[3], "POST", "oidc/link/start"),
+    ]
+    print("  ok: OIDC routes proxy only fixed identity-service paths")
+
+
 def test_me_proxies_authoritative_user_state():
     calls = []
     sentinel = object()
@@ -295,4 +506,8 @@ if __name__ == "__main__":
     test_configured_unreadable_db_fails_closed()
     test_me_proxies_authoritative_user_state()
     test_auth_proxy_forwards_browser_device_context()
+    test_oidc_proxy_preserves_query_cookie_redirect_and_set_cookie_headers()
+    test_auth_proxy_rejects_non_web_redirects()
+    test_oidc_link_start_forwards_authenticated_browser_context()
+    test_oidc_routes_proxy_only_fixed_identity_paths()
     print("All tests passed.")

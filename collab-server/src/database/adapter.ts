@@ -17,6 +17,9 @@ export interface DBAdapter {
   /** Execute raw SQL (DDL, multi-statement scripts). */
   exec(sql: string): Promise<void>;
 
+  /** Execute a group of operations atomically on one database connection. */
+  transaction<T>(operation: (db: DBAdapter) => Promise<T>): Promise<T>;
+
   /** Gracefully close all connections. */
   close(): Promise<void>;
 }

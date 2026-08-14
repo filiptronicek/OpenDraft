@@ -15,6 +15,17 @@ export interface UserRow {
   created_at: string;
   updated_at: string;
   two_factor_enabled: number;
+  external_identity_count?: number | string;
+}
+
+export interface ExternalIdentityRow {
+  id: string;
+  issuer: string;
+  subject: string;
+  user_id: string;
+  email: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface EmailVerificationRow {
@@ -111,6 +122,17 @@ const SCHEMA_SQL = `
     two_factor_enabled INTEGER DEFAULT 0
   );
 
+  CREATE TABLE IF NOT EXISTS external_identities (
+    id TEXT PRIMARY KEY,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (issuer, subject)
+  );
+
   CREATE TABLE IF NOT EXISTS email_verifications (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -192,6 +214,9 @@ const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
   CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+  CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_external_identities_issuer_subject
+    ON external_identities(issuer, subject);
   CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
   CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id);

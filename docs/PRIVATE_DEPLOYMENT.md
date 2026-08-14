@@ -1,7 +1,8 @@
 # Private OpenDraft deployment
 
-This fork supports a small self-hosted writers' room with local accounts and
-an optional private Gitea mirror for manual version checkpoints.
+This fork supports a small self-hosted writers' room with local accounts,
+generic OpenID Connect login, and an optional private Gitea mirror for manual
+version checkpoints.
 
 ## Track the source fork
 
@@ -33,8 +34,8 @@ cp .env.example .env
 
 The command **./deploy.sh --combined** requires **OPENDRAFT_IMAGE** to name an
 image built from this fork. It fails rather than falling back to the public
-upstream image, because that image does not contain this fork's auth and backup
-changes. Set **OPENDRAFT_VERSION** to a pinned tag as well.
+upstream image, because that image does not contain this fork's OIDC, auth, and
+backup changes. Set **OPENDRAFT_VERSION** to a pinned tag as well.
 
 The deployment exposes the editor at **https://DEMO_HOST**, including the
 same-origin **/collab-server** WebSocket/HTTP transport. The separate
@@ -54,7 +55,7 @@ Generate a unique **JWT_SECRET** with at least 32 random bytes and keep the
 issuer and audience identical in both services. Compose wires these values to
 the backend and collaboration server.
 
-For first boot:
+For a local-account-only first boot:
 
 1. Keep **LOCAL_REGISTRATION_ENABLED=true**.
 2. Create the accounts that should host collaboration sessions.
@@ -64,19 +65,85 @@ For first boot:
 Disabling registration is enforced by the server, not only hidden in the UI.
 Existing users can continue to sign in.
 
+`LOCAL_LOGIN_ENABLED` is a separate switch. Keep it `true` until OIDC login and
+account linking have both been tested. Setting it to `false` removes and blocks
+local password sign-in without disabling OIDC.
+
 Without SMTP, new accounts are verified automatically. With SMTP configured,
 OpenDraft requires the emailed verification code and enables password reset
 and new-device email checks. Do not set a placeholder **SMTP_HOST**: either
 configure all SMTP values or leave it unset.
-
-This milestone deliberately uses OpenDraft's local accounts. Generic OIDC is
-not included yet.
 
 Browser access and refresh tokens remain in `localStorage`. Deploy this fork
 only on a trusted TLS origin and do not install unreviewed plugins. Before
 offering it as a public multi-tenant service, move refresh tokens to Secure,
 HttpOnly, SameSite cookies, keep access tokens in memory only, and enforce a
 strict Content Security Policy.
+
+## Sign in through Authentik
+
+OpenDraft uses the OIDC Authorization Code flow with PKCE. Authentik owns
+passwords, MFA, recovery, and access policy; OpenDraft exchanges the verified
+identity for its existing short-lived application session. Authentik tokens and
+OpenDraft session tokens are never placed in a redirect URL. This first OIDC
+integration targets the hosted web app; native clients need a future system
+browser/deep-link flow.
+
+In Authentik:
+
+1. Create an **OAuth2/OpenID Provider** with client type **Confidential**.
+2. Add the strict redirect URI
+   `https://scripts.example.com/api/auth/oidc/callback`.
+3. Make the `openid`, `profile`, and `email` scope mappings available. The
+   returned email must have an `email_verified: true` claim.
+4. Create an application for that provider and apply the desired group and MFA
+   policies in Authentik.
+5. Copy the provider's issuer URL, client ID, and client secret. An Authentik
+   issuer normally resembles
+   `https://auth.example.com/application/o/opendraft/`.
+
+Store only the client secret in a root-readable host file:
+
+~~~sh
+install -m 600 /dev/null /secure/path/opendraft-oidc-client-secret
+# Edit the file and place only the client secret in it.
+~~~
+
+Then add all of these settings to `deploy/.env`:
+
+~~~dotenv
+LOCAL_LOGIN_ENABLED=true
+LOCAL_REGISTRATION_ENABLED=false
+OIDC_ISSUER_URL=https://auth.example.com/application/o/opendraft/
+OIDC_CLIENT_ID=replace-with-authentik-client-id
+OIDC_REDIRECT_URI=https://scripts.example.com/api/auth/oidc/callback
+OIDC_CLIENT_SECRET_HOST_FILE=/secure/path/opendraft-oidc-client-secret
+OIDC_DISPLAY_NAME=Authentik
+~~~
+
+`deploy.sh` validates the settings as one unit and mounts the secret read-only.
+It will not start a partially configured OIDC deployment. The issuer must use
+HTTPS in production and must exactly match the issuer in Authentik discovery
+and signed ID tokens.
+
+Do not add Authentik's forward-auth middleware in front of this deployment.
+OpenDraft is itself the OIDC relying party, and an additional proxy login gate
+can interrupt the callback and WebSocket flow.
+
+On first rollout, sign in locally, open account settings, and use **Link
+Authentik**. This explicitly attaches Authentik's stable `(issuer, subject)`
+identity to the existing OpenDraft user and preserves project ownership. An
+ordinary OIDC login never auto-links by matching email; if that email already
+belongs to a local user, OpenDraft rejects the login until the authenticated
+link flow is used. After linking and testing a fresh login in a private browser,
+`LOCAL_LOGIN_ENABLED` may be set to `false`.
+
+SMTP may remain unset for an OIDC-only deployment. Authentik must perform email
+verification before emitting `email_verified: true`; do not hard-code that
+claim to true merely to bypass verification. Disabling a user in Authentik does
+not immediately revoke an already-issued OpenDraft refresh session, so keep the
+OpenDraft refresh lifetime appropriate for the deployment and explicitly sign
+out active users during urgent revocation.
 
 ## Mirror checkpoints to Gitea
 

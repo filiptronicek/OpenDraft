@@ -46,7 +46,7 @@ WORKDIR /app
 # ── Backend (Python) ──
 COPY backend/requirements.txt ./backend-requirements.txt
 RUN grep -v pyinstaller backend-requirements.txt > backend-requirements-docker.txt \
-    && pip install --no-cache-dir -r backend-requirements-docker.txt \
+    && python -m pip install --no-cache-dir -r backend-requirements-docker.txt \
     && rm backend-requirements-docker.txt backend-requirements.txt
 
 COPY backend/app ./backend/app

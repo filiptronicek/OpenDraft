@@ -1,7 +1,13 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { registrationSetting } from './services/securityConfig';
+import {
+  appUrlSetting,
+  localLoginSetting,
+  oidcSetting,
+  type OidcSettings,
+  registrationSetting,
+} from './services/securityConfig';
 
 dotenv.config();
 
@@ -14,6 +20,7 @@ export interface ServerConfig {
   jwtAudience: string;
   jwtAccessExpiry: string;
   jwtRefreshExpiry: string;
+  localLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
   bcryptRounds: number;
   dataDir: string;
@@ -21,6 +28,7 @@ export interface ServerConfig {
   tlsKey: string | null;
   googleClientId: string | null;
   googleClientSecret: string | null;
+  oidc: OidcSettings | null;
   smtpHost: string | null;
   smtpPort: number;
   smtpUser: string | null;
@@ -63,6 +71,8 @@ function loadConfig(): ServerConfig {
     process.exit(1);
   }
 
+  const oidc = oidcSetting(process.env);
+
   return {
     host: process.env.HOST || '0.0.0.0',
     port: parseInt(process.env.PORT || '4000', 10),
@@ -76,6 +86,7 @@ function loadConfig(): ServerConfig {
     jwtAudience: process.env.JWT_AUDIENCE || 'opendraft-backend',
     jwtAccessExpiry: process.env.JWT_ACCESS_EXPIRY || '15m',
     jwtRefreshExpiry: process.env.JWT_REFRESH_EXPIRY || '7d',
+    localLoginEnabled: localLoginSetting(process.env),
     localRegistrationEnabled: registrationSetting(process.env),
     bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '12', 10),
     dataDir: process.env.DATA_DIR || path.join(__dirname, '..', 'data'),
@@ -83,13 +94,14 @@ function loadConfig(): ServerConfig {
     tlsKey: process.env.TLS_KEY || null,
     googleClientId: process.env.GOOGLE_CLIENT_ID || null,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || null,
+    oidc,
     smtpHost: process.env.SMTP_HOST || null,
     smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
     smtpUser: process.env.SMTP_USER || null,
     smtpPass: process.env.SMTP_PASS || null,
     smtpFrom: process.env.SMTP_FROM || 'noreply@opendraft.app',
-    // Base URL of the frontend — used to build magic-link verification URLs.
-    appUrl: (process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, ''),
+    // Fixed frontend origin used to build all browser-facing redirect URLs.
+    appUrl: appUrlSetting(process.env, Boolean(oidc)),
     rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || String(15 * 60 * 1000), 10),
     rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
     corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3000,http://localhost:8008,http://localhost:18321,tauri://localhost,https://tauri.localhost').split(',').map(s => s.trim()),

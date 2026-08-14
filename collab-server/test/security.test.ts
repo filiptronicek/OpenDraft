@@ -137,6 +137,10 @@ test('viewer invites map to protocol-level read-only access', () => {
 test('security-sensitive registration switches reject typos', () => {
   assert.equal(parseSecurityBoolean('FLAG', 'true', false), true);
   assert.equal(parseSecurityBoolean('FLAG', 'OFF', true), false);
+  assert.equal(registrationSetting({
+    LOCAL_LOGIN_ENABLED: 'false',
+    LOCAL_REGISTRATION_ENABLED: 'true',
+  }), false);
   assert.throws(
     () => registrationSetting({ LOCAL_REGISTRATION_ENABLED: 'flase' }),
     /LOCAL_REGISTRATION_ENABLED/,
