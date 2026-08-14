@@ -1,6 +1,7 @@
 import React from 'react';
 import type { Asset } from '../stores/assetStore';
 import { api } from '../services/api';
+import { useAuthenticatedAssetUrl } from '../hooks/useAuthenticatedAssetUrl';
 
 interface AssetViewerProps {
   asset: Asset;
@@ -9,19 +10,23 @@ interface AssetViewerProps {
 }
 
 const AssetViewer: React.FC<AssetViewerProps> = ({ asset, projectId, onClose }) => {
-  const assetUrl = api.getAssetUrl(projectId, asset.id, asset.filename);
+  const sourceUrl = api.getAssetUrl(projectId, asset.id, asset.filename);
+  const { url: assetUrl, loading, error } = useAuthenticatedAssetUrl(sourceUrl);
   const mime = asset.mime_type;
 
   const renderPreview = () => {
+    if (!assetUrl) {
+      return (
+        <div className="asset-viewer-fallback">
+          {loading ? 'Loading asset...' : error ? 'Failed to load asset' : 'Asset unavailable'}
+        </div>
+      );
+    }
     if (mime.startsWith('image/')) {
       return <img src={assetUrl} alt={asset.original_name} className="asset-viewer-image" />;
     }
     if (mime === 'application/pdf') {
-      // Use ?disposition=inline for backend URLs; asset:// protocol serves inline by default
-      const pdfUrl = assetUrl.startsWith('asset://')
-        ? assetUrl
-        : assetUrl + (assetUrl.includes('?') ? '&' : '?') + 'disposition=inline';
-      return <embed src={pdfUrl} type="application/pdf" className="asset-viewer-iframe" title={asset.original_name} />;
+      return <embed src={assetUrl} type="application/pdf" className="asset-viewer-iframe" title={asset.original_name} />;
     }
     if (mime.startsWith('audio/')) {
       return (
@@ -81,10 +86,16 @@ const TextPreview: React.FC<{ url: string }> = ({ url }) => {
   const [text, setText] = React.useState<string>('Loading...');
 
   React.useEffect(() => {
+    let active = true;
+    setText('Loading...');
     fetch(url)
-      .then((r) => r.text())
-      .then(setText)
-      .catch(() => setText('Failed to load text content'));
+      .then((response) => {
+        if (!response.ok) throw new Error(`Text asset request failed: ${response.status}`);
+        return response.text();
+      })
+      .then((value) => { if (active) setText(value); })
+      .catch(() => { if (active) setText('Failed to load text content'); });
+    return () => { active = false; };
   }, [url]);
 
   return <pre className="asset-viewer-text">{text}</pre>;

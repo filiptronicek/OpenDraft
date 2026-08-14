@@ -1,8 +1,11 @@
 import { v4 as uuidv4 } from 'uuid';
 import * as bcrypt from 'bcryptjs';
-import { getDB } from '../db';
-import type { UserRow } from '../db';
+import { getDB, type DBAdapter, type UserRow } from '../db';
 import { config } from '../config';
+
+// Precomputed once so unknown-email login attempts perform the same password
+// KDF work as wrong-password attempts without creating attacker-controlled cost.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('OpenDraft invalid login sentinel 9Z', config.bcryptRounds);
 
 export async function createUser(email: string, password: string, displayName: string): Promise<UserRow> {
   const db = getDB();
@@ -61,9 +64,9 @@ export async function findOrCreateGoogleUser(googleId: string, email: string, di
   return (await findUserById(id))!;
 }
 
-export async function verifyPassword(user: UserRow, password: string): Promise<boolean> {
-  if (!user.password_hash) return false;
-  return bcrypt.compareSync(password, user.password_hash);
+export async function verifyPassword(user: UserRow | null, password: string): Promise<boolean> {
+  const passwordHash = user?.password_hash || DUMMY_PASSWORD_HASH;
+  return bcrypt.compareSync(password, passwordHash) && Boolean(user?.password_hash);
 }
 
 export async function setEmailVerified(userId: string): Promise<void> {
@@ -99,13 +102,15 @@ export async function updatePassword(userId: string, newPassword: string): Promi
  * children first so the same code path works on databases where cascades
  * weren't defined when the table was first created (older deployments).
  *
- * The user's invite tokens (`collab_sessions.created_by`) and audit-log rows
- * are not foreign-keyed; we null/blank them out so the user cannot be
- * reidentified through them but the audit trail is preserved.
+ * Invite rows are deleted and audit rows are anonymized because neither has a
+ * foreign key to the user table.
  */
-export async function deleteUser(userId: string): Promise<void> {
-  const db = getDB();
-  await db.run('UPDATE collab_sessions SET active = 0 WHERE created_by = ?', [userId]);
+export async function deleteUser(
+  userId: string,
+  db: DBAdapter = getDB(),
+  markDeletionMayHaveOccurred?: () => void,
+): Promise<void> {
+  await db.run('DELETE FROM collab_sessions WHERE created_by = ?', [userId]);
   await db.run('DELETE FROM password_resets WHERE user_id = ?', [userId]);
   await db.run('DELETE FROM device_challenges WHERE user_id = ?', [userId]);
   await db.run('DELETE FROM user_devices WHERE user_id = ?', [userId]);
@@ -116,5 +121,9 @@ export async function deleteUser(userId: string): Promise<void> {
     "UPDATE audit_log SET user_id = NULL, detail = NULL WHERE user_id = ?",
     [userId],
   );
+  markDeletionMayHaveOccurred?.();
   await db.run('DELETE FROM users WHERE id = ?', [userId]);
+  // Owner-checked invite inserts that observed the user before DELETE finish
+  // before this final deletion; later inserts cannot select an owner row.
+  await db.run('DELETE FROM collab_sessions WHERE created_by = ?', [userId]);
 }

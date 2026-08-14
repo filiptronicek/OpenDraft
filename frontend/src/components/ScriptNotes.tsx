@@ -13,6 +13,8 @@ import { useAssetStore, type Asset } from '../stores/assetStore';
 import { useProjectStore } from '../stores/projectStore';
 import { api } from '../services/api';
 import { isTauri } from '../services/platform';
+import { useAuthenticatedAssetUrl } from '../hooks/useAuthenticatedAssetUrl';
+import { AuthenticatedAssetImage } from './AuthenticatedAssetImage';
 
 /** Open a URL in the default browser. Uses Tauri invoke on desktop, window.open on web. */
 const openInBrowser = (url: string) => {
@@ -48,6 +50,26 @@ const toEmbedUrl = (url: string): string | null => {
   m = url.match(/vimeo\.com\/(\d+)/);
   if (m) return `https://player.vimeo.com/video/${m[1]}`;
   return null;
+};
+
+const NoteAssetLink: React.FC<{
+  sourceUrl: string;
+  filename: string;
+  children: React.ReactNode;
+}> = ({ sourceUrl, filename, children }) => {
+  const { url } = useAuthenticatedAssetUrl(sourceUrl);
+  return (
+    <a
+      className="note-asset-ref note-asset-link"
+      href={url || undefined}
+      download={filename}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(event) => event.stopPropagation()}
+    >
+      {children}
+    </a>
+  );
 };
 
 
@@ -136,15 +158,15 @@ const NoteContentDisplay: React.FC<{
           if (isImg) {
             lineElements.push(
               <span key={j} className="note-asset-ref">
-                <img src={url} alt={asset.original_name} className="note-asset-thumb" loading="lazy" />
+                <AuthenticatedAssetImage src={url} alt={asset.original_name} className="note-asset-thumb" loading="lazy" />
                 <span className="note-asset-name">{part}</span>
               </span>,
             );
           } else {
             lineElements.push(
-              <a key={j} className="note-asset-ref note-asset-link" href={url} target="_blank" rel="noreferrer">
+              <NoteAssetLink key={j} sourceUrl={url} filename={asset.original_name}>
                 {part}
-              </a>,
+              </NoteAssetLink>,
             );
           }
         } else {

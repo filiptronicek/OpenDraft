@@ -196,6 +196,11 @@ export interface VersionInfo {
   message: string;
   date: string;
   author?: string;
+  backup?: {
+    status: 'disabled' | 'succeeded' | 'failed';
+    ref?: string | null;
+    message?: string | null;
+  };
 }
 
 export interface DiffResponse {
@@ -330,20 +335,26 @@ export const api = {
     }),
 
   // Collaboration (routed to collab server, not Python backend)
-  createCollabInvite: (projectId: string, scriptId: string, collaboratorName: string, role: string = 'editor', expiresInHours: number = 1, sessionNonce: string = '') =>
+  createCollabInvite: (projectId: string, scriptId: string, collaboratorName: string, role: string = 'editor', expiresInHours: number = 1) =>
     collabServerRequest<CollabSession>('/api/collab/invite', {
       method: 'POST',
-      body: JSON.stringify({ project_id: projectId, script_id: scriptId, collaborator_name: collaboratorName, role, expires_in_hours: expiresInHours, session_nonce: sessionNonce }),
+      body: JSON.stringify({ project_id: projectId, script_id: scriptId, collaborator_name: collaboratorName, role, expires_in_hours: expiresInHours }),
     }),
 
   validateCollabSession: (token: string) =>
-    collabServerRequest<CollabSession>(`/api/collab/session/${token}`),
+    collabServerRequest<CollabSession>('/api/collab/session/validate', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
 
   listCollabSessions: (projectId: string, scriptId: string) =>
     collabServerRequest<CollabSession[]>(`/api/collab/sessions/${projectId}/${scriptId}`),
 
   revokeCollabSession: (token: string) =>
-    collabServerRequest<{ message: string }>(`/api/collab/session/${token}`, { method: 'DELETE' }),
+    collabServerRequest<{ message: string }>('/api/collab/session', {
+      method: 'DELETE',
+      body: JSON.stringify({ token }),
+    }),
 
   revokeAllCollabSessions: (projectId: string, scriptId: string) =>
     collabServerRequest<{ message: string }>(`/api/collab/sessions/${projectId}/${scriptId}`, { method: 'DELETE' }),

@@ -10,13 +10,14 @@ from fastapi.responses import FileResponse
 
 import logging
 
-from app.api import scripts, auth, export, projects, versions, assets, collab, link_preview, formatting_templates, locations
+from app.api import scripts, auth, export, projects, versions, assets, link_preview, formatting_templates, locations
 from app.config import COLLAB_JWT_SECRET, PROJECTS_DIR_BASE, BASE_DIR, DEMO_MODE
 from app.dependencies import require_verified_user
 from app.middleware.user_context import UserContextMiddleware
 from app.plugins import get_plugin_routers
 from app.services.user_migration import migrate_legacy_projects
 from app.services import quota_service  # noqa: F401 — registers default quota hook
+from app.services import git_backup_service
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ async def lifespan(app: FastAPI):
     # (pre-auth) project directories into users/legacy/.
     PROJECTS_DIR_BASE.mkdir(parents=True, exist_ok=True)
     migrate_legacy_projects(PROJECTS_DIR_BASE)
+
+    # Enabled backup with an unsafe or incomplete configuration is a deploy
+    # error. A temporary Gitea outage remains non-fatal during checkpoints.
+    git_backup_service.validate_startup_config()
 
     # Auth config sanity check — make misconfiguration obvious at boot rather
     # than leaving the user to diagnose silent 401s mid-session.
@@ -84,13 +89,8 @@ app.include_router(projects.router, prefix="/api/projects", tags=["projects"], d
 app.include_router(versions.router, prefix="/api/projects", tags=["versions"], dependencies=_user_scoped)
 app.include_router(assets.router, prefix="/api/projects", tags=["assets"], dependencies=_user_scoped)
 app.include_router(locations.router, prefix="/api/projects", tags=["locations"], dependencies=_user_scoped)
-# Collab session management writes to a shared JSON file, so anonymous access
-# would let anyone invite to / revoke sessions for any project. The frontend
-# normally talks directly to the collab-server for invites; these routes are
-# kept for legacy callers and require a verified user.
-app.include_router(collab.router, prefix="/api/collab", tags=["collab"], dependencies=_user_scoped)
 
-# Not user-scoped: export stubs, link previews, shared formatting templates.
+# Export is stateless; link previews and formatting templates gate themselves.
 app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(link_preview.router, prefix="/api/link", tags=["link-preview"])
 app.include_router(formatting_templates.router, prefix="/api/formatting-templates", tags=["formatting-templates"])

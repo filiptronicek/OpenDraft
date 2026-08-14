@@ -1,8 +1,8 @@
 import * as crypto from 'crypto';
-import * as bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { getDB } from '../db';
 import type { PasswordResetRow } from '../db';
+import { secretDigest } from './secretDigest';
 
 const TOKEN_TTL_MINUTES = 30;
 
@@ -14,7 +14,7 @@ export interface CreatedResetToken {
 /**
  * Generate a single-use password-reset token for the given user.
  *
- * The raw token is high-entropy random; only its bcrypt hash is stored, so a
+ * The raw token is high-entropy random; only its SHA-256 digest is stored, so a
  * database leak doesn't yield working reset links. The caller emails the raw
  * value to the user. Previous outstanding resets for the same user are
  * invalidated so only one live link exists at a time.
@@ -38,7 +38,7 @@ export async function createResetToken(
   );
 
   const token = crypto.randomBytes(32).toString('base64url');
-  const tokenHash = bcrypt.hashSync(token, 10);
+  const tokenHash = secretDigest(token);
   const id = uuidv4();
   const expiresAt = new Date(now.getTime() + TOKEN_TTL_MINUTES * 60 * 1000).toISOString();
 
@@ -55,32 +55,24 @@ export async function createResetToken(
  * Validate a reset token and atomically mark it used. Returns the owning
  * user_id on success, or null if the token is missing/expired/already used.
  *
- * We can't index on token_hash (bcrypt salts every hash), so we iterate over
- * the live rows and bcrypt-compare — same pattern as refresh_tokens. The set
- * is bounded by the rate limiter + per-user cap, so the cost stays small.
+ * High-entropy tokens need no password KDF. Their deterministic digest permits
+ * a single indexed lookup and avoids attacker-controlled O(n) bcrypt work.
  */
 export async function consumeResetToken(rawToken: string): Promise<string | null> {
   const db = getDB();
   const now = new Date().toISOString();
 
-  const rows = await db.all<PasswordResetRow>(
-    'SELECT * FROM password_resets WHERE used = 0 AND expires_at > ?',
-    [now],
+  const row = await db.get<PasswordResetRow>(
+    `SELECT * FROM password_resets
+     WHERE token_hash = ? AND used = 0 AND expires_at > ?`,
+    [secretDigest(rawToken), now],
   );
-
-  for (const row of rows) {
-    if (bcrypt.compareSync(rawToken, row.token_hash)) {
-      // Race-safe: only succeed if the row is still unused.
-      const result = await db.run(
-        'UPDATE password_resets SET used = 1 WHERE id = ? AND used = 0',
-        [row.id],
-      );
-      if (result.changes === 0) return null;
-      return row.user_id;
-    }
-  }
-
-  return null;
+  if (!row) return null;
+  const result = await db.run(
+    'UPDATE password_resets SET used = 1 WHERE id = ? AND used = 0',
+    [row.id],
+  );
+  return result.changes === 1 ? row.user_id : null;
 }
 
 /**

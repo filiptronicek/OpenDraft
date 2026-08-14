@@ -109,32 +109,27 @@ function getCollabApiBase(): string {
 }
 
 /**
- * Make an authenticated request to the collab server.
- * Uses platformFetch to bypass WebView mixed-content restrictions on Tauri.
+ * Make an authenticated request to the collab server. authedFetch uses the
+ * Tauri-safe transport, limits credentials to trusted configured origins, and
+ * transparently rotates an expired access token before retrying once.
  */
 async function collabRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const { platformFetch } = await import('./platform');
-  const { useSettingsStore } = await import('../stores/settingsStore');
+  const { authedFetch } = await import('./authedFetch');
   const base = getCollabApiBase();
   const url = `${base}${path}`;
 
-  // Include auth token if available (collab server requires it for write operations)
-  const { collabAuth } = useSettingsStore.getState();
-  const authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (collabAuth.accessToken) {
-    authHeaders['Authorization'] = `Bearer ${collabAuth.accessToken}`;
-  }
-
   console.log(`[collabRequest] ${options?.method || 'GET'} ${url}`);
-  const res = await platformFetch(url, {
+  const res = await authedFetch(url, {
     ...options,
-    headers: { ...authHeaders, ...options?.headers },
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
     console.error(`[collabRequest] ${url} → ${res.status}: ${detail}`);
-    // Clear stale auth on 401 so the UI prompts for re-login
+    // authedFetch has already tried refresh. Clear any remaining stale auth so
+    // the UI prompts for re-login when the final response is still 401.
     if (res.status === 401) {
+      const { useSettingsStore } = await import('../stores/settingsStore');
       useSettingsStore.getState().clearCollabAuth();
     }
     throw new Error(`Collab API error ${res.status}: ${detail}`);
@@ -707,7 +702,6 @@ export async function createLocalStorage() {
       collaboratorName: string,
       role: string = 'editor',
       expiresInHours: number = 1,
-      sessionNonce: string = '',
     ): Promise<CollabSession> {
       return collabRequest<CollabSession>('/api/collab/invite', {
         method: 'POST',
@@ -717,13 +711,15 @@ export async function createLocalStorage() {
           collaborator_name: collaboratorName,
           role,
           expires_in_hours: expiresInHours,
-          session_nonce: sessionNonce,
         }),
       });
     },
 
     async validateCollabSession(token: string): Promise<CollabSession> {
-      return collabRequest<CollabSession>(`/api/collab/session/${token}`);
+      return collabRequest<CollabSession>('/api/collab/session/validate', {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      });
     },
 
     async listCollabSessions(projectId: string, scriptId: string): Promise<CollabSession[]> {
@@ -731,7 +727,10 @@ export async function createLocalStorage() {
     },
 
     async revokeCollabSession(token: string): Promise<{ message: string }> {
-      return collabRequest<{ message: string }>(`/api/collab/session/${token}`, { method: 'DELETE' });
+      return collabRequest<{ message: string }>('/api/collab/session', {
+        method: 'DELETE',
+        body: JSON.stringify({ token }),
+      });
     },
 
     async revokeAllCollabSessions(projectId: string, scriptId: string): Promise<{ message: string }> {

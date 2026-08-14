@@ -62,7 +62,14 @@ client = TestClient(app)
 
 def _auth():
     tok = jwt.encode(
-        {"sub": "alice", "email": "alice@ex.com", "type": "access", "exp": int(time.time()) + 120},
+        {
+            "iss": "opendraft-collab",
+            "aud": "opendraft-backend",
+            "sub": "alice",
+            "email": "alice@ex.com",
+            "type": "access",
+            "exp": int(time.time()) + 120,
+        },
         "sekret",
         algorithm="HS256",
     )
@@ -74,7 +81,34 @@ def main():
     r = client.post("/api/projects/", json={"name": "Test"}, headers=_auth())
     assert r.status_code == 200, r.text
 
-    # Create 3 scripts — all should succeed
+    # Neither a linked project/scripts directory nor linked metadata files may
+    # inflate the current user's count by following content outside their root.
+    user_root = _data_dir / "projects" / "users" / "alice"
+    scripts_dir = user_root / "test" / "scripts"
+    outside_scripts = _tmp / "outside-scripts"
+    outside_scripts.mkdir()
+    for i in range(5):
+        (outside_scripts / f"outside-{i}.meta.json").write_text(
+            "{}", encoding="utf-8"
+        )
+    outside_project = _tmp / "outside-project"
+    outside_project.mkdir()
+    (outside_project / "scripts").symlink_to(
+        outside_scripts, target_is_directory=True
+    )
+    (user_root / "linked-project").symlink_to(
+        outside_project, target_is_directory=True
+    )
+    linked_scripts_project = user_root / "linked-scripts-project"
+    linked_scripts_project.mkdir()
+    (linked_scripts_project / "scripts").symlink_to(
+        outside_scripts, target_is_directory=True
+    )
+    outside_meta = _tmp / "outside.meta.json"
+    outside_meta.write_text("{}", encoding="utf-8")
+    (scripts_dir / "poison.meta.json").symlink_to(outside_meta)
+
+    # Create 3 real scripts — all should succeed despite the symlink poison.
     for i in range(3):
         r = client.post(
             "/api/projects/test/scripts/",
@@ -82,7 +116,9 @@ def main():
             headers=_auth(),
         )
         assert r.status_code == 200, f"script {i}: {r.status_code} {r.text}"
-    print(f"  ok: created {3} scripts within limit")
+    print(
+        f"  ok: ignored symlink quota poison and created {3} scripts within limit"
+    )
 
     # 4th should 402
     r = client.post(

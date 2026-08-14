@@ -96,7 +96,9 @@ import { api } from '../services/api';
 import { cloudApi } from '../services/cloudApi';
 import { projectApi } from '../services/projectApi';
 import { scriptApi } from '../services/scriptApi';
-import { API_BASE, getCollabWsUrl } from '../config';
+import { getCollabWsUrl } from '../config';
+import { buildCollabProviderToken, readCollabRouteToken } from '../services/collabInvite';
+import { scrubCapabilityUrl } from '../services/capabilityUrl';
 import { showToast } from './Toast';
 import VersionHistory from './VersionHistory';
 import AssetManager from './AssetManager';
@@ -263,7 +265,15 @@ function resolveHFFields(
 
 const ScreenplayEditor: React.FC = () => {
   const { projectId: urlProjectId, scriptId: urlScriptId, commitHash: urlCommitHash, collabToken: urlCollabToken } = useParams<{ projectId?: string; scriptId?: string; commitHash?: string; collabToken?: string }>();
+  const [routeCollabToken] = useState(() => readCollabRouteToken(
+    urlCollabToken,
+    window.location.pathname,
+    window.location.hash,
+  ));
   const navigate = useNavigate();
+  useEffect(() => {
+    if (routeCollabToken) scrubCapabilityUrl('/collab');
+  }, [routeCollabToken]);
   const goBack = useGoBack();
   const isHistoryMode = Boolean(urlCommitHash);
 
@@ -408,29 +418,15 @@ const ScreenplayEditor: React.FC = () => {
     addCollabActivity('Starting collaboration session');
     const ydoc = new Y.Doc();
 
-    // Build compound token: "jwt:<access>|invite:<invite>" when auth is available and valid
-    const { collabAuth, clearCollabAuth } = useSettingsStore.getState();
-    let token = inviteToken;
-    if (collabAuth.accessToken) {
-      // Check JWT expiry client-side to avoid sending expired tokens
-      try {
-        const payload = JSON.parse(atob(collabAuth.accessToken.split('.')[1]));
-        if (payload.exp && payload.exp * 1000 > Date.now()) {
-          token = `jwt:${collabAuth.accessToken}|invite:${inviteToken}`;
-        } else {
-          // JWT expired — clear it so we don't keep sending it
-          clearCollabAuth();
-        }
-      } catch {
-        // Malformed JWT — just use invite token
-        clearCollabAuth();
-      }
-    }
-
     // Use the collab server URL extracted from the invite link if provided,
     // otherwise fall back to the local setting.
-    const wsUrl = overrideWsUrl || getCollabWsUrl();
-    console.log(`[Collab] setupCollab: docName="${docName}", wsUrl="${wsUrl}", isHost=${isHost}, tokenPrefix="${inviteToken.slice(0, 8)}..."`);
+    const configuredWsUrl = getCollabWsUrl();
+    const wsUrl = overrideWsUrl || configuredWsUrl;
+    const { collabAuth } = useSettingsStore.getState();
+    const token = buildCollabProviderToken(
+      inviteToken, collabAuth.accessToken, wsUrl, configuredWsUrl,
+    );
+    console.log(`[Collab] setupCollab: docName="${docName}", wsUrl="${wsUrl}", isHost=${isHost}`);
 
     const provider = new HocuspocusProvider({
       url: wsUrl,
@@ -697,73 +693,43 @@ const ScreenplayEditor: React.FC = () => {
   // ── Handle /collab/:token route — resolve token to project/script, then enter collab mode ──
   const collabInitDone = useRef(false);
   const collabInitialContent = useRef<Record<string, unknown> | null>(null);
-  const [collabLoading, setCollabLoading] = useState(Boolean(urlCollabToken));
+  const [collabLoading, setCollabLoading] = useState(Boolean(routeCollabToken));
   useEffect(() => {
-    if (!urlCollabToken || collabInitDone.current) return;
+    if (!routeCollabToken || collabInitDone.current) return;
     collabInitDone.current = true;
     (async () => {
       try {
-        // Try collab server first (validates against all configured backends),
-        // then fall back to local backend
+        // Validate against the configured collaboration service,
+        // then use the platform API wrapper as a compatibility fallback.
         let session: import('../services/api').CollabSession | null = null;
         const collabHttpUrl = getCollabWsUrl().replace(/^ws/, 'http');
         try {
-          const res = await platformFetch(`${collabHttpUrl}/api/collab/session/${urlCollabToken}`);
+          const res = await platformFetch(`${collabHttpUrl}/api/collab/session/validate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: routeCollabToken }),
+          });
           if (res.ok) session = await res.json();
         } catch { /* collab server unreachable */ }
         if (!session) {
-          session = await api.validateCollabSession(urlCollabToken);
+          session = await api.validateCollabSession(routeCollabToken);
         }
 
-        // Load script content FIRST so the editor can seed the Yjs doc.
-        // Try multiple backends (local + alternatives) for cross-backend joins.
-        // Derive host from the collab server URL setting so cross-machine access works.
-        const collabHost = (() => { try { return new URL(collabHttpUrl).hostname; } catch { return 'localhost'; } })();
-        const backends = [
-          API_BASE,
-          `http://${collabHost}:8000/api`,
-          `http://${collabHost}:18321/api`,
-        ].filter((v, i, a) => a.indexOf(v) === i);
-
-        let project: any = null;
-        let scriptResp: any = null;
-        for (const base of backends) {
-          try {
-            const pRes = await platformFetch(`${base}/projects/${session.project_id}`);
-            if (!pRes.ok) continue;
-            project = await pRes.json();
-            const sRes = await platformFetch(`${base}/projects/${session.project_id}/scripts/${session.script_id}`);
-            if (!sRes.ok) continue;
-            scriptResp = await sRes.json();
-            break;
-          } catch { /* try next */ }
-        }
-
-        // Seed the Yjs doc if content was loaded; otherwise Yjs will sync from host
-        if (scriptResp) {
-          const content = scriptResp.content as Record<string, unknown> | null;
-          if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-            const { _notes, _generalNotes, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId, _pageLayout: _plGuest, ...pmDoc } = content as Record<string, unknown>;
-            collabInitialContent.current = pmDoc;
-          } else if (content && typeof content === 'object' && Object.keys(content).length > 0) {
-            collabInitialContent.current = content;
-          }
-        }
 
         // Setup provider synchronously before triggering editor rebuild
         // Include session_nonce so guest joins the exact same Yjs room as the host
         const nonce = session.session_nonce || '';
         const docName = `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
-        setupCollab(docName, urlCollabToken, session.collaborator_name);
+        setupCollab(docName, routeCollabToken, session.collaborator_name);
 
         setCollabUserName(session.collaborator_name);
         setCollabRole((session.role as 'editor' | 'viewer') || 'editor');
         setCollabMode(true);
         setEditorKey((k) => k + 1);
 
-        setCurrentProject(project || { id: session.project_id, name: 'Collaboration' });
+        setCurrentProject({ id: session.project_id, name: 'Collaboration' } as any);
         setCurrentScriptId(session.script_id);
-        setDocumentTitle(scriptResp?.meta?.title || 'Untitled');
+        setDocumentTitle('Untitled');
         setCollabLoading(false);
 
         if (session.role === 'viewer') {
@@ -775,7 +741,7 @@ const ScreenplayEditor: React.FC = () => {
         navigate('/');
       }
     })();
-  }, [urlCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
+  }, [routeCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
 
   // handleStartCollab is defined after the editor — see below useEditor
 
@@ -890,7 +856,7 @@ const ScreenplayEditor: React.FC = () => {
       // Create host's own token for the new document, sharing the same nonce
       let hostToken: string;
       try {
-        const hostInvite = await api.createCollabInvite(newProjectId, newScriptId, collabUserName, 'editor', 24, sharedNonce);
+        const hostInvite = await api.createCollabInvite(newProjectId, newScriptId, collabUserName, 'editor', 24);
         hostToken = hostInvite.token;
       } catch {
         hostToken = sharedToken;
@@ -938,22 +904,6 @@ const ScreenplayEditor: React.FC = () => {
         showToast(`Joined collaboration as ${session.collaborator_name}`, 'success');
       }
 
-      // Try to load project metadata in the background (non-blocking).
-      // This fills in the title and project name if reachable, but is not required.
-      try {
-        const pRes = await platformFetch(`${API_BASE}/projects/${session.project_id}`);
-        if (pRes.ok) {
-          const project = await pRes.json();
-          setCurrentProject(project as any);
-          const sRes = await platformFetch(`${API_BASE}/projects/${session.project_id}/scripts/${session.script_id}`);
-          if (sRes.ok) {
-            const scriptResp = await sRes.json();
-            setDocumentTitle(scriptResp?.meta?.title || 'Untitled');
-          }
-        }
-      } catch {
-        // Backend unreachable — fine, Yjs handles content sync
-      }
     } catch (err) {
       console.error('[Collab] handleJoinCollab failed:', err);
       showToast(`Failed to join collaboration: ${err instanceof Error ? err.message : String(err)}`, 'error');
@@ -992,7 +942,7 @@ const ScreenplayEditor: React.FC = () => {
 
   // Welcome dialog — show on first visit
   const [showWelcome, setShowWelcome] = useState(() => {
-    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !urlCollabToken;
+    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !routeCollabToken;
   });
 
   // ── Drag-and-drop file import state ──
@@ -1541,7 +1491,7 @@ const ScreenplayEditor: React.FC = () => {
     let ownerToken: string;
     try {
       const ownerSession = await api.createCollabInvite(
-        currentProject.id, currentScriptId, 'Host', 'editor', 1, nonce,
+        currentProject.id, currentScriptId, 'Host', 'editor', 1,
       );
       ownerToken = ownerSession.token;
     } catch {

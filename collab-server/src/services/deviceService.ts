@@ -9,6 +9,7 @@
  * they can review/revoke any session that doesn't look like theirs.
  */
 
+import * as crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { getDB } from '../db';
 import type { UserDeviceRow, DeviceChallengeRow } from '../db';
@@ -134,7 +135,7 @@ export async function createDeviceChallenge(
     return null;
   }
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const code = String(crypto.randomInt(100000, 1_000_000));
   const id = uuidv4();
   const expiresAt = new Date(now.getTime() + CHALLENGE_EXPIRY_MS).toISOString();
 
@@ -194,6 +195,9 @@ export async function consumeDeviceChallenge(
   );
   if (!row) return null;
 
-  await db.run('UPDATE device_challenges SET used = 1 WHERE id = ?', [row.id]);
-  return row;
+  const claimed = await db.run(
+    'UPDATE device_challenges SET used = 1 WHERE id = ? AND used = 0',
+    [row.id],
+  );
+  return claimed.changes === 1 ? row : null;
 }

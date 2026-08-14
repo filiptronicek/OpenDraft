@@ -3,6 +3,8 @@ import { api } from '../services/api';
 import type { CollabSession } from '../services/api';
 import { useSettingsStore } from '../stores/settingsStore';
 import { collabAuthApi, isCollabAuthenticated } from '../services/collabAuth';
+import { getApiBase } from '../config';
+import { buildCollabInviteUrl } from '../services/collabInvite';
 import { showToast } from './Toast';
 
 interface ShareDialogProps {
@@ -92,9 +94,7 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
         return;
       }
 
-      // Reuse the session nonce from the first invite so all guests join the same Yjs room
-      const existingNonce = sessions.length > 0 ? sessions[0].session_nonce || '' : '';
-      const session = await api.createCollabInvite(projectId, scriptId, trimmed, role, expiryHours, existingNonce);
+      const session = await api.createCollabInvite(projectId, scriptId, trimmed, role, expiryHours);
       setSessions((prev) => [...prev, session]);
       setName('');
       inputRef.current?.focus();
@@ -130,12 +130,12 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
   };
 
   const copyLink = async (token: string) => {
-    // Build invite link from the collab server URL in Settings.
-    // The guest will open this on the collab server (which may be on a different
-    // machine than the frontend/backend).
-    const collabWs = useSettingsStore.getState().collabServerUrl;
-    const collabHttp = collabWs.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
-    const link = `${collabHttp}/collab/${token}`;
+    const isTauri = Boolean((window as any).__TAURI_INTERNALS__);
+    const link = buildCollabInviteUrl(token, {
+      isTauri,
+      browserOrigin: window.location.origin,
+      apiBase: getApiBase(),
+    });
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(link);

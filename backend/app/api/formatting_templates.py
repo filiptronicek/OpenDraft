@@ -1,11 +1,12 @@
 """API router for formatting template CRUD."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.services import formatting_template_service
+from app.dependencies import require_verified_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_verified_user)])
 
 
 class TemplateCreate(BaseModel):
@@ -35,15 +36,20 @@ async def list_templates():
 
 @router.post("/")
 async def create_template(body: TemplateCreate):
-    return formatting_template_service.create_template(body.model_dump())
+    try:
+        return formatting_template_service.create_template(body.model_dump())
+    except formatting_template_service.InvalidTemplateIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{template_id}")
 async def get_template(template_id: str):
     try:
         return formatting_template_service.get_template(template_id)
+    except formatting_template_service.InvalidTemplateIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.put("/{template_id}")
@@ -51,11 +57,16 @@ async def update_template(template_id: str, body: TemplateUpdate):
     try:
         data = {k: v for k, v in body.model_dump().items() if v is not None}
         return formatting_template_service.update_template(template_id, data)
+    except formatting_template_service.InvalidTemplateIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.delete("/{template_id}")
 async def delete_template(template_id: str):
-    formatting_template_service.delete_template(template_id)
+    try:
+        formatting_template_service.delete_template(template_id)
+    except formatting_template_service.InvalidTemplateIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"message": "Template deleted"}

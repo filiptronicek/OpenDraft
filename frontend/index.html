@@ -22,10 +22,13 @@
           d = document.createElement('div');
           d.id = '_fatal';
           d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff6b6b;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
-          d.innerHTML = '<h2 style="color:#fff;margin-bottom:12px;">OpenDraft failed to start</h2>';
+          var heading = document.createElement('h2');
+          heading.style.cssText = 'color:#fff;margin-bottom:12px;';
+          heading.textContent = 'OpenDraft failed to start';
+          d.appendChild(heading);
           document.body.appendChild(d);
         }
-        d.innerHTML += '\n[ERROR] ' + (e.message || e) + '\n  at ' + (e.filename || '?') + ':' + (e.lineno || '?') + '\n';
+        d.appendChild(document.createTextNode('\n[ERROR] ' + (e.message || e) + '\n  at ' + (e.filename || '?') + ':' + (e.lineno || '?') + '\n'));
       });
       window.addEventListener('unhandledrejection', function(e) {
         var d = document.getElementById('_fatal');
@@ -33,11 +36,14 @@
           d = document.createElement('div');
           d.id = '_fatal';
           d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff6b6b;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
-          d.innerHTML = '<h2 style="color:#fff;margin-bottom:12px;">OpenDraft failed to start</h2>';
+          var heading = document.createElement('h2');
+          heading.style.cssText = 'color:#fff;margin-bottom:12px;';
+          heading.textContent = 'OpenDraft failed to start';
+          d.appendChild(heading);
           document.body.appendChild(d);
         }
         var msg = e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : 'Unknown rejection';
-        d.innerHTML += '\n[UNHANDLED REJECTION] ' + msg + '\n';
+        d.appendChild(document.createTextNode('\n[UNHANDLED REJECTION] ' + msg + '\n'));
       });
       // Timeout: if nothing renders in 8 seconds, show a diagnostic
       window._renderTimeout = setTimeout(function() {
@@ -49,11 +55,14 @@
             d.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#1a1a2e;color:#ff9f43;font:14px/1.6 monospace;padding:40px;overflow:auto;white-space:pre-wrap;';
             document.body.appendChild(d);
           }
-          d.innerHTML += '<h2 style="color:#fff;margin-bottom:12px;">OpenDraft: Loading timed out</h2>';
-          d.innerHTML += 'The app did not render within 8 seconds.\n';
-          d.innerHTML += 'Tauri IPC available: ' + !!(window.__TAURI_INTERNALS__) + '\n';
-          d.innerHTML += 'User agent: ' + navigator.userAgent + '\n';
-          d.innerHTML += 'Location: ' + location.href + '\n';
+          var heading = document.createElement('h2');
+          heading.style.cssText = 'color:#fff;margin-bottom:12px;';
+          heading.textContent = 'OpenDraft: Loading timed out';
+          d.appendChild(heading);
+          d.appendChild(document.createTextNode('The app did not render within 8 seconds.\n'));
+          d.appendChild(document.createTextNode('Tauri IPC available: ' + !!(window.__TAURI_INTERNALS__) + '\n'));
+          d.appendChild(document.createTextNode('User agent: ' + navigator.userAgent + '\n'));
+          d.appendChild(document.createTextNode('Location: ' + location.pathname + '\n'));
         }
       }, 8000);
     </script>

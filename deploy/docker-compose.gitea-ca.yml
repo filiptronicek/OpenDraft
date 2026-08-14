@@ -1,0 +1,13 @@
+# Optional private-CA overlay for the split source-build stack.
+# deploy.sh adds it when OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE is set.
+services:
+  demo:
+    environment:
+      OPENDRAFT_GIT_BACKUP_CA_BUNDLE: /run/secrets/opendraft_gitea_ca_bundle
+    secrets:
+      - source: opendraft_gitea_ca_bundle
+        target: opendraft_gitea_ca_bundle
+
+secrets:
+  opendraft_gitea_ca_bundle:
+    file: ${OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE}

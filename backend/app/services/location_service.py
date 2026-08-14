@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from app.config import get_projects_dir
+from app.services import project_service
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +26,10 @@ PREFIX_RE = re.compile(r"^(INT\.?\/?EXT\.?|EXT\.?\/?INT\.?|INT\.?|EXT\.?|I\/E\.?
 
 
 def _locations_file(project_id: str) -> Path:
-    project_dir = get_projects_dir() / project_id
-    if not project_dir.exists():
-        raise FileNotFoundError(f"Project '{project_id}' not found")
-    return project_dir / "locations.json"
+    project_dir = project_service.get_project_dir(project_id)
+    return project_service.resolve_contained_path(
+        project_dir, "locations.json", label="Locations path"
+    )
 
 
 def _read(project_id: str) -> dict[str, Any]:

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useGoBack } from '../hooks/useGoBack';
 import { useSettingsStore } from '../stores/settingsStore';
-import { collabAuthApi, handleAuthResponse, performLogout, isDeviceChallenge } from '../services/collabAuth';
+import { collabAuthApi, handleAuthResponse, handleEmailVerificationResponse, performLogout, isDeviceChallenge } from '../services/collabAuth';
 import type { CollabServerConfig, DeviceRecord } from '../services/collabAuth';
 import { initDemoInfo, isDemoMode } from '../services/demoInfo';
 import { showToast } from './Toast';
@@ -108,6 +108,7 @@ const SettingsPage: React.FC = () => {
   }, [collabServerUrl]);
 
   const isLoggedIn = Boolean(collabAuth.accessToken && collabAuth.user);
+  const registrationEnabled = serverConfig?.localRegistrationEnabled !== false;
   // Demo flag comes from the backend's DEMO_MODE env var (see /api/demo-info).
   const [isDemoServer, setIsDemoServer] = useState<boolean>(isDemoMode());
   useEffect(() => {
@@ -255,6 +256,7 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleRegister = async () => {
+    if (!registrationEnabled) return;
     if (!regEmail || !regPassword || !regName) return;
     if (regPassword !== regConfirm) {
       showToast('Passwords do not match', 'error');
@@ -314,13 +316,8 @@ const SettingsPage: React.FC = () => {
     if (verifyCode.length !== 6) return;
     setVerifying(true);
     try {
-      await collabAuthApi.verifyEmail(verifyCode);
-      // Update local user state
-      const user = await collabAuthApi.getMe();
-      useSettingsStore.getState().setCollabAuth({
-        ...collabAuth,
-        user: user,
-      });
+      const response = await collabAuthApi.verifyEmail(verifyCode);
+      handleEmailVerificationResponse(response);
       showToast('Email verified!', 'success');
       setVerifyCode('');
     } catch (err: any) {
@@ -680,15 +677,17 @@ const SettingsPage: React.FC = () => {
                 >
                   Sign In
                 </button>
-                <button
-                  className={`settings-auth-tab ${authTab === 'register' ? 'active' : ''}`}
-                  onClick={() => setAuthTab('register')}
-                >
-                  Create Account
-                </button>
+                {registrationEnabled && (
+                  <button
+                    className={`settings-auth-tab ${authTab === 'register' ? 'active' : ''}`}
+                    onClick={() => setAuthTab('register')}
+                  >
+                    Create Account
+                  </button>
+                )}
               </div>
 
-              {authTab === 'login' ? (
+              {authTab === 'login' || !registrationEnabled ? (
                 pendingChallenge ? (
                   <div className="settings-auth-form">
                     <div className="settings-verify-text">
@@ -1014,8 +1013,10 @@ const SettingsPage: React.FC = () => {
                 <div className="settings-account-block settings-account-danger">
                   <div className="settings-account-title">Delete account</div>
                   <div className="settings-account-hint">
-                    Permanently deletes your account, password, devices, and any cloud
-                    screenplays stored under your account. This cannot be undone.
+                    Permanently deletes your active account, password, and devices, and
+                    attempts to remove cloud screenplays stored under your account. Git
+                    mirrors, filesystem snapshots, and other administrator-managed backups
+                    follow the server administrator&apos;s retention policy.
                   </div>
                   {!deleteOpen ? (
                     <button
@@ -1040,16 +1041,18 @@ const SettingsPage: React.FC = () => {
                                 screenplay{cloudInventory.scripts === 1 ? '' : 's'}
                               </>
                             )}{' '}
-                            stored in OpenDraft Cloud. They will be permanently deleted along
-                            with this account and cannot be recovered. Please open each one in
-                            OpenDraft and use <em>File → Save As / Export</em> to download a
-                            local copy before continuing.
+                            stored in OpenDraft Cloud. Account deletion attempts to remove them
+                            from active storage. Administrator-managed backups can persist until
+                            their retention period ends or an administrator removes them. Please
+                            open each screenplay in OpenDraft and use <em>File → Save As / Export</em>{' '}
+                            to download a local copy before continuing.
                           </>
                         ) : (
                           <>
-                            any screenplays stored in OpenDraft Cloud under this account will be
-                            deleted along with the account and cannot be recovered. Please make
-                            sure you have downloaded them first.
+                            account deletion attempts to remove screenplays stored in active
+                            OpenDraft Cloud storage. Administrator-managed backups can persist
+                            until their retention period ends or an administrator removes them.
+                            Please make sure you have downloaded your screenplays first.
                           </>
                         )}
                         {cloudPortalLink && (

@@ -12,6 +12,8 @@ import type { DeviceInfo } from '../services/deviceService';
 import { requireAuth } from '../middleware/auth';
 import { strictLimiter, veryStrictLimiter } from '../middleware/rateLimit';
 import { config } from '../config';
+import { accountLifecycle } from '../services/accountLifecycle';
+import { revokeOwnedCollaborationSessions } from '../services/collaborationSessionService';
 
 const router = Router();
 
@@ -35,7 +37,7 @@ const registerSchema = z.object({
   device: deviceInfoSchema,
 });
 
-const loginSchema = z.object({
+export const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
   device: deviceInfoSchema,
@@ -103,6 +105,15 @@ function userResponse(user: UserRow | null) {
   };
 }
 
+function accessTokenFor(user: UserRow): string {
+  return tokenService.generateAccessToken(
+    user.id,
+    user.email,
+    user.display_name,
+    Boolean(user.email_verified),
+  );
+}
+
 function getClientIp(req: any): string {
   return req.ip || req.connection?.remoteAddress || 'unknown';
 }
@@ -119,6 +130,13 @@ function pickDeviceInfo(req: any, body: any): DeviceInfo | null {
     userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
     ipAddress: getClientIp(req),
   };
+}
+
+export function requiresDeviceForTwoFactor(
+  twoFactorEnabled: number | boolean,
+  deviceInfo: DeviceInfo | null,
+): boolean {
+  return Boolean(twoFactorEnabled) && !deviceInfo;
 }
 
 function deviceResponse(row: {
@@ -148,6 +166,11 @@ function deviceResponse(row: {
 
 router.post('/register', veryStrictLimiter, async (req, res) => {
   try {
+    if (!config.localRegistrationEnabled) {
+      res.status(403).json({ error: 'Local account registration is disabled on this server' });
+      return;
+    }
+
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten().fieldErrors });
@@ -165,12 +188,6 @@ router.post('/register', veryStrictLimiter, async (req, res) => {
     }
 
     let user = await userService.createUser(email, password, displayName);
-    const accessToken = tokenService.generateAccessToken(user.id, user.email);
-    const { token: refreshToken } = await tokenService.generateRefreshToken(
-      user.id,
-      deviceInfo?.deviceId ?? null,
-    );
-
     // The device that created the account is implicitly trusted — no 2FA prompt
     // on the very first login.
     if (deviceInfo) {
@@ -185,6 +202,14 @@ router.post('/register', veryStrictLimiter, async (req, res) => {
       await userService.setEmailVerified(user.id);
       user = (await userService.findUserById(user.id))!;
     }
+
+    // Issue credentials only after account setup and any automatic email
+    // verification, so the signed claims reflect the final user state.
+    const accessToken = accessTokenFor(user);
+    const { token: refreshToken } = await tokenService.generateRefreshToken(
+      user.id,
+      deviceInfo?.deviceId ?? null,
+    );
 
     await auditService.logEvent('register', user.id, null, { email: user.email }, getClientIp(req));
 
@@ -211,15 +236,21 @@ router.post('/login', strictLimiter, async (req, res) => {
     const deviceInfo = pickDeviceInfo(req, parsed.data);
     const user = await userService.findUserByEmail(email);
 
-    if (!user) {
-      await auditService.logEvent('login_failed', null, null, { email, reason: 'user_not_found' }, getClientIp(req));
-      res.status(404).json({ error: 'User not found' });
+    if (!(await userService.verifyPassword(user, password)) || !user) {
+      await auditService.logEvent('login_failed', null, null, { reason: 'invalid_credentials' }, getClientIp(req));
+      res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
 
-    if (!(await userService.verifyPassword(user, password))) {
-      await auditService.logEvent('login_failed', null, null, { email, reason: 'wrong_password' }, getClientIp(req));
-      res.status(401).json({ error: 'Invalid email or password' });
+    if (requiresDeviceForTwoFactor(user.two_factor_enabled, deviceInfo)) {
+      await auditService.logEvent(
+        'login_failed',
+        user.id,
+        null,
+        { reason: 'two_factor_device_required' },
+        getClientIp(req),
+      );
+      res.status(400).json({ error: 'Device information is required for two-factor verification' });
       return;
     }
 
@@ -231,8 +262,8 @@ router.post('/login', strictLimiter, async (req, res) => {
     //   • If 2FA is off (default), login proceeds normally; the device is
     //     recorded as trusted and we email a "new device signed in" notice
     //     so the user can spot unauthorized access.
-    //   • If no device info was provided (older clients), nothing changes —
-    //     login works exactly as before.
+    //   • Older clients without device info remain compatible only when 2FA is
+    //     disabled; 2FA accounts must identify a device before tokens issue.
     if (deviceInfo) {
       const known = await deviceService.findDevice(user.id, deviceInfo.deviceId);
       if (!known) {
@@ -276,7 +307,7 @@ router.post('/login', strictLimiter, async (req, res) => {
       }
     }
 
-    const accessToken = tokenService.generateAccessToken(user.id, user.email);
+    const accessToken = accessTokenFor(user);
     const { token: refreshToken } = await tokenService.generateRefreshToken(
       user.id,
       deviceInfo?.deviceId ?? null,
@@ -326,7 +357,7 @@ router.post('/verify-device', strictLimiter, async (req, res) => {
       ipAddress: challenge.ip_address,
     });
 
-    const accessToken = tokenService.generateAccessToken(user.id, user.email);
+    const accessToken = accessTokenFor(user);
     const { token: refreshToken } = await tokenService.generateRefreshToken(user.id, challenge.device_id);
 
     await auditService.logEvent(
@@ -451,7 +482,7 @@ router.post('/refresh', strictLimiter, async (req, res) => {
   }
 });
 
-router.post('/logout', async (req, res) => {
+router.post('/logout', strictLimiter, async (req, res) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -484,9 +515,19 @@ router.post('/verify-email', requireAuth, veryStrictLimiter, async (req, res) =>
     }
 
     await userService.setEmailVerified(req.user!.id);
-    await auditService.logEvent('email_verified', req.user!.id, null, null, getClientIp(req));
+    const freshUser = await userService.findUserById(req.user!.id);
+    if (!freshUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    const accessToken = accessTokenFor(freshUser);
+    await auditService.logEvent('email_verified', freshUser.id, null, null, getClientIp(req));
 
-    res.json({ message: 'Email verified' });
+    res.json({
+      message: 'Email verified',
+      user: userResponse(freshUser),
+      accessToken,
+    });
   } catch (err) {
     console.error('Verify email error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -519,7 +560,7 @@ router.post('/verify-email-link', veryStrictLimiter, async (req, res) => {
     await userService.setEmailVerified(user.id);
     const freshUser = (await userService.findUserById(user.id))!;
 
-    const accessToken = tokenService.generateAccessToken(freshUser.id, freshUser.email);
+    const accessToken = accessTokenFor(freshUser);
     const { token: refreshToken } = await tokenService.generateRefreshToken(freshUser.id);
 
     await auditService.logEvent('email_verified', freshUser.id, null, { via: 'magic_link' }, getClientIp(req));
@@ -578,7 +619,7 @@ router.post('/google', strictLimiter, async (req, res) => {
     });
 
     const payload = ticket.getPayload();
-    if (!payload || !payload.email || !payload.sub) {
+    if (!payload || !payload.email || !payload.sub || payload.email_verified !== true) {
       res.status(400).json({ error: 'Invalid Google token' });
       return;
     }
@@ -594,7 +635,7 @@ router.post('/google', strictLimiter, async (req, res) => {
       await deviceService.recordTrustedDevice(user.id, deviceInfo);
     }
 
-    const accessToken = tokenService.generateAccessToken(user.id, user.email);
+    const accessToken = accessTokenFor(user);
     const { token: refreshToken } = await tokenService.generateRefreshToken(
       user.id,
       deviceInfo?.deviceId ?? null,
@@ -630,6 +671,7 @@ router.get('/me', requireAuth, async (req, res) => {
 // Return whether Google login is available (for frontend UI)
 router.get('/config', (req, res) => {
   res.json({
+    localRegistrationEnabled: config.localRegistrationEnabled,
     googleEnabled: Boolean(config.googleClientId),
     emailVerificationRequired: Boolean(config.smtpHost),
     // Whether outbound email is wired up. UI gates 2FA on this — without
@@ -679,10 +721,16 @@ router.post('/change-password', requireAuth, veryStrictLimiter, async (req, res)
       return;
     }
 
-    await userService.updatePassword(user.id, parsed.data.newPassword);
-    // Invalidate every refresh token so other devices are forced to sign in
-    // again with the new password.
-    await tokenService.revokeAllRefreshTokens(user.id);
+    const changed = await accountLifecycle.runActive(user.id, async () => {
+      await userService.updatePassword(user.id, parsed.data.newPassword);
+      // Invalidate refresh credentials and long-lived invite capabilities.
+      await tokenService.revokeAllRefreshTokens(user.id);
+      await revokeOwnedCollaborationSessions(user.id);
+    });
+    if (!changed.accepted) {
+      res.status(409).json({ error: 'Account deletion is in progress' });
+      return;
+    }
 
     await auditService.logEvent('password_changed', user.id, null, null, getClientIp(req));
 
@@ -701,7 +749,7 @@ router.post('/change-password', requireAuth, veryStrictLimiter, async (req, res)
 //
 // The flow is:
 //   1. User submits their email to /forgot-password. Server generates a
-//      single-use token, stores its bcrypt hash, and emails the user a link
+//      single-use token, stores its SHA-256 digest, and emails the user a link
 //      containing the raw token. The response is intentionally generic —
 //      "if an account exists, an email was sent" — to avoid leaking which
 //      addresses are registered.
@@ -798,15 +846,20 @@ router.post('/reset-password', veryStrictLimiter, async (req, res) => {
       return;
     }
 
-    await userService.updatePassword(user.id, parsed.data.newPassword);
-    // Treat email-verified once they've proven control of the address by
-    // clicking the link — same logic as the magic-link verify route.
-    if (!user.email_verified) {
-      await userService.setEmailVerified(user.id);
+    const reset = await accountLifecycle.runActive(user.id, async () => {
+      await userService.updatePassword(user.id, parsed.data.newPassword);
+      // Clicking the reset link also proves control of the email address.
+      if (!user.email_verified) {
+        await userService.setEmailVerified(user.id);
+      }
+      // Revoke credentials and collaboration capabilities from before recovery.
+      await tokenService.revokeAllRefreshTokens(user.id);
+      await revokeOwnedCollaborationSessions(user.id);
+    });
+    if (!reset.accepted) {
+      res.status(400).json({ error: 'Invalid or expired reset link. Request a new one.' });
+      return;
     }
-    // Invalidate every refresh token — any device that was signed in must
-    // sign in again with the new password.
-    await tokenService.revokeAllRefreshTokens(user.id);
 
     await auditService.logEvent('password_reset', user.id, null, null, getClientIp(req));
 
@@ -944,10 +997,18 @@ router.delete('/account', requireAuth, veryStrictLimiter, async (req, res) => {
     }
 
     const emailForNotice = user.email;
+    const deletion = await accountLifecycle.runDeletion(user.id, async (markDeletion) => {
+      // Query, deactivate, close, and tombstone owned invites while the
+      // per-user deletion lock excludes in-process invite creation.
+      await revokeOwnedCollaborationSessions(user.id);
+      await userService.deleteUser(user.id, undefined, markDeletion);
+    });
+    if (!deletion.accepted) {
+      res.status(409).json({ error: 'Account deletion is already in progress' });
+      return;
+    }
 
-    await userService.deleteUser(user.id);
-
-    await auditService.logEvent('account_deleted', null, null, { email: emailForNotice }, getClientIp(req));
+    await auditService.logEvent('account_deleted', null, null, null, getClientIp(req));
 
     try { await emailService.sendAccountDeletedNotice(emailForNotice); } catch { /* ignore */ }
 

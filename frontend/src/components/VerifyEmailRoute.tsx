@@ -1,5 +1,5 @@
 /**
- * /verify?email=…&code=… magic-link handler.
+ * /verify#email=…&code=… magic-link handler (query form remains compatible).
  *
  * The activation email contains a link to this route. On mount we POST the
  * email+code to /auth/verify-email-link, store the returned tokens, then
@@ -8,14 +8,17 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { collabAuthApi, handleAuthResponse } from '../services/collabAuth';
+import { captureCapabilityParams, scrubCapabilityUrl } from '../services/capabilityUrl';
 
 const VerifyEmailRoute: React.FC = () => {
-  const [params] = useSearchParams();
   const navigate = useNavigate();
-  const email = params.get('email') || '';
-  const code = params.get('code') || '';
+  const [{ email, code }] = useState(() => captureCapabilityParams(
+    ['email', 'code'] as const,
+    window.location.hash,
+    window.location.search,
+  ));
   const [status, setStatus] = useState<'pending' | 'success' | 'error'>('pending');
   const [error, setError] = useState<string>('');
   // Strict-mode double-mount guard.
@@ -24,6 +27,7 @@ const VerifyEmailRoute: React.FC = () => {
   useEffect(() => {
     if (ran.current) return;
     ran.current = true;
+    scrubCapabilityUrl(window.location.pathname);
 
     if (!email || !code) {
       setStatus('error');

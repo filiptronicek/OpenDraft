@@ -1,12 +1,12 @@
 import { create } from 'zustand';
+import { getDefaultCollabWsUrl } from '../config';
 
 export interface CollabUser {
   id: string;
   email: string;
   displayName: string;
   emailVerified: boolean;
-  /** Optional — only present from the collab server; the backend's lighter
-   *  /api/auth/me payload omits it. Defaults to false when missing. */
+  /** Optional for compatibility with auth state persisted by older clients. */
   twoFactorEnabled?: boolean;
 }
 
@@ -131,7 +131,7 @@ function loadEnabledScriptFormats(): string[] {
   return [];
 }
 
-const DEFAULT_COLLAB_URL = 'wss://collab.open-draft.com';
+const DEFAULT_COLLAB_URL = getDefaultCollabWsUrl();
 
 function loadAuth(): CollabAuth {
   try {

@@ -74,6 +74,8 @@ const CollabLoginDialog: React.FC<CollabLoginDialogProps> = ({ onClose, onSucces
     collabAuthApi.getServerConfig().then(setServerConfig).catch(() => {});
     initDemoInfo().then((info) => setIsDemoServer(Boolean(info.demo))).catch(() => {});
   }, []);
+  const registrationEnabled = serverConfig?.localRegistrationEnabled !== false;
+
 
   const handleLogin = async () => {
     if (!loginEmail || !loginPassword) return;
@@ -139,6 +141,7 @@ const CollabLoginDialog: React.FC<CollabLoginDialogProps> = ({ onClose, onSucces
   };
 
   const handleRegister = async () => {
+    if (!registrationEnabled) return;
     if (!regEmail || !regPassword || !regName) return;
     if (regPassword !== regConfirm) {
       showToast('Passwords do not match', 'error');
@@ -247,15 +250,17 @@ const CollabLoginDialog: React.FC<CollabLoginDialogProps> = ({ onClose, onSucces
             >
               Sign In
             </button>
-            <button
-              className={`settings-auth-tab ${tab === 'register' ? 'active' : ''}`}
-              onClick={() => { setTab('register'); setForgotMode(null); }}
-            >
-              Create Account
-            </button>
+            {registrationEnabled && (
+              <button
+                className={`settings-auth-tab ${tab === 'register' ? 'active' : ''}`}
+                onClick={() => { setTab('register'); setForgotMode(null); }}
+              >
+                Create Account
+              </button>
+            )}
           </div>
 
-          {tab === 'login' ? (
+          {tab === 'login' || !registrationEnabled ? (
             forgotMode === 'form' ? (
               <div className="settings-auth-form">
                 <p style={{ margin: '0 0 12px', fontSize: 13, color: 'var(--fd-text-muted)' }}>

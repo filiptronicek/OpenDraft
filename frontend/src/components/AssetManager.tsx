@@ -3,6 +3,8 @@ import { useAssetStore } from '../stores/assetStore';
 import type { Asset } from '../stores/assetStore';
 import AssetViewer from './AssetViewer';
 import { api } from '../services/api';
+import { acquireAuthenticatedAssetUrl } from '../services/authenticatedAssetUrl';
+import { useSettingsStore } from '../stores/settingsStore';
 import { showToast } from './Toast';
 
 interface AssetManagerProps {
@@ -12,6 +14,7 @@ interface AssetManagerProps {
 
 const AssetManager: React.FC<AssetManagerProps> = ({ projectId, embedded = false }) => {
   const { assets, setAssets, assetManagerOpen, setAssetManagerOpen } = useAssetStore();
+  const authenticatedUserId = useSettingsStore((state) => state.collabAuth.user?.id ?? null);
   const [filterText, setFilterText] = useState('');
   const [filterTag, setFilterTag] = useState('');
   const [tagInput, setTagInput] = useState('');
@@ -120,12 +123,23 @@ const AssetManager: React.FC<AssetManagerProps> = ({ projectId, embedded = false
     }
   };
 
-  const handleDownload = (asset: Asset) => {
-    const url = api.getAssetUrl(projectId, asset.id, asset.filename);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = asset.original_name;
-    a.click();
+  const handleDownload = async (asset: Asset) => {
+    const sourceUrl = api.getAssetUrl(projectId, asset.id, asset.filename);
+    const lease = acquireAuthenticatedAssetUrl(sourceUrl, authenticatedUserId);
+    try {
+      const url = await lease.url;
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = asset.original_name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Keep the blob alive through the browser's click/default-action turn.
+      window.setTimeout(lease.release, 0);
+    } catch {
+      lease.release();
+      showToast(`Failed to download "${asset.original_name}"`, 'error');
+    }
   };
 
   const handleSaveTags = async (assetId: string) => {

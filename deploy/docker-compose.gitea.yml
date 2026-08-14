@@ -1,0 +1,11 @@
+# Opt-in overlay for the split source-build stack.
+# Use via deploy.sh when OPENDRAFT_GIT_BACKUP_ENABLED=true.
+services:
+  demo:
+    secrets:
+      - source: opendraft_gitea_token
+        target: opendraft_gitea_token
+
+secrets:
+  opendraft_gitea_token:
+    file: ${OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE}

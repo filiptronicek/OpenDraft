@@ -24,6 +24,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { useEditorStore, type BeatInfo, type BeatLinkPreview } from '../stores/editorStore';
 import { api } from '../services/api';
+import { safeExternalHttpUrl } from '../services/externalUrl';
 
 const BEAT_COLORS = [
   '', '#8b5cf6', '#4f46e5', '#2563eb', '#059669',
@@ -31,7 +32,7 @@ const BEAT_COLORS = [
 ];
 
 /* ─── URL detection ─── */
-const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g;
+const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
 
 function extractUrls(text: string): string[] {
   if (!text) return [];
@@ -54,7 +55,9 @@ function useLinkPreviews(
     if (urls.length === 0) return;
 
     // Find URLs that aren't already cached on the beat or in the in-memory cache
-    const existingUrls = new Set((existingPreviews || []).map((p) => p.url));
+    const existingUrls = new Set(
+      (existingPreviews || []).map((p) => p.sourceUrl ?? p.url),
+    );
     const newUrls = urls.filter((u) => !existingUrls.has(u) && _previewCache.get(u) !== 'loading');
 
     if (newUrls.length === 0) {
@@ -72,10 +75,11 @@ function useLinkPreviews(
       _previewCache.set(url, 'loading');
       api.fetchLinkPreview(url).then((resp) => {
         const preview: BeatLinkPreview = {
+          sourceUrl: url,
           url: resp.url,
           title: resp.title,
           description: resp.description,
-          image: resp.image,
+          image: '',
           siteName: resp.site_name,
         };
         _previewCache.set(url, preview);
@@ -83,7 +87,7 @@ function useLinkPreviews(
         const store = useEditorStore.getState();
         const beat = store.beats.find((b) => b.id === beatId);
         const current = beat?.linkPreviews || [];
-        if (!current.some((p) => p.url === url)) {
+        if (!current.some((p) => (p.sourceUrl ?? p.url) === url)) {
           onUpdate(beatId, { linkPreviews: [...current, preview] });
         }
       }).catch(() => {
@@ -94,7 +98,9 @@ function useLinkPreviews(
 
   // Return only previews for URLs still in the description
   return useMemo(() => {
-    return (existingPreviews || []).filter((p) => urls.includes(p.url));
+    return (existingPreviews || []).filter((p) => (
+      urls.includes(p.sourceUrl ?? p.url)
+    ));
   }, [existingPreviews, urls]);
 }
 
@@ -102,32 +108,32 @@ function useLinkPreviews(
 const LinkPreviewCard: React.FC<{
   preview: BeatLinkPreview;
   onRemove: () => void;
-}> = ({ preview, onRemove }) => (
-  <a
-    className="beat-link-preview"
-    href={preview.url}
-    target="_blank"
-    rel="noopener noreferrer"
-    title={preview.url}
-    onClick={(e) => e.stopPropagation()}
-  >
-    {preview.image && (
-      <div className="beat-link-preview-image">
-        <img src={preview.image} alt="" loading="lazy" />
+}> = ({ preview, onRemove }) => {
+  const safeUrl = safeExternalHttpUrl(preview.url);
+  if (!safeUrl) return null;
+
+  return (
+    <a
+      className="beat-link-preview"
+      href={safeUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={safeUrl}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="beat-link-preview-body">
+        {preview.siteName && <div className="beat-link-preview-site">{preview.siteName}</div>}
+        <div className="beat-link-preview-title">{preview.title || safeUrl}</div>
+        {preview.description && <div className="beat-link-preview-desc">{preview.description}</div>}
       </div>
-    )}
-    <div className="beat-link-preview-body">
-      {preview.siteName && <div className="beat-link-preview-site">{preview.siteName}</div>}
-      <div className="beat-link-preview-title">{preview.title || preview.url}</div>
-      {preview.description && <div className="beat-link-preview-desc">{preview.description}</div>}
-    </div>
-    <button
-      className="beat-link-preview-remove"
-      onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(); }}
-      title="Remove preview"
-    >&times;</button>
-  </a>
-);
+      <button
+        className="beat-link-preview-remove"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(); }}
+        title="Remove preview"
+      >&times;</button>
+    </a>
+  );
+};
 
 /* ─── Render description text with clickable links ─── */
 const DescriptionWithLinks: React.FC<{ text: string }> = ({ text }) => {
@@ -138,11 +144,16 @@ const DescriptionWithLinks: React.FC<{ text: string }> = ({ text }) => {
   for (let i = 0; i < parts.length; i++) {
     if (parts[i]) elements.push(<span key={`t${i}`}>{parts[i]}</span>);
     if (urls[i]) {
+      const safeUrl = safeExternalHttpUrl(urls[i]);
+      if (!safeUrl) {
+        elements.push(<span key={`u${i}`}>{urls[i]}</span>);
+        continue;
+      }
       elements.push(
         <a
           key={`u${i}`}
           className="beat-desc-link"
-          href={urls[i]}
+          href={safeUrl}
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e) => e.stopPropagation()}
@@ -246,7 +257,7 @@ const BeatCardContent: React.FC<BeatCardContentProps> = ({
 
   const handleRemovePreview = useCallback(
     (url: string) => {
-      const updated = (beat.linkPreviews || []).filter((p) => p.url !== url);
+      const updated = (beat.linkPreviews || []).filter((p) => (p.sourceUrl ?? p.url) !== url);
       onUpdate(beat.id, { linkPreviews: updated });
       _previewCache.set(url, 'error'); // prevent re-fetch
     },
@@ -399,7 +410,11 @@ const BeatCardContent: React.FC<BeatCardContentProps> = ({
           {linkPreviews.length > 0 && (
             <div className="beat-link-previews">
               {linkPreviews.map((p) => (
-                <LinkPreviewCard key={p.url} preview={p} onRemove={() => handleRemovePreview(p.url)} />
+                <LinkPreviewCard
+                  key={`${p.sourceUrl ?? p.url}:${p.url}`}
+                  preview={p}
+                  onRemove={() => handleRemovePreview(p.sourceUrl ?? p.url)}
+                />
               ))}
             </div>
           )}
@@ -439,7 +454,11 @@ const BeatCardContent: React.FC<BeatCardContentProps> = ({
           {linkPreviews.length > 0 && (
             <div className="beat-link-previews">
               {linkPreviews.map((p) => (
-                <LinkPreviewCard key={p.url} preview={p} onRemove={() => handleRemovePreview(p.url)} />
+                <LinkPreviewCard
+                  key={`${p.sourceUrl ?? p.url}:${p.url}`}
+                  preview={p}
+                  onRemove={() => handleRemovePreview(p.sourceUrl ?? p.url)}
+                />
               ))}
             </div>
           )}

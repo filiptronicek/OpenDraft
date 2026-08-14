@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.config import COLLAB_DB_PATH
 from app.services.auth_service import (
     AuthUser,
     auth_user_from_payload,
@@ -38,6 +39,12 @@ def _extract_user(credentials: Optional[HTTPAuthorizationCredentials]) -> Option
     user = get_user_by_id(user_id)
     if user is not None:
         return user
+
+    # A configured shared DB is authoritative. Missing/deleted users and read
+    # failures must fail closed instead of retaining JWT-only write access.
+    if COLLAB_DB_PATH:
+        return None
+
     # Fallback: trust the JWT payload only (email_verified will be False; any
     # endpoint requiring verification will reject). Good enough for read-only
     # identity — write endpoints should use require_verified_user.

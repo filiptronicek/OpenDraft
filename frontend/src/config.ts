@@ -80,14 +80,26 @@ export const SERVER_BASE: string = API_BASE.replace(/\/api$/, '');
  *  to the VITE env var, then to the default.
  */
 const DEFAULT_COLLAB_WS = 'wss://collab.open-draft.com';
+export function getDefaultCollabWsUrl(): string {
+  const env = import.meta.env.VITE_COLLAB_WS_URL;
+  if (env) return String(env).replace(/\/+$/, '');
+  if ((window as any).__TAURI_INTERNALS__) return DEFAULT_COLLAB_WS;
+  if (window.location.port === '5173') {
+    return `ws://${window.location.hostname}:4000`;
+  }
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/collab-server`;
+  }
+  return DEFAULT_COLLAB_WS;
+}
 export function getCollabWsUrl(): string {
   const stored = localStorage.getItem('opendraft:collabServerUrl');
   if (stored) return stored;
-  return import.meta.env.VITE_COLLAB_WS_URL || DEFAULT_COLLAB_WS;
+  return getDefaultCollabWsUrl();
 }
 // Static alias kept for backward-compatible imports
-export const COLLAB_WS_URL: string =
-  import.meta.env.VITE_COLLAB_WS_URL || DEFAULT_COLLAB_WS;
+export const COLLAB_WS_URL: string = getDefaultCollabWsUrl();
 
 /**
  * Get the URL for an asset.

@@ -20,16 +20,16 @@ set -euo pipefail
 #   cp .env.example .env
 #   # edit .env: set DEMO_HOST, COLLAB_HOST, ACME_EMAIL, JWT_SECRET
 #   ./deploy.sh                  # builds backend + collab from source
-#   ./deploy.sh --combined       # pulls combined image from GHCR (no source build)
+#   ./deploy.sh --combined       # pulls your configured combined image (no source build)
 #
-# Update deploy (after git pull or new GHCR release):
+# Update deploy (after git pull or publishing a new image):
 #   ./deploy.sh [--combined]
 
 cd "$(dirname "$0")"
 
 # ── Mode selection ──
-# --combined (or env OPENDRAFT_USE_COMBINED=1) uses the prebuilt single-image
-# stack from GHCR; default is the per-service build-from-source stack.
+# --combined (or env OPENDRAFT_USE_COMBINED=1) uses an explicitly configured
+# configured single-image build; default is the per-service build-from-source stack.
 USE_COMBINED="${OPENDRAFT_USE_COMBINED:-0}"
 for arg in "$@"; do
   case "$arg" in
@@ -40,11 +40,16 @@ done
 
 if [ "$USE_COMBINED" = "1" ]; then
   COMPOSE_FILE="docker-compose.combined.yml"
-  MODE_LABEL="combined image (GHCR pull)"
+  BACKUP_COMPOSE_FILE="docker-compose.combined.gitea.yml"
+  BACKUP_CA_COMPOSE_FILE="docker-compose.combined.gitea-ca.yml"
+  MODE_LABEL="combined image (registry pull)"
 else
   COMPOSE_FILE="docker-compose.yml"
+  BACKUP_COMPOSE_FILE="docker-compose.gitea.yml"
+  BACKUP_CA_COMPOSE_FILE="docker-compose.gitea-ca.yml"
   MODE_LABEL="per-service build"
 fi
+COMPOSE_ARGS=(-f "$COMPOSE_FILE")
 
 if [ ! -f .env ]; then
   echo "ERROR: .env not found. Copy .env.example to .env and fill it in."
@@ -57,37 +62,79 @@ set -a
 source .env
 set +a
 
+if [ "$USE_COMBINED" = "1" ]; then
+  PUBLIC_UPSTREAM_IMAGE="ghcr.io/proteus-technologies-private-limited/opendraft-combined"
+  if [ -z "${OPENDRAFT_IMAGE:-}" ]; then
+    echo "ERROR: --combined requires OPENDRAFT_IMAGE to name an image built from this fork."
+    echo "The public upstream image does not contain this fork's auth and backup changes."
+    exit 1
+  fi
+  if [ "$OPENDRAFT_IMAGE" = "$PUBLIC_UPSTREAM_IMAGE" ]; then
+    echo "ERROR: OPENDRAFT_IMAGE points at the public upstream image."
+    echo "Build and publish this fork's Dockerfile.combined, then set its image repository here."
+    exit 1
+  fi
+fi
+
 for var in DEMO_HOST COLLAB_HOST ACME_EMAIL JWT_SECRET CORS_ORIGINS; do
   if [ -z "${!var:-}" ] || [[ "${!var}" == *"change-me"* ]]; then
     echo "ERROR: $var is unset or still the placeholder value in .env"
     exit 1
   fi
 done
+BACKUP_ENABLED="${OPENDRAFT_GIT_BACKUP_ENABLED:-false}"
+case "${BACKUP_ENABLED,,}" in
+  1|true|yes|on)
+    for var in OPENDRAFT_GIT_BACKUP_URL OPENDRAFT_GIT_BACKUP_USERNAME OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE; do
+      if [ -z "${!var:-}" ]; then
+        echo "ERROR: $var is required when Git backup is enabled"
+        exit 1
+      fi
+    done
+    if [ ! -f "$OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE" ]; then
+      echo "ERROR: Gitea token file does not exist: $OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE"
+      exit 1
+    fi
+    COMPOSE_ARGS+=(-f "$BACKUP_COMPOSE_FILE")
+    if [ -n "${OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE:-}" ]; then
+      if [ ! -f "$OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE" ]; then
+        echo "ERROR: Gitea CA bundle does not exist: $OPENDRAFT_GIT_BACKUP_CA_BUNDLE_HOST_FILE"
+        exit 1
+      fi
+      COMPOSE_ARGS+=(-f "$BACKUP_CA_COMPOSE_FILE")
+    fi
+    ;;
+  ""|0|false|no|off) ;;
+  *)
+    echo "ERROR: OPENDRAFT_GIT_BACKUP_ENABLED must be a boolean value"
+    exit 1
+    ;;
+esac
 
 echo "Mode: $MODE_LABEL"
-echo "Compose file: $COMPOSE_FILE"
+echo "Compose files: ${COMPOSE_ARGS[*]}"
 echo
 
 if [ "$USE_COMBINED" = "1" ]; then
   echo "Pulling image (tag: ${OPENDRAFT_VERSION:-latest})..."
-  docker compose -f "$COMPOSE_FILE" pull
+  docker compose "${COMPOSE_ARGS[@]}" pull
 else
   echo "Building images..."
-  docker compose -f "$COMPOSE_FILE" build
+  docker compose "${COMPOSE_ARGS[@]}" build
 fi
 
 echo "Starting stack..."
-docker compose -f "$COMPOSE_FILE" up -d
+docker compose "${COMPOSE_ARGS[@]}" up -d
 
 echo ""
 echo "Stack status:"
-docker compose -f "$COMPOSE_FILE" ps
+docker compose "${COMPOSE_ARGS[@]}" ps
 
 echo ""
 echo "Done. Once DNS has propagated, Caddy will fetch Let's Encrypt certs automatically."
 echo "  Demo:   https://${DEMO_HOST}"
 echo "  Collab: https://${COLLAB_HOST}  (wss://${COLLAB_HOST} for WebSocket)"
 echo ""
-echo "Logs:    docker compose -f $COMPOSE_FILE logs -f"
-echo "Restart: docker compose -f $COMPOSE_FILE restart"
-echo "Stop:    docker compose -f $COMPOSE_FILE down"
+echo "Logs:    docker compose ${COMPOSE_ARGS[*]} logs -f"
+echo "Restart: docker compose ${COMPOSE_ARGS[*]} restart"
+echo "Stop:    docker compose ${COMPOSE_ARGS[*]} down"

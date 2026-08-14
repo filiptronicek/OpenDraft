@@ -14,7 +14,12 @@ from typing import Optional
 
 import jwt
 
-from app.config import COLLAB_DB_PATH, COLLAB_JWT_SECRET
+from app.config import (
+    COLLAB_DB_PATH,
+    COLLAB_JWT_AUDIENCE,
+    COLLAB_JWT_ISSUER,
+    COLLAB_JWT_SECRET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ _missing_secret_warned = False
 
 
 def verify_access_token(token: str) -> Optional[dict]:
-    """Verify a collab-issued HS256 JWT. Returns the payload on success."""
+    """Verify a collab-issued HS256 access JWT. Return its payload on success."""
     global _missing_secret_warned
     if not COLLAB_JWT_SECRET:
         if not _missing_secret_warned:
@@ -43,7 +48,14 @@ def verify_access_token(token: str) -> Optional[dict]:
             _missing_secret_warned = True
         return None
     try:
-        payload = jwt.decode(token, COLLAB_JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(
+            token,
+            COLLAB_JWT_SECRET,
+            algorithms=["HS256"],
+            issuer=COLLAB_JWT_ISSUER,
+            audience=COLLAB_JWT_AUDIENCE,
+            options={"require": ["exp", "iss", "aud"]},
+        )
     except jwt.ExpiredSignatureError:
         return None
     except jwt.InvalidTokenError as exc:
@@ -61,8 +73,8 @@ def _open_collab_db() -> Optional[sqlite3.Connection]:
     if not COLLAB_DB_PATH:
         return None
     try:
-        # Open in read-only, immutable URI form so we never write to the
-        # collab database from the backend process.
+        # Open in read-only URI mode so we never write to the collaboration
+        # database while still observing current commits from its WAL.
         conn = sqlite3.connect(
             f"file:{COLLAB_DB_PATH}?mode=ro",
             uri=True,
@@ -105,12 +117,19 @@ def get_user_by_id(user_id: str) -> Optional[AuthUser]:
 
 def auth_user_from_payload(payload: dict) -> AuthUser:
     """Construct an AuthUser from just the JWT payload, for the case when the
-    backend cannot read the collab DB directly. email_verified defaults to False
-    — callers that need to enforce verification must call get_user_by_id or
-    proxy to /auth/me."""
+    backend cannot read the collab DB directly.
+
+    The caller must pass a payload returned by verify_access_token. The signed
+    identity claims make this a safe fallback for deployments where the backend
+    and collab server do not share a filesystem or database.
+    """
+    display_name = payload.get("name")
+    if not isinstance(display_name, str) or not display_name.strip():
+        display_name = str(payload["email"])
+
     return AuthUser(
         id=str(payload["sub"]),
         email=str(payload["email"]),
-        display_name=str(payload.get("email", "")),
-        email_verified=False,
+        display_name=display_name,
+        email_verified=payload.get("email_verified") is True,
     )

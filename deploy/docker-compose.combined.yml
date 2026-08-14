@@ -4,9 +4,9 @@
 # behind supervisord, so we expose both internal ports to Caddy and route
 # the two DuckDNS hostnames at them just like the per-service setup.
 #
-# Image tag is read from OPENDRAFT_VERSION (defaults to "latest"). Pin a
-# specific version in .env (e.g. OPENDRAFT_VERSION=0.16.2) for predictable
-# rollbacks.
+# OPENDRAFT_IMAGE must name a combined image built from this fork.
+# Its tag is read from OPENDRAFT_VERSION (defaults to "latest"). Pin a specific
+# version in .env for predictable rollbacks.
 
 services:
   caddy:
@@ -28,13 +28,21 @@ services:
       - opendraft
 
   opendraft:
-    image: ghcr.io/proteus-technologies-private-limited/opendraft-combined:${OPENDRAFT_VERSION:-latest}
+    image: ${OPENDRAFT_IMAGE:?Set OPENDRAFT_IMAGE to a combined image built from this fork}:${OPENDRAFT_VERSION:-latest}
     restart: unless-stopped
     expose:
       - "8080"
       - "8081"
     environment:
       JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-opendraft-collab}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-opendraft-backend}
+      APP_URL: https://${DEMO_HOST}
+      LOCAL_REGISTRATION_ENABLED: ${LOCAL_REGISTRATION_ENABLED:-true}
+      # Safe here because the backend port is only exposed behind Caddy.
+      FORWARDED_ALLOW_IPS: ${BACKEND_FORWARDED_ALLOW_IPS:-*}
+      # Safe here because both collab ports are only exposed behind Caddy.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-loopback,linklocal,uniquelocal}
       CORS_ORIGINS: ${CORS_ORIGINS}
       # SMTP — empty values fall back to "no email", which auto-verifies users.
       SMTP_HOST: ${SMTP_HOST:-}
@@ -47,6 +55,13 @@ services:
       SEED_DEMO_USER_EMAIL: ${SEED_DEMO_USER_EMAIL:-}
       SEED_DEMO_USER_PASSWORD: ${SEED_DEMO_USER_PASSWORD:-}
       SEED_DEMO_USER_NAME: ${SEED_DEMO_USER_NAME:-}
+      OPENDRAFT_GIT_BACKUP_ENABLED: ${OPENDRAFT_GIT_BACKUP_ENABLED:-false}
+      OPENDRAFT_GIT_BACKUP_URL: ${OPENDRAFT_GIT_BACKUP_URL:-}
+      OPENDRAFT_GIT_BACKUP_USERNAME: ${OPENDRAFT_GIT_BACKUP_USERNAME:-}
+      OPENDRAFT_GIT_BACKUP_TOKEN_FILE: /run/secrets/opendraft_gitea_token
+      OPENDRAFT_GIT_BACKUP_REF_PREFIX: ${OPENDRAFT_GIT_BACKUP_REF_PREFIX:-opendraft}
+      # The private-CA overlay replaces this with its mounted secret path.
+      OPENDRAFT_GIT_BACKUP_CA_BUNDLE: ${OPENDRAFT_GIT_BACKUP_CA_BUNDLE:-}
     volumes:
       - opendraft_data:/app/data
 

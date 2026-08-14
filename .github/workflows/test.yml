@@ -1,8 +1,7 @@
 name: Tests
 
-# Runs the frontend unit tests and the TypeScript build gate on every push and
-# pull request. Before this existed nothing ran `npm test`, so the suite could
-# silently rot.
+# Runs backend security/isolation tests plus collaboration and frontend build
+# gates on every push and pull request.
 
 on:
   push:
@@ -10,6 +9,68 @@ on:
   pull_request:
 
 jobs:
+  backend:
+    name: Backend (auth + isolation + Git backup)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Compile backend
+        run: python -m compileall -q backend/app
+
+      - name: Auth token tests
+        run: python test-script/test_backend_auth.py
+
+      - name: Per-user file isolation tests
+        run: python test-script/test_per_user_files.py
+
+      - name: Quota tests
+        run: python test-script/test_quota.py
+
+      - name: Git backup tests
+        run: python test-script/test_git_backup.py
+
+      - name: Filesystem path-security tests
+        run: python test-script/test_backend_path_security.py
+
+      - name: Link-preview SSRF tests
+        run: python test-script/test_link_preview_security.py
+
+  collaboration:
+    name: Collaboration server (build + security tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: collab-server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: collab-server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Security tests
+        run: npm test
+
   frontend:
     name: Frontend (typecheck + unit tests)
     runs-on: ubuntu-latest

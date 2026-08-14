@@ -5,7 +5,14 @@
 # Single combined container exposes backend on :8080 and collab on :8081.
 {$DEMO_HOST} {
 	encode gzip zstd
-	reverse_proxy opendraft:8080
+	@collab_server path /collab-server /collab-server/*
+	handle @collab_server {
+		uri strip_prefix /collab-server
+		reverse_proxy opendraft:8081
+	}
+	handle {
+		reverse_proxy opendraft:8080
+	}
 }
 
 {$COLLAB_HOST} {

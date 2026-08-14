@@ -18,8 +18,18 @@
 import { useSettingsStore } from '../stores/settingsStore';
 import { collabAuthApi } from './collabAuth';
 import { platformFetch } from './platform';
+import { API_BASE, getApiBase, getCollabWsUrl } from '../config';
+import { isTrustedAuthenticatedUrl, shouldRefreshAuthentication, type AuthenticatedUrlTrustOptions } from './authUrlTrust';
 
 let refreshing: Promise<string | null> | null = null;
+
+function currentTrustOptions(): AuthenticatedUrlTrustOptions {
+  return {
+    apiBases: [API_BASE, getApiBase()],
+    collabWsUrl: getCollabWsUrl(),
+    pageHref: window.location.href,
+  };
+}
 
 async function refreshOnce(): Promise<string | null> {
   if (refreshing) return refreshing;
@@ -55,17 +65,25 @@ function withAuth(init: RequestInit, token: string | null): RequestInit {
 }
 
 export async function authedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const trustOptions = currentTrustOptions();
+  if (!isTrustedAuthenticatedUrl(url, trustOptions)) {
+    // Arbitrary screenplay/image URLs never receive bearer credentials or a refresh retry.
+    return platformFetch(url, withAuth(init, null));
+  }
   const initial = useSettingsStore.getState().collabAuth.accessToken;
   // Route through platformFetch so HTTP backend URLs work from the Tauri
   // WebView (whose origin is https://tauri.localhost — plain fetch() to
   // http:// targets is blocked as mixed content). On web this is a thin
   // pass-through to the native fetch.
-  let res = await platformFetch(url, withAuth(init, initial));
+  const res = await platformFetch(url, withAuth(init, initial));
 
   if (res.status !== 401) return res;
 
-  // Only attempt refresh if we actually have a refresh token to try.
-  if (!useSettingsStore.getState().collabAuth.refreshToken) return res;
+  // Refresh only for the same trusted transport policy used above.
+  const hasRefreshToken = Boolean(useSettingsStore.getState().collabAuth.refreshToken);
+  if (!shouldRefreshAuthentication(url, res.status, hasRefreshToken, trustOptions)) {
+    return res;
+  }
 
   const fresh = await refreshOnce();
   if (!fresh) return res;

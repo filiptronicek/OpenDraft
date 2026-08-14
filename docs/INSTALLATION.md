@@ -60,6 +60,10 @@ Your screenplays are stored locally:
 
 Run OpenDraft in your web browser. Good for teams who want to host a shared instance, or if you prefer a browser-based workflow.
 
+For an internet-facing private Docker deployment, use the
+[private deployment guide](PRIVATE_DEPLOYMENT.md); it configures both auth
+services, same-origin collaboration, registration locking, and Gitea backup.
+
 ### Prerequisites
 
 Install these before running the setup script:

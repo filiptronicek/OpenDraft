@@ -2,19 +2,18 @@
 
 The collab server owns user registration, OTP email verification, password
 login, refresh tokens, and Google OAuth. Backend proxies writes to it and
-performs local JWT verification for `GET /me`.
+proxies current-user state back to the identity provider.
 
 Rationale: a single host (backend) serves the frontend; the frontend doesn't
-need to know about the collab server URL for auth. `GET /api/auth/me` uses
-local JWT verification so callers can detect invalid sessions without the
-extra hop.
+need to know about the collab server URL for auth. The /api/auth/me route uses
+the same authoritative user record as login and settings, including 2FA
+state.
 """
 
 from __future__ import annotations
 
 import logging
 import shutil
-from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -27,10 +26,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Headers we forward from the client to collab (auth + content type).
-# x-device-id is forwarded so the collab server's /devices endpoint can
-# flag the caller's current device in its response.
-_FORWARD_REQUEST_HEADERS = {"authorization", "content-type", "accept", "accept-language", "x-device-id"}
+# Preserve authentication, content negotiation, and browser device context.
+# The collab server uses x-device-id for the current-device flag and User-Agent
+# for new-device records and security notices.
+_FORWARD_REQUEST_HEADERS = {
+    "authorization", "content-type", "accept", "accept-language", "x-device-id", "user-agent",
+}
+
 # Headers to forward back from collab to the client (skip hop-by-hop).
 _HOP_BY_HOP = {
     "connection",
@@ -134,14 +136,12 @@ async def config_route(request: Request) -> Response:
 
 
 @router.get("/me")
-async def me(user: AuthUser = Depends(require_user)) -> dict[str, Any]:
-    """Local JWT verification; returns the authenticated user."""
-    return {
-        "id": user.id,
-        "email": user.email,
-        "displayName": user.display_name,
-        "emailVerified": user.email_verified,
-    }
+async def me(
+    request: Request,
+    _user: AuthUser = Depends(require_user),
+) -> Response:
+    """Return the identity provider authoritative current user state."""
+    return await _proxy(request, "GET", "me")
 
 
 @router.post("/verify-device")

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config import get_projects_dir
+from app.services import project_service
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,26 @@ class EmptyOverwriteError(Exception):
 
 def _scripts_dir(project_id: str) -> Path:
     """Return the scripts directory for the active user's project."""
-    scripts_path = get_projects_dir() / project_id / "scripts"
-    if not scripts_path.exists():
+    project_dir = project_service.get_project_dir(project_id)
+    scripts_path = project_service.resolve_contained_path(
+        project_dir, "scripts", label="Scripts path"
+    )
+    if not scripts_path.exists() or not scripts_path.is_dir():
         raise FileNotFoundError(f"Project '{project_id}' not found")
     return scripts_path
+
+
+def _script_paths(project_id: str, script_id: str) -> tuple[Path, Path]:
+    """Return contained metadata/content paths for a validated script ID."""
+    project_service.validate_resource_id(script_id, "Script")
+    scripts_path = _scripts_dir(project_id)
+    meta_file = project_service.resolve_contained_path(
+        scripts_path, f"{script_id}.meta.json", label="Script metadata path"
+    )
+    content_file = project_service.resolve_contained_path(
+        scripts_path, f"{script_id}.json", label="Script content path"
+    )
+    return meta_file, content_file
 
 
 def create_script(
@@ -31,7 +47,6 @@ def create_script(
     format: str = "json",
 ) -> dict:
     """Create a new script with a UUID, saving content and metadata files."""
-    scripts_path = _scripts_dir(project_id)
 
     script_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -46,11 +61,12 @@ def create_script(
     }
 
     script_content = content if content is not None else {}
+    meta_file, content_file = _script_paths(project_id, script_id)
 
-    (scripts_path / f"{script_id}.meta.json").write_text(
+    meta_file.write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
-    (scripts_path / f"{script_id}.json").write_text(
+    content_file.write_text(
         json.dumps(script_content, indent=2), encoding="utf-8"
     )
 
@@ -81,15 +97,29 @@ def _extract_preview(content: dict, max_chars: int = 200) -> str:
 
 
 def list_scripts(project_id: str, include_preview: bool = False) -> list[dict]:
-    """List all script metadata in a project, enriched with file size."""
+    """List metadata using canonical IDs derived from contained filenames."""
     scripts_path = _scripts_dir(project_id)
 
     metas = []
-    for meta_file in sorted(scripts_path.glob("*.meta.json")):
-        data = json.loads(meta_file.read_text(encoding="utf-8"))
-        # Add file size from the content file
-        script_id = data.get("id", "")
-        content_file = scripts_path / f"{script_id}.json"
+    suffix = ".meta.json"
+    for candidate in sorted(scripts_path.glob(f"*{suffix}")):
+        if candidate.is_symlink():
+            logger.warning("Skipping symlinked script metadata: %s", candidate)
+            continue
+        script_id = candidate.name[:-len(suffix)]
+        try:
+            meta_file, content_file = _script_paths(project_id, script_id)
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+        except (
+            project_service.InvalidResourceIdError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning("Skipping unsafe or invalid script metadata %s: %s", candidate, exc)
+            continue
+        data["id"] = script_id
         data["size_bytes"] = content_file.stat().st_size if content_file.exists() else 0
         data.setdefault("page_count", 0)
         data.setdefault("color", "")
@@ -114,15 +144,13 @@ def list_scripts(project_id: str, include_preview: bool = False) -> list[dict]:
 
 def get_script(project_id: str, script_id: str) -> dict:
     """Read a script's metadata and content."""
-    scripts_path = _scripts_dir(project_id)
-
-    meta_file = scripts_path / f"{script_id}.meta.json"
-    content_file = scripts_path / f"{script_id}.json"
+    meta_file, content_file = _script_paths(project_id, script_id)
 
     if not meta_file.exists():
         raise FileNotFoundError(f"Script '{script_id}' not found")
 
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    meta["id"] = script_id
     content = json.loads(content_file.read_text(encoding="utf-8")) if content_file.exists() else {}
 
     return {"meta": meta, "content": content}
@@ -159,10 +187,7 @@ def update_script(
     allow_empty_body: bool = False,
 ) -> dict:
     """Update a script's title and/or content."""
-    scripts_path = _scripts_dir(project_id)
-
-    meta_file = scripts_path / f"{script_id}.meta.json"
-    content_file = scripts_path / f"{script_id}.json"
+    meta_file, content_file = _script_paths(project_id, script_id)
 
     if not meta_file.exists():
         raise FileNotFoundError(f"Script '{script_id}' not found")
@@ -187,6 +212,7 @@ def update_script(
 
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
 
+    meta["id"] = script_id
     if title is not None:
         meta["title"] = title
     if color is not None:
@@ -215,7 +241,6 @@ def update_script(
 def duplicate_script(project_id: str, script_id: str) -> dict:
     """Duplicate a script with a new UUID and '(Copy)' title suffix."""
     original = get_script(project_id, script_id)
-    scripts_path = _scripts_dir(project_id)
 
     new_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -238,10 +263,11 @@ def duplicate_script(project_id: str, script_id: str) -> dict:
 
     content = original.get("content", {})
 
-    (scripts_path / f"{new_id}.meta.json").write_text(
+    meta_file, content_file = _script_paths(project_id, new_id)
+    meta_file.write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
-    (scripts_path / f"{new_id}.json").write_text(
+    content_file.write_text(
         json.dumps(content, indent=2), encoding="utf-8"
     )
 
@@ -250,10 +276,7 @@ def duplicate_script(project_id: str, script_id: str) -> dict:
 
 def delete_script(project_id: str, script_id: str) -> None:
     """Delete a script's content and metadata files."""
-    scripts_path = _scripts_dir(project_id)
-
-    meta_file = scripts_path / f"{script_id}.meta.json"
-    content_file = scripts_path / f"{script_id}.json"
+    meta_file, content_file = _script_paths(project_id, script_id)
 
     if not meta_file.exists():
         raise FileNotFoundError(f"Script '{script_id}' not found")

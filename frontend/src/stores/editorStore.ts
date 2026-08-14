@@ -401,6 +401,7 @@ export interface BeatColumn {
 }
 
 export interface BeatLinkPreview {
+  sourceUrl?: string;
   url: string;
   title: string;
   description: string;

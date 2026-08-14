@@ -1,0 +1,11 @@
+# Opt-in overlay for the combined-image stack.
+# Use via deploy.sh --combined when OPENDRAFT_GIT_BACKUP_ENABLED=true.
+services:
+  opendraft:
+    secrets:
+      - source: opendraft_gitea_token
+        target: opendraft_gitea_token
+
+secrets:
+  opendraft_gitea_token:
+    file: ${OPENDRAFT_GIT_BACKUP_TOKEN_HOST_FILE}

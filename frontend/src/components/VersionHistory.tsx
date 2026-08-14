@@ -166,7 +166,7 @@ const VersionHistory: React.FC = () => {
       const version = restoreConfirm;
       setRestoreConfirm(null);
       try {
-        await api.restoreVersion(currentProject.id, version.hash);
+        const restored = await api.restoreVersion(currentProject.id, version.hash);
         await loadVersions();
         setSelectedVersion(null);
         setDiffText(null);
@@ -187,7 +187,14 @@ const VersionHistory: React.FC = () => {
         } else {
           triggerScriptReload();
         }
-        showToast(`Restored to version ${version.short_hash}`, 'success');
+        if (restored.backup?.status === 'failed') {
+          showToast(
+            'Restored ' + version.short_hash + ' locally, but the Git backup failed',
+            'error',
+          );
+        } else {
+          showToast('Restored to version ' + version.short_hash, 'success');
+        }
       } catch (err) {
         showToast(`Restore failed: ${err instanceof Error ? err.message : 'unknown error'}`, 'error');
       }

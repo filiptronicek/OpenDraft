@@ -28,8 +28,26 @@ services:
     environment:
       OPENDRAFT_DATA_DIR: /app/data
       PORT: "8080"
+      COLLAB_JWT_SECRET: ${JWT_SECRET}
+      COLLAB_JWT_ISSUER: ${JWT_ISSUER:-opendraft-collab}
+      COLLAB_JWT_AUDIENCE: ${JWT_AUDIENCE:-opendraft-backend}
+      COLLAB_SERVER_URL: http://collab:8080
+      COLLAB_DB_PATH: /app/collab-data/collab.sqlite3
+      # This service is only exposed to Caddy on the private Compose network.
+      # Trust its forwarded client address so proxied auth rate limits are
+      # per-client instead of treating every login as if it came from Caddy.
+      FORWARDED_ALLOW_IPS: ${BACKEND_FORWARDED_ALLOW_IPS:-*}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      # Optional private Gitea backup. Add docker-compose.gitea.yml when enabled.
+      OPENDRAFT_GIT_BACKUP_ENABLED: ${OPENDRAFT_GIT_BACKUP_ENABLED:-false}
+      OPENDRAFT_GIT_BACKUP_URL: ${OPENDRAFT_GIT_BACKUP_URL:-}
+      OPENDRAFT_GIT_BACKUP_USERNAME: ${OPENDRAFT_GIT_BACKUP_USERNAME:-}
+      OPENDRAFT_GIT_BACKUP_TOKEN_FILE: /run/secrets/opendraft_gitea_token
+      OPENDRAFT_GIT_BACKUP_REF_PREFIX: ${OPENDRAFT_GIT_BACKUP_REF_PREFIX:-opendraft}
+      OPENDRAFT_GIT_BACKUP_CA_BUNDLE: ${OPENDRAFT_GIT_BACKUP_CA_BUNDLE:-}
     volumes:
       - demo_data:/app/data
+      - collab_data:/app/collab-data:ro
 
   collab:
     build:
@@ -45,12 +63,27 @@ services:
       DATA_DIR: /app/data
       DB_TYPE: sqlite
       JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-opendraft-collab}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-opendraft-backend}
+      APP_URL: https://${DEMO_HOST}
+      LOCAL_REGISTRATION_ENABLED: ${LOCAL_REGISTRATION_ENABLED:-true}
+      # Safe here because collab is only exposed inside the Caddy network.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-loopback,linklocal,uniquelocal}
       DOC_IDLE_TIMEOUT_MINUTES: "30"
       WS_MAX_CONNECTIONS_PER_IP: "50"
       WS_MAX_CONNECTIONS_PER_USER: "10"
       RATE_LIMIT_WINDOW_MS: "900000"
       RATE_LIMIT_MAX: "100"
       CORS_ORIGINS: ${CORS_ORIGINS}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SEED_DEMO_USER: ${SEED_DEMO_USER:-}
+      SEED_DEMO_USER_EMAIL: ${SEED_DEMO_USER_EMAIL:-}
+      SEED_DEMO_USER_PASSWORD: ${SEED_DEMO_USER_PASSWORD:-}
+      SEED_DEMO_USER_NAME: ${SEED_DEMO_USER_NAME:-}
     volumes:
       - collab_data:/app/data
 

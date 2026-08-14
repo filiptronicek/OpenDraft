@@ -614,7 +614,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
     }
     try {
       const result = await api.checkin(currentProject.id, checkinMessage.trim());
-      if (result.hash) {
+      if (result.backup?.status === 'failed') {
+        const label = result.short_hash ? 'Version ' + result.short_hash : 'Version';
+        showToast(label + ' saved locally, but the Git backup failed', 'error');
+      } else if (result.hash) {
         showToast(`Version saved: ${result.short_hash}`, 'success');
       } else {
         showToast(result.message || 'No changes to commit', 'success');

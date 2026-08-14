@@ -1,8 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import React, { useMemo, useRef, useCallback } from 'react';
 import { NodeViewWrapper, type NodeViewProps } from '@tiptap/react';
 import { api } from '../../services/api';
-import { authedFetch } from '../../services/authedFetch';
-import { isTauri } from '../../services/platform';
+import { AuthenticatedAssetImage } from '../../components/AuthenticatedAssetImage';
 
 const LINE_HEIGHT_PX = 16; // 12pt — matches pagination LINE_HEIGHT_PT
 
@@ -18,34 +17,14 @@ export const ScreenplayImageView: React.FC<NodeViewProps> = ({ node, updateAttri
     filename: string | null; width: number | null; align: string;
   };
   const imgRef = useRef<HTMLImageElement>(null);
-  const [blobUrl, setBlobUrl] = useState<string>('');
 
-  // The asset endpoint requires auth, which an <img> can't send — so on the web
-  // we fetch the bytes with the token and use a blob URL. Direct cases (data URL,
-  // or Tauri's asset://) are resolved synchronously below.
-  useEffect(() => {
-    if (src || !assetId || !projectId || isTauri()) return;
-    let objectUrl: string | null = null;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await authedFetch(api.getAssetUrl(projectId, assetId, filename || undefined));
-        if (!res.ok) return;
-        const blob = await res.blob();
-        objectUrl = URL.createObjectURL(blob);
-        if (!cancelled) setBlobUrl(objectUrl);
-      } catch { /* leave blank on failure */ }
-    })();
-    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [assetId, projectId, filename, src]);
-
-  const url = useMemo(() => {
+  const sourceUrl = useMemo(() => {
     if (src) return src;
-    if (assetId && projectId && isTauri()) {
+    if (assetId && projectId) {
       try { return api.getAssetUrl(projectId, assetId, filename || undefined); } catch { return ''; }
     }
-    return blobUrl;
-  }, [src, assetId, projectId, filename, blobUrl]);
+    return '';
+  }, [src, assetId, projectId, filename]);
 
   // On first load (no stored width), default to the natural width capped to the
   // content column, and record the rendered height in lines for pagination.
@@ -92,7 +71,14 @@ export const ScreenplayImageView: React.FC<NodeViewProps> = ({ node, updateAttri
       data-drag-handle
     >
       <span className="sp-image-inner" style={{ width: width ? `${width}px` : undefined }}>
-        <img ref={imgRef} src={url} alt="" draggable={false} onLoad={onLoad} className="sp-image-img" />
+        <AuthenticatedAssetImage
+          ref={imgRef}
+          src={sourceUrl}
+          alt=""
+          draggable={false}
+          onLoad={onLoad}
+          className="sp-image-img"
+        />
         {selected && editable && (
           <span className="sp-image-resize" onMouseDown={startResize} title="Drag to resize" />
         )}

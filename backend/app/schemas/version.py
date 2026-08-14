@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -13,11 +15,18 @@ class VersionInfo(BaseModel):
     author: str | None = None
 
 
+class GitBackupResult(BaseModel):
+    status: Literal["disabled", "succeeded", "failed"]
+    ref: str | None = None
+    message: str | None = None
+
+
 class VersionCommitResponse(BaseModel):
     hash: str | None = None
     short_hash: str | None = None
     message: str
     date: str | None = None
+    backup: GitBackupResult | None = None
 
 
 class DiffResponse(BaseModel):

@@ -10,6 +10,7 @@ import { api } from '../services/api';
 import { showToast } from './Toast';
 import MiniRichText from './MiniRichText';
 import { RelationshipMap } from './RelationshipMap';
+import { AuthenticatedAssetImage } from './AuthenticatedAssetImage';
 
 // Default colors for auto-assignment (VIBGYOR palette)
 const DEFAULT_HIGHLIGHT_COLORS = [
@@ -634,7 +635,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
         {prof.images && prof.images.length > 0 && projectId && (
           <div className="char-profile-images">
             <div className="char-profile-images-primary">
-              <img
+              <AuthenticatedAssetImage
                 src={getAssetUrl(prof.images[0])}
                 alt={charName}
                 className="char-profile-image-main"
@@ -645,7 +646,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
               <div className="char-profile-images-strip">
                 {prof.images.map((imgId, idx) => (
                   <div key={imgId} className={`char-profile-thumb-wrap${idx === 0 ? ' active' : ''}`}>
-                    <img
+                    <AuthenticatedAssetImage
                       src={getAssetUrl(imgId)}
                       alt={`${charName} ${idx + 1}`}
                       className="char-profile-thumb"
@@ -993,7 +994,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                 >
                   {/* Avatar: show primary image or color swatch */}
                   {primaryImageId && projectId ? (
-                    <img
+                    <AuthenticatedAssetImage
                       src={getAssetUrl(primaryImageId)}
                       alt={name}
                       className="char-profile-avatar"
@@ -1135,7 +1136,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                         {profile.images && profile.images.length > 0 && projectId && (
                           <div className="char-profile-images">
                             <div className="char-profile-images-primary">
-                              <img
+                              <AuthenticatedAssetImage
                                 src={getAssetUrl(profile.images[0])}
                                 alt={name}
                                 className="char-profile-image-main"
@@ -1146,7 +1147,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                               <div className="char-profile-images-strip">
                                 {profile.images.map((imgId, idx) => (
                                   <div key={imgId} className={`char-profile-thumb-wrap${idx === 0 ? ' active' : ''}`}>
-                                    <img
+                                    <AuthenticatedAssetImage
                                       src={getAssetUrl(imgId)}
                                       alt={`${name} ${idx + 1}`}
                                       className="char-profile-thumb"
@@ -1421,7 +1422,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                         onClick={() => !alreadyLinked && handleAssociateAsset(imagePickerFor, asset.id)}
                         title={alreadyLinked ? 'Already associated' : `Associate ${asset.original_name}`}
                       >
-                        <img src={getAssetUrl(asset.id)} alt={asset.original_name} />
+                        <AuthenticatedAssetImage src={getAssetUrl(asset.id)} alt={asset.original_name} />
                         <span className="char-image-picker-name">{asset.original_name}</span>
                         {alreadyLinked && <span className="char-image-picker-linked">Linked</span>}
                       </div>
@@ -1437,7 +1438,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
       {lightboxImage && (
         <div className="dialog-overlay char-lightbox-overlay" onClick={() => setLightboxImage(null)}>
           <div className="char-lightbox" onClick={(e) => e.stopPropagation()}>
-            <img src={lightboxImage.url} alt={lightboxImage.name} />
+            <AuthenticatedAssetImage src={lightboxImage.url} alt={lightboxImage.name} />
             <button className="char-lightbox-close" onClick={() => setLightboxImage(null)}>&times;</button>
           </div>
         </div>
