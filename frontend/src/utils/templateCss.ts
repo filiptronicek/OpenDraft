@@ -6,22 +6,38 @@
  */
 
 import type { FormattingTemplate, FormattingElementRule } from '../stores/formattingTypes';
-import { ELEMENT_CSS_CLASS } from '../stores/formattingTypes';
+import { ELEMENT_CSS_CLASS, titlePageFieldOf, isTitlePageRuleId } from '../stores/formattingTypes';
 import type { PageLayout } from '../stores/editorStore';
+import { fontStack } from './fonts';
 
 const STYLE_ELEMENT_ID = 'opendraft-template-css';
 
 /**
  * Generate a complete CSS string from a template and page layout.
  */
+export interface TemplateCssOptions {
+  /**
+   * Emit only the title page's rules.
+   *
+   * The industry-standard template is served by the static stylesheet rather
+   * than generated CSS, which is why it takes this path at all — but the title
+   * page has no static equivalent a template can drive, so its rules have to be
+   * emitted even there or a title-page font set in the template does nothing on
+   * the default template.
+   */
+  titlePageOnly?: boolean;
+}
+
 export function generateTemplateCss(
   template: FormattingTemplate,
   pageLayout: PageLayout,
+  options: TemplateCssOptions = {},
 ): string {
   const lines: string[] = [];
 
   for (const [elementId, rule] of Object.entries(template.rules)) {
     if (!rule.enabled) continue;
+    if (options.titlePageOnly && !isTitlePageRuleId(elementId)) continue;
 
     const selector = getSelector(elementId, rule);
     const props = generateRuleProperties(rule, pageLayout);
@@ -64,6 +80,10 @@ export function generateTemplateCss(
 }
 
 function getSelector(elementId: string, rule: FormattingElementRule): string {
+  // Title page elements are one node type distinguished by a `field` attribute,
+  // not a node type each, so they select on the class the node view renders.
+  const titleField = titlePageFieldOf(elementId);
+  if (titleField) return `.page .screenplay-element.title-page-${titleField}`;
   if (rule.isBuiltIn) {
     const cssClass = ELEMENT_CSS_CLASS[elementId];
     if (cssClass) {
@@ -75,6 +95,8 @@ function getSelector(elementId: string, rule: FormattingElementRule): string {
 }
 
 function getPlaceholderSelector(elementId: string, rule: FormattingElementRule): string {
+  const titleField = titlePageFieldOf(elementId);
+  if (titleField) return `div[data-type="title-page"][data-field="${titleField}"].is-empty::before`;
   if (rule.isBuiltIn) {
     const cssClass = ELEMENT_CSS_CLASS[elementId];
     // The data-type uses the CSS class name (hyphenated)
@@ -94,7 +116,9 @@ function generateRuleProperties(
 
   // Font family & size (null = use document default)
   if (rule.fontFamily) {
-    props.push(`font-family: '${rule.fontFamily}', 'Courier Prime', 'Courier New', monospace;`);
+    // Fallbacks matched to the font's own shape, so an element set in a serif
+    // or display face doesn't drop to Courier on a machine without it.
+    props.push(`font-family: ${fontStack(rule.fontFamily)};`);
   }
   if (rule.fontSize != null) {
     props.push(`font-size: ${rule.fontSize}pt;`);

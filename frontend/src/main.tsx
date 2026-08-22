@@ -3,8 +3,12 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App.tsx';
 import { initStorage } from './services/api';
+import { initScratchAssets } from './services/scratchAssets';
+import { scheduleScratchSweep } from './services/scratchSweep';
 import { initDemoInfo } from './services/demoInfo';
 import { getOS, isTauri } from './services/platform';
+import { initCustomFonts } from './services/customFonts';
+import { detectDeviceFonts } from './utils/deviceFonts';
 
 /**
  * Keep the `ios-windowed` class in sync with whether the app is running in an
@@ -82,6 +86,33 @@ async function init() {
   // initStorage() handles its own timeout and fallback internally —
   // no additional wrapping needed here.
   await initStorage();
+
+  // Where images go for a document that has no project yet, so the bytes never
+  // sit inside the document (and never inside a recovery snapshot). Awaited:
+  // once it resolves, image URLs resolve synchronously on Tauri.
+  await initScratchAssets();
+  // Housekeeping for images left behind by abandoned documents. Deliberately
+  // late and idle — a delayed sweep costs disk, a hasty one costs a picture.
+  scheduleScratchSweep();
+
+  // Bring back the writer's own TTF/OTF fonts, and work out which of the
+  // registry's system faces this machine actually has, before the first
+  // document renders — otherwise a script written in an installed font shows
+  // Courier for a frame. Neither can stop the app starting.
+  initCustomFonts().catch((err) => console.warn('[fonts] custom fonts unavailable:', err));
+
+  // Measuring a few hundred families is a few hundred canvas calls on the main
+  // thread — nothing next to a document, but no reason to make first paint wait
+  // for it either.
+  const findDeviceFonts = () => {
+    try {
+      detectDeviceFonts();
+    } catch (err) {
+      console.warn('[fonts] device font detection failed:', err);
+    }
+  };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(findDeviceFonts, { timeout: 4000 });
+  else setTimeout(findDeviceFonts, 1200);
 
   // Fetch the backend's demo-mode flag once so CollabLoginDialog/SettingsPage
   // can decide whether to show demo warnings. Non-blocking best-effort.

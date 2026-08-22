@@ -39,7 +39,8 @@ import type { LockedFormatting } from '../utils/effectiveFormatting';
 import FontPicker from './FontPicker';
 import ColorPicker from './ColorPicker';
 import LanguageSelector from './LanguageSelector';
-import { FONT_REGISTRY, loadFont } from '../utils/fonts';
+import { findFont, loadFontByName } from '../utils/fonts';
+import { isTitlePageRuleId } from '../stores/formattingTypes';
 
 interface ToolbarProps {
   editor: Editor | null;
@@ -116,7 +117,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
       const detectedSize = (attrs.fontSize as string | undefined) || '';
       const effectiveFont = detectedFont || rule?.fontFamily || fontFamily;
       setCursorFont(effectiveFont);
-      if (effectiveFont && !FONT_REGISTRY.find((f) => f.name === effectiveFont)) {
+      if (effectiveFont && !findFont(effectiveFont)) {
         setExtraFonts((prev) => (prev.includes(effectiveFont) ? prev : [...prev, effectiveFont]));
       }
       if (detectedSize) {
@@ -169,7 +170,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
       const single = [...fonts][0] || '';
       const effective = single || rule?.fontFamily || fontFamily;
       setCursorFont(effective);
-      if (effective && !FONT_REGISTRY.find((f) => f.name === effective)) {
+      if (effective && !findFont(effective)) {
         setExtraFonts((prev) => (prev.includes(effective) ? prev : [...prev, effective]));
       }
     }
@@ -209,7 +210,12 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
           for (const mark of node.marks) {
             if (mark.type.name === 'textStyle' && mark.attrs.fontFamily) {
               const f = mark.attrs.fontFamily as string;
-              if (!FONT_REGISTRY.find(r => r.name === f)) {
+              if (findFont(f)) {
+                // A font the app knows: make sure it is actually loaded, so a
+                // script written elsewhere renders in the face it names rather
+                // than only once someone opens the picker.
+                loadFontByName(f);
+              } else {
                 found.add(f);
               }
             }
@@ -254,6 +260,8 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
   };
 
   /** True when the selection is inside an AV cell — used to scope the element dropdown. */
+  const isInTitlePage = isTitlePageRuleId(String(activeElement));
+
   const isInsideAvCell = React.useMemo(() => {
     if (!editor) return false;
     try {
@@ -395,13 +403,29 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
     // rotating the device, or a Split View divider drag that lands on the same
     // pane width the toolbar already had.  The width-guard above would swallow
     // those, leaving the overflow menu describing the previous layout.
-    const breakpoint = window.matchMedia('(max-width: 768px)');
-    breakpoint.addEventListener('change', remeasure);
+    // Legacy WebKit (Safari < 14, i.e. macOS 10.15 and earlier) ships a
+    // MediaQueryList without addEventListener — only the deprecated
+    // addListener/removeListener pair.  Calling the modern API there throws
+    // during mount and takes the whole app down, so feature-detect both.
+    const breakpoint = window.matchMedia?.('(max-width: 768px)');
+    if (breakpoint) {
+      if (typeof breakpoint.addEventListener === 'function') {
+        breakpoint.addEventListener('change', remeasure);
+      } else if (typeof breakpoint.addListener === 'function') {
+        breakpoint.addListener(remeasure);
+      }
+    }
 
     requestAnimationFrame(measure);
     return () => {
       ro.disconnect();
-      breakpoint.removeEventListener('change', remeasure);
+      if (breakpoint) {
+        if (typeof breakpoint.removeEventListener === 'function') {
+          breakpoint.removeEventListener('change', remeasure);
+        } else if (typeof breakpoint.removeListener === 'function') {
+          breakpoint.removeListener(remeasure);
+        }
+      }
       cancelAnimationFrame(rafId);
     };
   }, []);
@@ -535,10 +559,10 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
         <FontPicker
           value={cursorFont}
           extraFonts={extraFonts}
+          onManageFonts={() => useEditorStore.getState().setFontsDialogOpen(true)}
           onChange={(val) => {
             if (locked.fontFamily) return;
-            const entry = FONT_REGISTRY.find(f => f.name === val);
-            if (entry) loadFont(entry);
+            loadFontByName(val);
             // Picking a font styles the selection — it must not rewrite the
             // document's own font, or every local change would redefine what
             // unstyled text elsewhere renders as (and what this picker reports
@@ -914,9 +938,21 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
           className="element-selector"
           value={activeElement}
           onChange={handleElementChange}
+          disabled={isInTitlePage}
+          title={isInTitlePage
+            ? 'Title page elements are set in the Title Page editor; their formatting lives in the template'
+            : 'Element type'}
         >
+          {/* The title page's fields have template rules but are not things a
+              paragraph converts into, so they never appear here — only as the
+              read-only label below when the cursor is actually in one. */}
+          {isInTitlePage && (
+            <option value={activeElement}>
+              {activeTemplate.rules[activeElement]?.label || 'Title Page'}
+            </option>
+          )}
           {Object.values(activeTemplate.rules)
-            .filter((r) => r.enabled)
+            .filter((r) => r.enabled && !isTitlePageRuleId(r.id))
             // When inside an AV cell, only cell-valid types make sense — selecting
             // sceneHeading/action/etc. silently fails the schema check anyway.
             .filter((r) => isInsideAvCell ? AV_CELL_ELEMENT_IDS.includes(r.id) : !AV_CELL_ELEMENT_IDS.includes(r.id))

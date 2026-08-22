@@ -13,7 +13,9 @@ import { exportPDF } from '../utils/pdfExporter';
 import { downloadDocx } from '../utils/docxExporter';
 import { parseDocx } from '../utils/docxImporter';
 import { serializeOdraft, downloadOdraft } from '../utils/odraftFormat';
+import { packScratchAssets } from '../services/snapshotAssets';
 import { pasteAsFountain } from '../utils/pasteFountain';
+import { copySelection, cutSelection, pasteIntoEditor } from '../utils/clipboardCommands';
 import {
   parseScreenplayImport,
   resetStoresForImport,
@@ -27,12 +29,14 @@ import ScriptFormatPreferencesDialog from './ScriptFormatPreferencesDialog';
 import ScriptFormatPickerDialog from './ScriptFormatPickerDialog';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
 import { applyScriptFormat } from '../utils/applyScriptFormat';
+import { isTitlePageRuleId } from '../stores/formattingTypes';
 import { INDUSTRY_STANDARD_ID, ELEMENT_DESCRIPTIONS } from '../stores/formattingTypes';
 import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFormatting';
 import { selectionStartsNewPage } from '../editor/extensions';
 import { pluginRegistry } from '../plugins/registry';
 import AuthIndicator from './AuthIndicator';
 import { useNavigate } from 'react-router-dom';
+import { flushPendingSave } from '../services/pendingSave';
 import { scriptApi } from '../services/scriptApi';
 import { useSettingsStore } from '../stores/settingsStore';
 import { clearEditorHistory } from '../editor/clearHistory';
@@ -159,6 +163,7 @@ import {
   FaToggleOn,
   FaLock,
   FaFileSignature,
+  FaFont,
 } from 'react-icons/fa';
 
 interface MenuBarProps {
@@ -401,6 +406,36 @@ const MenuBar: React.FC<MenuBarProps> = ({
       reportSaveError(err, 'manual-save');
     }
   }, [editor, currentProject, currentScriptId, buildSaveContent, setSaveAsOpen, serializeForOrigin, onDocumentSaved]);
+
+  /**
+   * Leave the editor for another screen of the app.
+   *
+   * Router navigation, not `window.location`: a full page load tore the whole
+   * app down and rebuilt it, and it reset the history stack, so the Projects
+   * screen's back arrow had nothing to return to and fell back to reloading
+   * the editor from scratch instead of returning to the script the user left
+   * (issues #65, #66).
+   *
+   * The catch is that a router navigation fires neither `beforeunload` nor
+   * Tauri's close handler, which are what used to flush unsaved text on the
+   * way out, and the editor's auto-save tick is 30 seconds wide. So flush
+   * first — awaited, which is more than the unload handler could promise in a
+   * WebView. flushPendingSave is a no-op when there is nothing outstanding, or
+   * no document with somewhere to save to.
+   */
+  const leaveEditor = useCallback(async (go: () => void) => {
+    await flushPendingSave();
+    go();
+  }, []);
+
+  const goToProjects = useCallback(
+    () => { void leaveEditor(() => navigate('/projects')); },
+    [leaveEditor, navigate],
+  );
+  const goToSettings = useCallback(
+    () => { void leaveEditor(() => navigate('/settings')); },
+    [leaveEditor, navigate],
+  );
 
   /** Save As: always opens the destination/project/filename picker, even when
    *  the current document is already saved. Use this to fork a local script
@@ -757,6 +792,27 @@ const MenuBar: React.FC<MenuBarProps> = ({
     if (!editor) return;
     editor.chain().focus().setNode(type).run();
   };
+
+  /**
+   * Cut, Copy and Paste run off ProseMirror's selection rather than the DOM's.
+   * Opening this menu takes focus out of the editor, and on iOS that collapses
+   * the DOM selection — which is why the old `document.execCommand` calls did
+   * nothing there while the long-press callout worked fine.
+   */
+  const handleCut = useCallback(async () => {
+    const result = await cutSelection(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
+
+  const handleCopy = useCallback(async () => {
+    const result = await copySelection(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
+
+  const handlePaste = useCallback(async () => {
+    const result = await pasteIntoEditor(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
 
   const handlePasteAsFountain = useCallback(async () => {
     if (!editor) return;
@@ -1233,7 +1289,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
   const handleBackupNow = useCallback(async () => {
     if (!backupsAvailable()) {
       showToast('Choose a backup folder first', 'info');
-      navigate('/settings');
+      goToSettings();
       return;
     }
     const content = buildSaveContent();
@@ -1256,13 +1312,13 @@ const MenuBar: React.FC<MenuBarProps> = ({
       const reason = describeBackupError(err instanceof Error ? err.message : String(err));
       showToast(`Backup failed — ${reason}`, 'error');
     }
-  }, [buildSaveContent, currentProject, currentScriptId, navigate]);
+  }, [buildSaveContent, currentProject, currentScriptId, goToSettings]);
 
   const handleOpenBackupFolder = useCallback(async () => {
     const folder = useSettingsStore.getState().backupFolder;
     if (!folder) {
       showToast('Choose a backup folder first', 'info');
-      navigate('/settings');
+      goToSettings();
       return;
     }
     try {
@@ -1270,7 +1326,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
     } catch {
       showToast('Could not open the backup folder', 'error');
     }
-  }, [navigate]);
+  }, [goToSettings]);
 
   const handleExportOdraft = useCallback(async () => {
     if (!editor) return;
@@ -1287,10 +1343,16 @@ const MenuBar: React.FC<MenuBarProps> = ({
       // script it came from.
       const content = buildSaveContent();
       if (!content) return;
+      // A document with no project keeps its images in the scratch store, so
+      // they have to be packed into the file explicitly. They used to travel
+      // (as base64) simply by being inside the document; without this they
+      // would silently vanish from the export.
+      const packed = currentProject ? null : await packScratchAssets(content);
       await downloadOdraft(meta, content, {
         projectId: currentProject?.id ?? null,
         scriptId: currentScriptId ?? null,
         projectTitle: currentProject?.name,
+        ...(packed ? { assets: packed.assets, assetsOmitted: packed.truncated } : {}),
       });
     } catch (err) {
       console.error('OpenDraft export failed:', err);
@@ -1457,7 +1519,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
               ...(supportsRevealBackup() ? [
                 { icon: <FaFolderOpen />, label: 'Open Backup Folder', action: handleOpenBackupFolder },
               ] : []),
-              { icon: <FaCog />, label: 'Backup Settings\u2026', action: () => navigate('/settings') },
+              { icon: <FaCog />, label: 'Backup Settings\u2026', action: goToSettings },
             ],
           },
         ] : []),
@@ -1472,9 +1534,9 @@ const MenuBar: React.FC<MenuBarProps> = ({
         { icon: <FaUndo />, label: 'Undo', shortcut: `${mod}Z`, action: () => { try { editor?.chain().focus().undo().run(); } catch {} } },
         { icon: <FaRedo />, label: 'Redo', shortcut: `⇧${mod}Z`, action: () => { try { editor?.chain().focus().redo().run(); } catch {} } },
         { separator: true, label: '' },
-        { icon: <FaCut />, label: 'Cut', shortcut: `${mod}X`, action: () => document.execCommand('cut') },
-        { icon: <FaCopy />, label: 'Copy', shortcut: `${mod}C`, action: () => document.execCommand('copy') },
-        { icon: <FaPaste />, label: 'Paste', shortcut: `${mod}V`, action: () => document.execCommand('paste') },
+        { icon: <FaCut />, label: 'Cut', shortcut: `${mod}X`, action: handleCut, disabled: !editor },
+        { icon: <FaCopy />, label: 'Copy', shortcut: `${mod}C`, action: handleCopy, disabled: !editor },
+        { icon: <FaPaste />, label: 'Paste', shortcut: `${mod}V`, action: handlePaste, disabled: !editor },
         { icon: <FaPaste />, label: 'Paste as Fountain', shortcut: `⇧${mod}V`, action: handlePasteAsFountain, disabled: !editor },
         { icon: <FaMousePointer />, label: 'Select All', shortcut: `${mod}A`, action: () => editor?.chain().focus().selectAll().run() },
         { separator: true, label: '' },
@@ -1499,7 +1561,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
         {
           icon: <FaListOl />, label: 'Element',
           children: [
-            ...Object.values(activeTemplate.rules).filter((r) => r.enabled).map((r) => {
+            // Title page fields have template rules but are not conversion
+            // targets — "make this line of action a copyright notice" is not a
+            // thing. They are reached through the Title Page editor.
+            ...Object.values(activeTemplate.rules).filter((r) => r.enabled && !isTitlePageRuleId(r.id)).map((r) => {
               const shortcuts: Record<string, string> = {
                 sceneHeading: `${mod}1`, action: `${mod}2`, character: `${mod}3`, dialogue: `${mod}4`,
                 parenthetical: `${mod}5`, transition: `${mod}6`, general: `${mod}7`, shot: `${mod}8`,
@@ -1547,6 +1612,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           disabled: !editor,
         },
         { separator: true, label: '' },
+        { icon: <FaFont />, label: 'Fonts…', action: () => useEditorStore.getState().setFontsDialogOpen(true) },
         { icon: <FaCommentDots />, label: 'Mores & Continueds…', action: () => useEditorStore.getState().setMoresContdsOpen(true) },
         { icon: <FaHeading />, label: 'Header & Footer…', action: () => useEditorStore.getState().setHeaderFooterOpen(true) },
         { icon: <FaImage />, label: 'Insert Image…', action: () => useEditorStore.getState().imageInsertHandler?.() },
@@ -1630,7 +1696,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           ],
         },
         { separator: true, label: '' },
-        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: () => { window.location.href = '/projects'; }, disabled: isCollabGuest },
+        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: goToProjects, disabled: isCollabGuest },
         { icon: <FaBoxes />, label: 'Asset Manager', action: () => useAssetStore.getState().toggleAssetManager() },
         { separator: true, label: '' },
         {
@@ -1649,7 +1715,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           ],
         },
         { separator: true, label: '' },
-        { icon: <FaCog />, label: 'System Settings…', action: () => navigate('/settings') },
+        { icon: <FaCog />, label: 'System Settings…', action: goToSettings },
         { separator: true, label: '' },
         {
           icon: <FaFilm />, label: 'Production',
@@ -1764,6 +1830,9 @@ const MenuBar: React.FC<MenuBarProps> = ({
   // Draggable FAB position — persisted to localStorage
   const FAB_POS_KEY = 'opendraft:fabPosition';
   const FAB_SIZE = 36;
+  // How far down the window the iPadOS window control reaches, plus room for
+  // the FAB itself — below this the corner is the app's own again.
+  const FAB_PILL_BAND_PX = 56;
   const [fabPos, setFabPos] = useState<{ x: number; y: number } | null>(() => {
     try {
       const s = localStorage.getItem('opendraft:fabPosition');
@@ -1790,6 +1859,16 @@ const MenuBar: React.FC<MenuBarProps> = ({
   const fabTopStyle = isAndroidWebView
     ? `max(${fabY}px, calc(max(env(safe-area-inset-top), 28px) + 8px))`
     : `max(${fabY}px, calc(env(safe-area-inset-top, 0px) + 8px))`;
+  // Same problem on the other axis: iPadOS draws its window-management pill
+  // over the top-leading corner of a windowed app, and the FAB's default spot
+  // is right underneath it. This FAB *is* the menu while the toolbar is
+  // hidden, so a buried one leaves no way to reach anything (issue #66).
+  // --ios-window-gutter is 0 unless the app is in a window, and the clamp only
+  // applies in the band the pill occupies — lower down, the leading edge is
+  // the user's to park on.
+  const fabLeftStyle = fabY < FAB_PILL_BAND_PX
+    ? `max(${fabX}px, calc(env(safe-area-inset-left, 0px) + var(--ios-window-gutter, 0px)))`
+    : `max(${fabX}px, env(safe-area-inset-left, 0px))`;
 
   // Desktop: pointer events with capture for mouse drag
   const handleFabPointerDown = useCallback((e: React.PointerEvent) => {
@@ -1989,7 +2068,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           <div
             ref={fabElRef}
             className={`menu-fab ${floatingMenuOpen ? 'menu-fab--open' : ''}`}
-            style={{ left: fabX, top: fabTopStyle }}
+            style={{ left: fabLeftStyle, top: fabTopStyle }}
             onPointerDown={handleFabPointerDown}
             onPointerMove={handleFabPointerMove}
             onPointerUp={handleFabPointerUp}
@@ -2224,6 +2303,21 @@ const MenuBar: React.FC<MenuBarProps> = ({
             <div className="about-whats-new">
               <div className="about-section-title">What's New in 0.24.1</div>
               <div className="about-changelog">
+              <div className="about-subsection-title">v0.25.0</div>
+              <ul className="about-list">
+                <li><strong>A Font Library Worth The Name</strong> — Around 185 fonts, grouped by what they are: screenplay, typewriter, serif, sans-serif, monospace, display faces for title pages, handwriting, and the Noto families covering most writing systems. The picker searches, and every name is drawn in its own face so you can see what you are choosing. Courier Prime 12pt is still what a new script is.</li>
+                <li><strong>Install Your Own Fonts</strong> — Format → Fonts… takes TrueType and OpenType files. The family name is read out of the font itself, so weights group together rather than arriving as separate families. Because OpenDraft holds the file, a font you install is embedded in exported PDFs — a title page in your own typeface comes out looking like the one on screen.</li>
+                <li><strong>The Fonts Already On Your Device</strong> — Faces from your operating system are checked before they are offered: one this platform hasn't got is greyed out and marked <em>not installed</em>, instead of silently rendering as Courier. On iPad and Android, where no app can list installed fonts, you can add one by name.</li>
+                <li><strong>A Font Choice Travels With The Script</strong> — Open a script on a machine without the font and OpenDraft substitutes the closest match of the same kind — a typewriter face for a typewriter face, a serif for a serif — rather than dropping everything to Courier. The original name is kept, so the font returns the moment you open it somewhere it exists.</li>
+                <li><strong>The Title Page Is Part Of The Template</strong> — Title, Credit &amp; Author, Draft &amp; Date, Contact, Copyright and Notes are formatting elements like any other, so you can set the title in a display face at 24pt and leave the contact block in Courier. Anything you change by hand outranks the template and stays put.</li>
+                <li><strong>Comfortable On A Tablet</strong> — Touch devices start in the comfortable toolbar, and the menus, font list and dialogs have finger-sized targets rather than mouse-sized ones. The font picker no longer closed itself the instant the on-screen keyboard appeared, which on iPad made tapping it look like it did nothing at all.</li>
+                <li><strong>Cut, Copy And Paste From The Menus</strong> — All three ran on the DOM selection, and tapping a menu item takes focus out of the editor — which on iOS collapses the selection with it, so Cut and Copy silently did nothing and Paste had never worked from a menu at all.</li>
+                <li><strong>Pasted Text Keeps Its Font</strong> — A paste used to have every font stripped out of it. It now keeps the face it came with, while taking the element type of wherever it lands.</li>
+                <li><strong>Highlights Come Across</strong> — Google Docs, Word Online, Notes and the browsers all write a highlight as a coloured background rather than a <code>&lt;mark&gt;</code>, so a highlighted sentence pasted in as plain text. It arrives highlighted now.</li>
+                <li><strong>Images Live Outside The Document</strong> — An image added to a script with no project behind it was embedded inside the document, where a single phone photo weighed about as much as five hundred pages of screenplay — enough to push the file past the crash-recovery limit and leave it with no crash protection at all.</li>
+                <li><strong>Android: Back At The First Screen</strong> — Pressing Back on the opening screen now backgrounds the app, the way every Android app does, instead of tearing down the view and reopening to a blank white page.</li>
+              </ul>
+
               <div className="about-subsection-title">v0.24.1</div>
               <ul className="about-list">
                 <li><strong>Header &amp; Footer Has Its Own Dialog</strong> — Format → Header &amp; Footer, out of the bottom of Page Setup where nobody found it. Buttons insert the page number, total pages, title, date and revision colour into whichever slot you are typing in, and a preview of the first two pages shows what you will actually get.</li>

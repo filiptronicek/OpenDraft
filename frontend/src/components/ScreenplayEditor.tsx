@@ -15,7 +15,7 @@ import TextAlign from '@tiptap/extension-text-align';
 import Placeholder from '@tiptap/extension-placeholder';
 import TextStyle from '@tiptap/extension-text-style';
 import Color from '@tiptap/extension-color';
-import FontFamily from '@tiptap/extension-font-family';
+import FontFamily from '../editor/extensions/ScreenplayFontFamily';
 import { Extension } from '@tiptap/core';
 import * as Y from 'yjs';
 import { HocuspocusProvider } from '@hocuspocus/provider';
@@ -23,7 +23,7 @@ import { HocuspocusProvider } from '@hocuspocus/provider';
 import {
   SceneHeading, Action, Character, Dialogue, Parenthetical,
   Transition, General, Shot, NewAct, EndOfAct, Lyrics,
-  ShowEpisode, CastList, FontSize, ScriptNoteMark, TagMark,
+  ShowEpisode, CastList, FontSize, PasteFormatting, ScriptNoteMark, TagMark,
   FormatOverride, CustomElement, DualDialogue, DualDialogueColumn,
   TitlePage,
   AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvKeymap,
@@ -33,7 +33,7 @@ import { registerAvCellPicker } from '../editor/extensions/AvBlock';
 import Strike from '@tiptap/extension-strike';
 import Subscript from '@tiptap/extension-subscript';
 import Superscript from '@tiptap/extension-superscript';
-import Highlight from '@tiptap/extension-highlight';
+import { PastedHighlight } from '../editor/extensions/PastedHighlight';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
 import { generateTemplateCss, injectTemplateCss } from '../utils/templateCss';
 import { docHasAnyText } from '../utils/docText';
@@ -41,7 +41,10 @@ import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFo
 import { createPaginationPlugin, getPageMetrics, activeTemplateHints } from '../editor/pagination';
 import { createContdCasePlugin } from '../editor/contdCase';
 import { ScreenplayImage } from '../editor/extensions/ScreenplayImage';
-import { insertImageNode } from '../utils/insertImage';
+import { buildImageAttrs, insertImageNode, warnIfImageDegraded } from '../utils/insertImage';
+import { demoteDataUrlsToScratch, promoteScratchImages } from '../services/promoteScratchAssets';
+import { docHasInlineImageBytes, docHasScratchImages } from '../utils/scratchRefs';
+import { setLiveScratchDocSource } from '../services/scratchSweep';
 
 import { useEditorStore, DEFAULT_PAGE_LAYOUT, DEFAULT_TAG_CATEGORIES, resolveMoresContds, resolveHeaderFooter, printedPageNumber } from '../stores/editorStore';
 import type { ElementType, HeaderFooterContent } from '../stores/editorStore';
@@ -57,6 +60,7 @@ import ScriptStatistics from './ScriptStatistics';
 import ScriptNotes from './ScriptNotes';
 import CharacterProfiles from './CharacterProfiles';
 import TagsPanel from './TagsPanel';
+import { PluginPanelTabs } from './PluginPanelTabs';
 import LocationDatabase from './LocationDatabase';
 import FormatPanel from './FormatPanel';
 import StatusBar from './StatusBar';
@@ -107,7 +111,8 @@ import { showToast } from './Toast';
 import VersionHistory from './VersionHistory';
 import AssetManager from './AssetManager';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useGoBack } from '../hooks/useGoBack';
+import { useGoBack, useGoBackTo } from '../hooks/useGoBack';
+import { setPendingSaveFlush } from '../services/pendingSave';
 import OpenFile from './OpenFile';
 import type { OpenSource } from './OpenFile';
 import WelcomeDialog, { type WelcomeChoice } from './WelcomeDialog';
@@ -126,6 +131,9 @@ import { stashSessionDoc, takeSessionDoc, clearSessionDoc } from '../utils/sessi
 import SaveAsDialog from './SaveAsDialog';
 import TitlePageEditor from './TitlePageEditor';
 import MoresContdsDialog from './MoresContdsDialog';
+import FontsDialog from './FontsDialog';
+import { fontStack } from '../utils/fonts';
+import { titlePageRuleId } from '../stores/formattingTypes';
 import ShareDialog from './ShareDialog';
 import CollabLoginDialog from './CollabLoginDialog';
 import JoinCollabDialog from './JoinCollabDialog';
@@ -256,6 +264,12 @@ const ScreenplayEditor: React.FC = () => {
   const navigate = useNavigate();
   const goBack = useGoBack();
   const isHistoryMode = Boolean(urlCommitHash);
+  // Leaving read-only history mode unwinds to the editor entry it was opened
+  // from; pushing a second one instead left the version sitting on the stack
+  // for the next Back press to walk into (issue #66).
+  const leaveHistoryMode = useGoBackTo(
+    urlProjectId && urlScriptId ? `/project/${urlProjectId}/edit/${urlScriptId}` : '/',
+  );
 
   const {
     setActiveElement, setScenes, setPageCount, setCurrentPage,
@@ -375,7 +389,9 @@ const ScreenplayEditor: React.FC = () => {
     setCurrentScriptId(null);
     setDocumentTitle('Untitled Screenplay');
     setEditorKey((k) => k + 1);
-    navigate('/');
+    // replace, not push: the session behind us is over, and leaving
+    // /collab/:token on the stack puts a dead session one Back press away.
+    navigate('/', { replace: true });
   }, [destroyCollab, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
   const handleSessionEndedRef = useRef(handleSessionEnded);
@@ -488,7 +504,8 @@ const ScreenplayEditor: React.FC = () => {
             setDocumentTitle('Untitled Screenplay');
           }
           setEditorKey((k) => k + 1);
-          if (!isHost) navigate('/');
+          // replace: the collab route no longer leads anywhere (see above).
+          if (!isHost) navigate('/', { replace: true });
         }, 0);
       },
       onAwarenessUpdate: ({ states }) => {
@@ -654,6 +671,7 @@ const ScreenplayEditor: React.FC = () => {
     openFileOpen, setOpenFileOpen, saveAsOpen, setSaveAsOpen,
     titlePageEditorOpen, setTitlePageEditorOpen,
     moresContdsOpen, setMoresContdsOpen,
+    fontsDialogOpen, setFontsDialogOpen,
     compareVersionOpen, setCompareVersionOpen,
     setTrackChangesEnabled, setTrackChangesLabel,
   } = useEditorStore();
@@ -762,7 +780,9 @@ const ScreenplayEditor: React.FC = () => {
       } catch (err) {
         showToast('Invalid or expired collaboration link', 'error');
         setCollabLoading(false);
-        navigate('/');
+        // replace: pushing here left the bad link one Back press away, and
+        // returning to it just failed and pushed again.
+        navigate('/', { replace: true });
       }
     })();
   }, [urlCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
@@ -821,8 +841,9 @@ const ScreenplayEditor: React.FC = () => {
     setCollabRole('editor');
 
     if (isHost && currentProject && currentScriptId) {
-      // Navigate to the project URL so the content-loading effect reloads the saved file
-      navigate(`/project/${currentProject.id}/edit/${currentScriptId}`);
+      // Navigate to the project URL so the content-loading effect reloads the
+      // saved file. replace: the collab route it came from is finished.
+      navigate(`/project/${currentProject.id}/edit/${currentScriptId}`, { replace: true });
       showToast('Collaboration session ended', 'success');
     } else if (isHost) {
       setEditorKey((k) => k + 1);
@@ -833,7 +854,7 @@ const ScreenplayEditor: React.FC = () => {
       setCurrentScriptId(null);
       setDocumentTitle('Untitled Screenplay');
       setEditorKey((k) => k + 1);
-      navigate('/');
+      navigate('/', { replace: true });
     }
   }, [destroyCollab, collabUserName, collabColor, currentProject, currentScriptId, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
@@ -1419,8 +1440,8 @@ const ScreenplayEditor: React.FC = () => {
       Text, ScreenplayHardBreak, HardBreakLeafText,
       Bold, Italic, Underline, Strike, Dropcursor, Gapcursor,
       Subscript, Superscript,
-      Highlight.configure({ multicolor: true }),
-      TextStyle, Color, FontFamily, FontSize,
+      PastedHighlight.configure({ multicolor: true }),
+      TextStyle, Color, FontFamily, FontSize, PasteFormatting,
       FormatOverride, CustomElement, ScreenplayImage,
       // Use History in normal mode, Collaboration in collab mode
       ...(collabMode ? collabExtensions : [History.configure({ newGroupDelay: 150 })]),
@@ -1488,6 +1509,15 @@ const ScreenplayEditor: React.FC = () => {
           return;
         }
       }
+      // A title page node is one type with a `field` attribute, so it needs
+      // asking about separately — and it has to be asked at all: leaving it out
+      // meant the selector kept whatever it last showed, which for a fresh
+      // document is Action. Putting the cursor in the title reported "Action".
+      if (ed.isActive('titlePage')) {
+        const field = (ed.getAttributes('titlePage')?.field as string) || 'title';
+        setActiveElement(titlePageRuleId(field));
+        return;
+      }
       for (const type of ALL_ELEMENT_TYPES) {
         if (ed.isActive(type)) { setActiveElement(type); break; }
       }
@@ -1536,10 +1566,16 @@ const ScreenplayEditor: React.FC = () => {
       ? `.screenplay-content .scene-heading { margin-top: ${sceneHeadingSpaceBefore}pt; }\n`
         + '.screenplay-content .scene-heading:first-child { margin-top: 0; }'
       : '';
-    // If the resolved template is industry standard, use static CSS
+    // If the resolved template is industry standard, the body elements are
+    // served by the static stylesheet — but the title page is not. It has no
+    // static rules a template can reach, so its own are emitted even here, or
+    // setting a title-page font would work on every template except the one
+    // most writers are using.
     if (template.id === '__industry_standard__') {
-      injectTemplateCss(overrideCss || null);
-      return;
+      const titlePageCss = generateTemplateCss(template, pageLayout, { titlePageOnly: true });
+      const combined = [titlePageCss, overrideCss].filter(Boolean).join('\n');
+      injectTemplateCss(combined || null);
+      return () => { injectTemplateCss(null); };
     }
     const css = generateTemplateCss(template, pageLayout);
     injectTemplateCss(overrideCss ? `${css}\n${overrideCss}` : css);
@@ -1607,25 +1643,16 @@ const ScreenplayEditor: React.FC = () => {
     if (!file.type.startsWith('image/')) { showToast('Please choose an image file', 'error'); return; }
     // Insert at the captured cursor position (valid block position), not doc start.
     const pos = imageInsertPosRef.current ?? editor.state.selection.to;
-    const insertAt = (attrs: Record<string, unknown>) => insertImageNode(editor, attrs, pos);
     try {
-      if (currentProject) {
-        const asset = await api.uploadAsset(currentProject.id, file, ['inline-image']);
-        insertAt({ assetId: asset.id, projectId: currentProject.id, filename: asset.filename ?? file.name, align: 'center' });
-      } else {
-        // No project yet (unsaved local doc) — embed as a data URL.
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(r.result as string);
-          r.onerror = () => reject(r.error);
-          r.readAsDataURL(file);
-        });
-        insertAt({ src: dataUrl, align: 'center' });
-      }
+      // Shared with paste and drop: a project asset when there is a project, the
+      // scratch store when there isn't, and never bytes inside the document.
+      const attrs = await buildImageAttrs(file);
+      insertImageNode(editor, attrs, pos);
+      warnIfImageDegraded(attrs);
     } catch (err) {
       showToast(`Failed to insert image: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
-  }, [editor, currentProject]);
+  }, [editor]);
 
   // Helper: clear track changes when switching documents
   const clearTrackChanges = useCallback(() => {
@@ -2318,6 +2345,12 @@ const ScreenplayEditor: React.FC = () => {
     useBackupStatusStore.getState().noteDocumentOpened();
     useEditorStore.getState().setSaveStatus('unsaved');
     showToast('Unsaved changes restored from your last session.', 'success');
+
+    // A snapshot written by an older build can carry its images inline. Moving
+    // them into the scratch store shrinks the payload immediately, so the
+    // restored document is protected again rather than staying over the size
+    // limit until the writer happens to save it somewhere.
+    if (docHasInlineImageBytes(snapshot.content)) void demoteDataUrlsToScratch(editor);
   }, [editor, currentProject, currentScriptId, setDocumentTitle, setCurrentProject, setCurrentScriptId]);
 
   // Crash-recovery copy. Unlike the two above it covers every platform and
@@ -2370,6 +2403,44 @@ const ScreenplayEditor: React.FC = () => {
     }, 30000);
     return () => clearInterval(timer);
   }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest]);
+
+  // Let the scratch sweeper see the document on screen, so it never mistakes a
+  // picture in the open screenplay for an orphan.
+  useEffect(() => {
+    if (!editor) return;
+    setLiveScratchDocSource(() => (editor.isDestroyed ? null : editor.getJSON()));
+    return () => setLiveScratchDocSource(null);
+  }, [editor]);
+
+  // --- Migrate images that predate the scratch store ---
+  // A script saved by an older build can hold its images as base64 inside the
+  // document, which is what used to push a screenplay past the recovery
+  // snapshot's size limit and silently cost it crash protection. Once, per
+  // document, move them into the project's assets; the resulting edit is picked
+  // up by the auto-save above, so the conversion is paid for exactly once
+  // rather than repeated on every open.
+  const migratedImagesForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!editor || !currentProject || !currentScriptId || isCollabGuest || isHistoryMode) return;
+    const key = `${currentProject.id}:${currentScriptId}`;
+    if (migratedImagesForRef.current === key) return;
+
+    const timer = setTimeout(() => {
+      if (scriptSwitchingRef.current || editor.isDestroyed) return;
+      const content = editor.getJSON();
+      if (!docHasInlineImageBytes(content) && !docHasScratchImages(content)) {
+        migratedImagesForRef.current = key;
+        return;
+      }
+      migratedImagesForRef.current = key;
+      void promoteScratchImages(
+        editor,
+        currentProject.id,
+        useProjectStore.getState().isCloudProject(currentProject.id) ? cloudApi : api,
+      );
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [editor, currentProject, currentScriptId, isCollabGuest, isHistoryMode]);
 
   // --- Track unsaved changes for status bar ---
   useEffect(() => {
@@ -2580,10 +2651,17 @@ const ScreenplayEditor: React.FC = () => {
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
 
+    // ── Router path ───────────────────────────────────────────────────────
+    // Neither hook above fires when the app navigates to another screen of
+    // its own, so hand the same flush to whatever is doing the navigating
+    // (issue #65). Unregistered below, so a destroyed editor is never asked.
+    const unregisterFlush = setPendingSaveFlush(flushPendingSave);
+
     return () => {
       cancelled = true;
       if (unlistenCloseRequested) unlistenCloseRequested();
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      unregisterFlush();
     };
   }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest]);
 
@@ -3720,6 +3798,15 @@ const ScreenplayEditor: React.FC = () => {
             const pos = payload.position;
             if (pos) {
               const el = document.elementFromPoint(pos.x, pos.y);
+              // Font files dropped on the Fonts dialog are installed, not
+              // imported as a script — the dialog reads the paths itself.
+              if (el?.closest('.fonts-dropzone')) {
+                const paths = payload.paths;
+                if (paths && paths.length > 0) {
+                  window.dispatchEvent(new CustomEvent('tauri-font-drop', { detail: { paths } }));
+                }
+                return;
+              }
               if (el?.closest('.asset-manager')) {
                 const paths = payload.paths;
                 if (paths && paths.length > 0) {
@@ -3784,6 +3871,30 @@ const ScreenplayEditor: React.FC = () => {
       unlistenFn?.();
     };
   }, [editor, hasUnsavedChanges, importDroppedFile]);
+
+  /**
+   * Move images that live outside a project into the one being saved to.
+   *
+   * Runs before the document is serialized (see SaveAsDialog.onProjectReady),
+   * so the first stored copy already references real assets rather than this
+   * machine's scratch store.
+   */
+  const handlePromoteImagesInto = useCallback(
+    async (projectId: string, destination: 'local' | 'cloud') => {
+      const result = await promoteScratchImages(
+        editor,
+        projectId,
+        destination === 'cloud' ? cloudApi : api,
+      );
+      if (result.failed > 0) {
+        showToast(
+          `${result.failed} image${result.failed === 1 ? '' : 's'} could not be moved into the project and may not open on another device.`,
+          'error',
+        );
+      }
+    },
+    [editor],
+  );
 
   const handleSaveAsComplete = useCallback(
     async (
@@ -4085,13 +4196,7 @@ const ScreenplayEditor: React.FC = () => {
           </span>
           <button
             className="history-banner-back"
-            onClick={() => {
-              if (urlProjectId && urlScriptId) {
-                navigate(`/project/${urlProjectId}/edit/${urlScriptId}`);
-              } else {
-                goBack();
-              }
-            }}
+            onClick={urlProjectId && urlScriptId ? leaveHistoryMode : goBack}
           >
             Back to Current Version
           </button>
@@ -4280,7 +4385,7 @@ const ScreenplayEditor: React.FC = () => {
                   className={`page${!tagsVisible ? ' tags-hidden' : ''}${!notesVisible ? ' notes-hidden' : ''}${isHistoryMode ? ' history-readonly' : ''}${sceneNumbersVisible ? ' show-scene-numbers' : ''}`}
                   ref={pageRef}
                   style={{
-                    fontFamily: `'${fontFamily}', 'Courier New', Courier, monospace`,
+                    fontFamily: fontStack(fontFamily),
                     fontSize: `${fontSize}pt`,
                     width: `${pageLayout.pageWidth}in`,
                     minHeight: `${lastPageEnd + (pageLayout.bottomMargin / 72) * 96}px`,
@@ -4298,7 +4403,7 @@ const ScreenplayEditor: React.FC = () => {
                     // variable has to be overridden here for the page to
                     // actually render in the font the document is set in.
                     ...{
-                      '--screenplay-font': `'${fontFamily}', 'Courier New', Courier, monospace`,
+                      '--screenplay-font': fontStack(fontFamily),
                       '--screenplay-font-size': `${fontSize}pt`,
                     } as React.CSSProperties,
                   }}
@@ -4392,9 +4497,13 @@ const ScreenplayEditor: React.FC = () => {
         {!isHistoryMode && <CharacterProfiles editor={editor} projectId={currentProject?.id || ''} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
         {!isHistoryMode && <TagsPanel editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
         {!isHistoryMode && <LocationDatabase editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
-        {!isHistoryMode && pluginRegistry.getPanels('right-sidebar').map((p) => (
-          <p.component key={p.id} editor={editor} />
-        ))}
+        {!isHistoryMode && (
+          <PluginPanelTabs
+            editor={editor}
+            width={rightPanelWidth}
+            onResizePointerDown={(e) => handleResizePointerDown('right', e)}
+          />
+        )}
       </div>
       {!isHistoryMode && (
         <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
@@ -4507,6 +4616,7 @@ const ScreenplayEditor: React.FC = () => {
               : 'local'
           }
           onSaved={handleSaveAsComplete}
+          onProjectReady={handlePromoteImagesInto}
           onClose={() => setSaveAsOpen(false)}
           buildContent={buildSaveContent}
         />
@@ -4523,6 +4633,10 @@ const ScreenplayEditor: React.FC = () => {
           onClose={() => setTitlePageEditorOpen(false)}
         />
       )}
+      {fontsDialogOpen && (
+        <FontsDialog onClose={() => setFontsDialogOpen(false)} />
+      )}
+
       {!isHistoryMode && moresContdsOpen && (
         <MoresContdsDialog onClose={() => setMoresContdsOpen(false)} />
       )}
