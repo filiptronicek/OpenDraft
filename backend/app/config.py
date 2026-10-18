@@ -78,6 +78,16 @@ DEMO_MODE = os.environ.get("DEMO_MODE", "").lower() in ("1", "true", "yes")
 # record from the collab SQLite file. When not co-located, /api/auth/* proxies
 # to the collab server over HTTPS.
 COLLAB_JWT_SECRET = os.environ.get("COLLAB_JWT_SECRET") or os.environ.get("JWT_SECRET") or ""
+COLLAB_JWT_ISSUER = (
+    os.environ.get("COLLAB_JWT_ISSUER")
+    or os.environ.get("JWT_ISSUER")
+    or "opendraft-collab"
+)
+COLLAB_JWT_AUDIENCE = (
+    os.environ.get("COLLAB_JWT_AUDIENCE")
+    or os.environ.get("JWT_AUDIENCE")
+    or "opendraft-backend"
+)
 COLLAB_DB_PATH = os.environ.get("COLLAB_DB_PATH") or ""  # e.g. /data/collab/collab.sqlite3
 COLLAB_SERVER_URL = (os.environ.get("COLLAB_SERVER_URL") or "http://localhost:4000").rstrip("/")
 

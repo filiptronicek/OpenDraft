@@ -18,6 +18,8 @@ import { useEditorStore, DEFAULT_TAG_CATEGORIES, DEFAULT_PAGE_LAYOUT } from '../
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
 import { hasSaveMetadata } from './saveContent';
 import { resolveSceneHeadingSpaceBefore } from './elementSpacing';
+import { restoreRevisionState } from './revisionState';
+import { normalizeScriptProfile } from './scriptProfile';
 
 /**
  * Some payloads store these as JSON strings rather than arrays/objects,
@@ -67,10 +69,17 @@ export function hydrateEditorStoresFromContent(
   if (c._sceneNumbersLocked !== undefined) {
     store.setSceneNumbersLocked(c._sceneNumbersLocked === true);
   }
+  // Always set: absent is "shown", and a script must not inherit the previous
+  // one's hidden numbers.
+  store.setElementNumbersVisible(c._elementNumbersVisible !== false);
   if (c._pageLayout !== undefined) {
     store.setPageLayout(parseAttr(c._pageLayout, DEFAULT_PAGE_LAYOUT));
   }
   store.setSceneHeadingSpaceBefore(resolveSceneHeadingSpaceBefore(content));
+  restoreRevisionState(content);
+  // Always set: a script saved before profiles existed opens as Standard with
+  // no genres, not with whatever the previous script had.
+  store.setScriptProfile(normalizeScriptProfile(c._scriptProfile));
 
   if (typeof c._templateId === 'string' && c._templateId) {
     try {

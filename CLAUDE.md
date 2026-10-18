@@ -115,6 +115,47 @@ The Android `.apk` and `.aab` are built via **GitHub Actions** (in `.github/work
 4. Builds both `.apk` (sideloadable) and `.aab` (Play Store)
 5. Uploads renamed artifacts (`OpenDraft_X.Y.Z_android.apk/aab`) to the GitHub Release
 
+### 16 KB memory page support (required by Google Play)
+
+Apps targeting Android 15+ must ship native libraries laid out for 16 KB memory
+pages; Play has refused updates without it since November 2025. NDK 27's linker
+still defaults to 4 KB, so `src-tauri/build.rs` passes
+`-Wl,-z,max-page-size=16384` for Android targets.
+
+That flag lives in `build.rs`, **not** in `.cargo/config.toml`: the Tauri CLI
+sets `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for every Android build, and that
+environment variable replaces a target's rustflags from config rather than
+merging with them, so anything written there is dropped silently.
+
+The `Verify native libraries are 16 KB page aligned` CI step reads the alignment
+back off the built APK and fails the release if it regresses. To check by hand:
+
+```bash
+$NDK_HOME/toolchains/llvm/prebuilt/*/bin/llvm-readelf -l libopendraft_lib.so | grep LOAD
+# the last column must be 0x4000, not 0x1000
+```
+
+### Compiling the Android Rust before a release
+
+`.github/workflows/test.yml` type-checks `src-tauri` against
+`aarch64-linux-android` on every push and pull request. The desktop jobs build
+for the host, so without it every `#[cfg(target_os = "android")]` block — the
+JNI behind export, print, the file picker and backups — first compiles inside
+`build-android`, during a release, on the one workflow that cannot be re-run
+without a tag.
+
+It is `cargo check`, not a build: no Gradle, no APK, nothing about Kotlin or
+R8. Two things it needs that a desktop check does not, and that the Tauri CLI
+would otherwise set:
+
+- `CC_aarch64_linux_android` and friends pointing into the NDK. cc-rs looks for
+  `aarch64-linux-android-clang`, which no NDK ships, so C build scripts (ring's
+  among them) fail before any OpenDraft code is reached.
+- A real `frontend/dist`, because `tauri::generate_context!()` embeds it at
+  compile time.
+
+The NDK version is pinned to the one `build-android` uses. Keep the two in step.
+
 ### GitHub Secrets for Android signing
 
 For unsigned builds (testing), no secrets are needed. For signed/production builds, add these repository secrets:
@@ -142,6 +183,83 @@ Requires Android Studio (or SDK command-line tools), NDK 27, and Rust Android ta
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 cd frontend && npx tauri android init && npx tauri android build --apk
 ```
+
+---
+
+## Linux Build — AppImage
+
+The `.deb`, `.rpm` and `.AppImage` come out of the `ubuntu-22.04` leg of
+`build-desktop`. The AppImage then gets repacked before it ships.
+
+### Why the AppImage is repacked
+
+linuxdeploy (which the Tauri AppImage bundler drives) walks `ldd` and copies
+every dependency into `AppDir/usr/lib` — including `libwayland-client.so.0`. It
+does **not** bundle Mesa: `libEGL` always comes from the user's machine. Since
+`AppRun` puts `AppDir/usr/lib` ahead of the system path, the host's own
+`libEGL_mesa` gets resolved against our Ubuntu 22.04 `libwayland-client`, fails
+to find symbols it needs (`wl_fixes_interface`,
+`wl_display_create_queue_with_name`, `wl_display_dispatch_queue_timeout`), and
+`libEGL` reports `EGL_BAD_PARAMETER`. WebKit is left with no renderer and the
+window comes up blank white — reported from Arch + GNOME/Wayland as issue #113.
+`GDK_BACKEND=x11` is already set by linuxdeploy's GTK hook, so this bites under
+XWayland too; it is a bundled-library problem, not a Wayland-backend one.
+
+`libwayland` is host-ABI-coupled for exactly this reason and sits on the
+upstream AppImage excludelist — the linuxdeploy build Tauri fetches just misses
+it. Every desktop that can run a GTK3 app already ships it, so removing ours is
+strictly a fix.
+
+- `.github/scripts/fix-appimage-wayland.sh` strips `libwayland-*` and repacks
+- `.github/scripts/verify-appimage-wayland.sh` fails the release if any come back
+- `.github/scripts/appimage-squashfs.py` reads the offset, compressor and block
+  size out of the file, shared by both
+
+The repack reuses the AppImage's **own** runtime (the ELF prefix the file
+already starts with) and the compressor recorded in its superblock, so it needs
+neither appimagetool nor FUSE, and the runtime that will mount the result is
+reading exactly the format it wrote. Hardcoding gzip instead of the zstd Tauri
+uses cost 10 MB.
+
+`tauri-action` uploads the AppImage itself, so the repacked file is re-uploaded
+over the draft asset afterwards.
+
+### Testing the Linux AppImage without a Linux machine
+
+Both scripts take a release version or a path, exit non-zero on the bug, and
+need only Docker — no VM, no GPU, no Wayland compositor. They run under x86
+emulation on an Apple Silicon Mac and natively (much faster) on any x86_64
+Linux box or free cloud shell.
+
+```bash
+./test-script/repro_issue_113_egl.sh [version | path.AppImage]      # ~1 min
+./test-script/launch_appimage_headless.sh [version | path.AppImage] # ~5 min
+```
+
+The first loads a current Arch Mesa's EGL driver against the AppImage's bundled
+`libwayland-client` and diffs the symbols — quick enough for the inner loop.
+The second boots the real app under Xvfb in the same container, screenshots it
+to `test-script/output/issue-113/`, and fails on either an `EGL_BAD_PARAMETER`
+in the log or a near-flat screenshot. Mesa falls back to software rendering
+there, which is fine: the bug is library resolution during EGL driver load, not
+anything the GPU does. On a native runner set `SETTLE_SECONDS=45`.
+
+Run at least the second one against a fresh build after touching anything in
+the Linux bundle path.
+
+### The same test in CI
+
+`.github/workflows/test-appimage.yml` is a `workflow_dispatch` job that runs
+both scripts on a GitHub runner and uploads the screenshot and console log as
+artifacts. Give it a released version to test that release, or leave `version`
+empty to build the AppImage from the branch first. Untick `repack` to skip the
+Wayland strip and confirm the test still catches the bug.
+
+The job runs the app inside the same Arch container the local scripts use — the
+runner's own Mesa is no good for this. Ubuntu builds Mesa against its own older
+wayland, so even 24.04 with Mesa 25.2 loads our bundled `libwayland-client`
+happily. Of the common cloud images only Debian 13, Ubuntu 25.04, Fedora 41+
+and Arch reproduce it; Debian 12 and Ubuntu 22.04/24.04 do not.
 
 ---
 

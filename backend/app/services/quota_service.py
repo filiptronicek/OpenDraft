@@ -33,13 +33,17 @@ def count_user_scripts() -> int:
         return 0
     total = 0
     for project_dir in root.iterdir():
-        if not project_dir.is_dir():
+        if project_dir.is_symlink() or not project_dir.is_dir():
             continue
         scripts_dir = project_dir / "scripts"
-        if not scripts_dir.is_dir():
+        if scripts_dir.is_symlink() or not scripts_dir.is_dir():
             continue
-        # Each script is backed by a <uuid>.meta.json file; count those.
-        total += sum(1 for _ in scripts_dir.glob("*.meta.json"))
+        # Each script is backed by a regular <uuid>.meta.json file. Ignore
+        # symlinks so quota accounting cannot traverse outside this user.
+        total += sum(
+            1 for candidate in scripts_dir.glob("*.meta.json")
+            if not candidate.is_symlink() and candidate.is_file()
+        )
     return total
 
 

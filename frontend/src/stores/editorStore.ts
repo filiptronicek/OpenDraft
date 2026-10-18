@@ -1,7 +1,15 @@
 import { create } from 'zustand';
 import { uuid } from '../utils/uuid';
+import { applyAppearance, applyNativeTheme, readAppearance, saveAppearance, themeOf, type Appearance } from '../utils/appearance';
+import { DEFAULT_SCRIPT_PROFILE, normalizeScriptProfile, type ScriptProfile } from '../utils/scriptProfile';
+import { DEFAULT_REVISION_COLOR, DEFAULT_REVISION_SETTINGS, nextRevisionColor, type RevisionSettings } from '../editor/revisionColors';
 import { spellChecker, PROJECT_DICT_TARGET } from '../editor/spellchecker';
 import { findLanguage, urlsFor } from '../editor/languageCatalog';
+import {
+  NOTE_NUMBER_FORMATS,
+  type NoteNumberFormat,
+  type FootnoteMarkerStyle,
+} from '../utils/noteNumbering';
 
 // ── View-state persistence helpers ──
 const VIEW_STATE_KEY = 'opendraft:viewState';
@@ -21,6 +29,20 @@ interface ViewState {
   characterSortBy?: 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance';
   grammarRulesEnabled?: Record<string, boolean>;
   spellingSettings?: SpellingSettings;
+  includeTitlePageInOutput?: boolean;
+}
+
+/** One colour a script has been revised in. */
+export interface RevisionHistoryEntry {
+  color: string;
+  /** ISO date the colour was first used. */
+  date: string;
+}
+
+/** `history` with `color` recorded, if it isn't already. */
+export function withRevisionColor(history: RevisionHistoryEntry[], color: string): RevisionHistoryEntry[] {
+  if (history.some((h) => h.color === color)) return history;
+  return [...history, { color, date: new Date().toISOString() }];
 }
 
 export interface SpellingSettings {
@@ -44,6 +66,27 @@ function saveViewState(patch: Partial<ViewState>) {
   } catch { /* localStorage unavailable */ }
 }
 const _vs = loadViewState();
+
+/**
+ * How tight the chrome is before the writer says otherwise.
+ *
+ * Compact suits a mouse, which lands wherever it is pointed. A finger does not:
+ * the compact toolbar's controls are 22px tall, well under the ~44px both Apple
+ * and Google put the floor at, and on an iPad that is the difference between
+ * tapping the font picker and tapping the element menu beside it. Touch gets
+ * comfortable to start with; the View menu still moves it either way, and the
+ * choice is remembered once made.
+ */
+function defaultToolbarMode(): 'compact' | 'comfortable' | 'hidden' {
+  try {
+    if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) {
+      return 'comfortable';
+    }
+  } catch {
+    // matchMedia unavailable (a test runner) — a mouse is the safer assumption.
+  }
+  return 'compact';
+}
 
 // ── Custom dictionary library (named global word lists) ──
 const DICTS_KEY = 'opendraft:dictionaries';
@@ -143,6 +186,9 @@ export type BuiltInElementType =
   | 'lyrics'
   | 'showEpisode'
   | 'castList'
+  // Fountain's two non-printing structural elements — see utils/nonPrinting.ts.
+  | 'section'
+  | 'note'
   | 'titlePage';
 
 /** Element type id — built-in literal or any custom id declared by a template.
@@ -169,6 +215,8 @@ export const ELEMENT_LABELS: Record<string, string> = {
   lyrics: 'Lyrics',
   showEpisode: 'Show/Episode',
   castList: 'Cast List',
+  section: 'Section (Outline)',
+  note: 'Note (Not printed)',
   titlePage: 'Title Page',
 };
 
@@ -227,6 +275,58 @@ export function resolveMoresContds(layout: PageLayout | undefined): MoresContds 
   return resolved;
 }
 
+/**
+ * Footnote / endnote configuration, mirroring Word's Footnote and Endnote
+ * dialog.
+ *
+ * `enabled` is the master switch and is OFF by default, which together with a
+ * note's own `printInScript` flag (also off by default) is what guarantees that
+ * a document written before this feature existed paginates and exports exactly
+ * as it always did.
+ */
+export interface FootnoteSettings {
+  /** Master switch. While this is off, a note's own print flag is inert. */
+  enabled: boolean;
+  /** At the foot of the page carrying the reference, or at the end of the script. */
+  placement: 'footnote' | 'endnote';
+  numberFormat: NoteNumberFormat;
+  markerStyle: FootnoteMarkerStyle;
+  /** Word's "Start at". */
+  startAt: number;
+  /** Word's "Numbering". Endnotes have no pages, so they are always continuous. */
+  numbering: 'continuous' | 'restartEachPage';
+  /** Whether printed notes reach the PDF, Word and Final Draft exports. */
+  includeInExports: boolean;
+}
+
+export const DEFAULT_FOOTNOTES: FootnoteSettings = {
+  enabled: false,
+  placement: 'footnote',
+  numberFormat: 'arabic',
+  markerStyle: 'superscript',
+  startAt: 1,
+  numbering: 'continuous',
+  includeInExports: true,
+};
+
+/** Always returns a complete FootnoteSettings, filling missing/legacy fields with
+ *  defaults so a document saved before this existed reads back as "off" rather
+ *  than as undefined. Invalid enum values fall back rather than propagating. */
+export function resolveFootnotes(layout: PageLayout | undefined): FootnoteSettings {
+  const f: FootnoteSettings = { ...DEFAULT_FOOTNOTES, ...(layout?.footnotes ?? {}) };
+  const n = Number(f.startAt);
+  f.startAt = Number.isFinite(n) ? Math.min(9999, Math.max(1, Math.round(n))) : 1;
+  if (f.placement !== 'endnote') f.placement = 'footnote';
+  if (f.markerStyle !== 'bracketed') f.markerStyle = 'superscript';
+  if (!NOTE_NUMBER_FORMATS.some((x) => x.id === f.numberFormat)) f.numberFormat = 'arabic';
+  // Endnotes are one list at the end of the script; there is no page to restart
+  // on, and Word greys the control out for the same reason.
+  if (f.placement === 'endnote' || f.numbering !== 'restartEachPage') f.numbering = 'continuous';
+  f.enabled = f.enabled === true;
+  f.includeInExports = f.includeInExports !== false;
+  return f;
+}
+
 export interface PageLayout {
   pageWidth: number;     // inches
   pageHeight: number;    // inches
@@ -253,6 +353,9 @@ export interface PageLayout {
   /** Dialogue continuation ("Mores & Continueds") config. Optional for back-compat
    *  with documents saved before this existed — read via resolveMoresContds(). */
   moresContds?: MoresContds;
+  /** Footnote/endnote config. Optional for back-compat with documents saved
+   *  before this existed — read via resolveFootnotes(). */
+  footnotes?: FootnoteSettings;
 }
 
 export const DEFAULT_PAGE_LAYOUT: PageLayout = {
@@ -270,6 +373,7 @@ export const DEFAULT_PAGE_LAYOUT: PageLayout = {
   footerStartPage: 1,
   startingPageNumber: 1,
   moresContds: { ...DEFAULT_MORES_CONTDS },
+  footnotes: { ...DEFAULT_FOOTNOTES },
 };
 
 /** Header/footer settings with every legacy gap filled in. Documents saved
@@ -311,7 +415,8 @@ export function printedPageNumber(index: number, startingPageNumber: number): nu
  *  already shifted by the starting-number offset. */
 export function resolveHFFields(
   text: string,
-  pageNum: number,
+  /** A number, or a locked page's label such as "12A". */
+  pageNum: number | string,
   totalPages: number,
   title: string,
   revisionColor: string,
@@ -338,7 +443,8 @@ export function showsHeaderFooter(
 export interface SceneInfo {
   id: string;
   heading: string;
-  sceneNumber: number | null;
+  /** "12", or "12A" for a scene added while numbers are locked. */
+  sceneNumber: string | null;
   color: string;
   synopsis: string;
 }
@@ -368,6 +474,37 @@ export interface NoteInfo {
   createdAt: string;
   /** Optional scene context */
   sceneId: string | null;
+  /** Print this note in the screenplay, as a footnote or an endnote.
+   *  Optional on purpose: a document saved before this existed reads back
+   *  undefined, which is off, so there is nothing to migrate. */
+  printInScript?: boolean;
+  /** Where this note prints, overriding the document's own Location setting.
+   *  Absent — the usual case — means it follows the document, so changing the
+   *  Location moves every note that has not been given one of its own. */
+  printPlacement?: NotePlacement;
+  /** Height in 12pt lines of this note's images, measured once after they load
+   *  and then persisted, so the space reserved on the page stops guessing. */
+  printImageLines?: number;
+}
+
+/** Where a printing note goes. */
+export type NotePlacement = 'footnote' | 'endnote';
+
+/** Whether a note actually reaches the page.
+ *
+ *  Nothing should test `printInScript` directly: an empty note is never worth a
+ *  number, and the placeholder records that orphan reconciliation synthesises
+ *  for a mark with no note have empty content by construction. */
+export function noteWillPrint(note: NoteInfo | undefined | null): boolean {
+  return !!note && note.printInScript === true && note.content.trim().length > 0;
+}
+
+/** Where this note actually goes: its own choice, or the document's. */
+export function effectiveNotePlacement(
+  note: NoteInfo | undefined | null,
+  settings: FootnoteSettings,
+): NotePlacement {
+  return note?.printPlacement ?? settings.placement;
 }
 
 /** Filter state that can be set externally (e.g. from context menu) */
@@ -386,6 +523,19 @@ export interface GeneralNote {
   content: string;
   color: NoteColor;
   createdAt: string;
+  /** Print this note in the screenplay. A general note is anchored to nothing,
+   *  so there is no place in the script to put a reference marker and no page
+   *  it belongs to — it can only ever be an endnote, whatever the document's
+   *  placement setting says. Optional, so older documents read back as off. */
+  printInScript?: boolean;
+  /** Measured image height, cached the way an anchored note's is. */
+  printImageLines?: number;
+}
+
+/** Whether a general note reaches the page. Same rule as an anchored one:
+ *  an empty note is never worth a number. */
+export function generalNoteWillPrint(note: GeneralNote | undefined | null): boolean {
+  return !!note && note.printInScript === true && note.content.trim().length > 0;
 }
 
 // ── Production Tagging (Final Draft TagData) ──
@@ -459,6 +609,63 @@ export interface CharacterProfile {
   sampleDialogue: string;
   /** Asset IDs of images associated with this character */
   images: string[];
+  /**
+   * The voice Table Read gives this character (OpenDraft-only). Optional, and
+   * absent on every profile written before Table Read existed.
+   */
+  voice?: CharacterVoice;
+}
+
+/**
+ * A character's Table Read voice, one slot per kind of engine.
+ *
+ * Kept apart because the two never share ids: a system voice is whatever the
+ * machine reading the script has installed — a script opened on another
+ * computer may not find it, and then falls back to an automatic pick — while
+ * an AI voice belongs to a provider and travels with the script intact.
+ */
+export interface CharacterVoice {
+  /** Voice id of an installed system voice. */
+  system?: string;
+  /** `<provider>:<voice id>` of an AI provider's voice. */
+  ai?: string;
+}
+
+/**
+ * A character profile read back from a saved script, as the fields
+ * upsertCharacterProfile takes.
+ *
+ * Every field is carried, including ones added after a script was written
+ * (the Table Read voice, issue #131). The two loaders in ScreenplayEditor
+ * used to copy the fields one by one, and a field missing from their list was
+ * silently dropped on open — then gone for good at the next save.
+ */
+export function savedProfileFields(prof: Record<string, unknown>): Partial<Omit<CharacterProfile, 'name'>> {
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const fields: Partial<Omit<CharacterProfile, 'name'>> = {
+    description: str(prof.description),
+    color: str(prof.color),
+    highlighted: prof.highlighted === true,
+    gender: str(prof.gender),
+    age: str(prof.age),
+    role: str(prof.role),
+    backstory: str(prof.backstory),
+    arc: str(prof.arc),
+    speechPattern: str(prof.speechPattern),
+    vocabulary: str(prof.vocabulary),
+    verbalTics: str(prof.verbalTics),
+    sampleDialogue: str(prof.sampleDialogue),
+    images: Array.isArray(prof.images) ? (prof.images as string[]) : [],
+  };
+  const v = prof.voice;
+  if (v && typeof v === 'object') {
+    const voice: CharacterVoice = {};
+    const rec = v as Record<string, unknown>;
+    if (typeof rec.system === 'string' && rec.system) voice.system = rec.system;
+    if (typeof rec.ai === 'string' && rec.ai) voice.ai = rec.ai;
+    if (voice.system || voice.ai) fields.voice = voice;
+  }
+  return fields;
 }
 
 export interface CharacterRelationship {
@@ -478,6 +685,7 @@ export interface BeatColumn {
 }
 
 export interface BeatLinkPreview {
+  sourceUrl?: string;
   url: string;
   title: string;
   description: string;
@@ -516,6 +724,21 @@ interface EditorState {
   currentPage: number;
   setCurrentPage: (page: number) => void;
 
+  /**
+   * Whether print, PDF and DOCX draw the title page. On unless turned off.
+   *
+   * Kept here rather than on `PageLayout` because it is the writer's habit, not
+   * the script's: it belongs to the person printing, follows them from one
+   * document to the next, and must not travel inside a .odraft file or a collab
+   * session. Persisted per device in the view state (issue #98).
+   *
+   * Only rendered output honours it. FDX, Fountain, Fade In/OSF and .odraft
+   * always carry the title-page data — sending a script somewhere is not the
+   * same as editing it.
+   */
+  includeTitlePageInOutput: boolean;
+  toggleIncludeTitlePageInOutput: () => void;
+
   // Scene navigator
   scenes: SceneInfo[];
   setScenes: (scenes: SceneInfo[]) => void;
@@ -546,7 +769,7 @@ interface EditorState {
   notes: NoteInfo[];
   setNotes: (notes: NoteInfo[]) => void;
   addNote: (note: Omit<NoteInfo, 'id' | 'createdAt'>) => string;
-  updateNote: (id: string, updates: Partial<Pick<NoteInfo, 'content' | 'color'>>) => void;
+  updateNote: (id: string, updates: Partial<Omit<NoteInfo, 'id' | 'createdAt'>>) => void;
   deleteNote: (id: string) => void;
   noteFilter: NoteFilter;
   setNoteFilter: (filter: NoteFilter) => void;
@@ -555,7 +778,7 @@ interface EditorState {
   generalNotes: GeneralNote[];
   setGeneralNotes: (notes: GeneralNote[]) => void;
   addGeneralNote: (note: Omit<GeneralNote, 'id' | 'createdAt'>) => string;
-  updateGeneralNote: (id: string, updates: Partial<Pick<GeneralNote, 'title' | 'content' | 'color'>>) => void;
+  updateGeneralNote: (id: string, updates: Partial<Omit<GeneralNote, 'id' | 'createdAt'>>) => void;
   deleteGeneralNote: (id: string) => void;
 
   // Beats
@@ -586,6 +809,14 @@ interface EditorState {
   setSceneNumbersVisible: (v: boolean) => void;
   sceneNumbersLocked: boolean;
   setSceneNumbersLocked: (v: boolean) => void;
+  /**
+   * Show the numbers a format puts on elements other than scene headings
+   * (utils/elementNumbers). Which elements are numbered is the format's;
+   * this only hides them, for a reading draft. Inert when the format numbers
+   * nothing.
+   */
+  elementNumbersVisible: boolean;
+  setElementNumbersVisible: (v: boolean) => void;
 
   /**
    * Per-document override for the space before a scene heading, in points.
@@ -600,11 +831,40 @@ interface EditorState {
   sceneHeadingSpaceBefore: number | null;
   setSceneHeadingSpaceBefore: (v: number | null) => void;
 
-  // Revision
+  // Revision — saved with the script (see utils/revisionState.ts)
   revisionMode: boolean;
   revisionColor: string;
+  /** Each colour this script has been revised in, first use first. */
+  revisionHistory: RevisionHistoryEntry[];
+  /** Colour revised text in its revision colour (screen only). */
+  showRevisionColors: boolean;
   setRevisionMode: (on: boolean) => void;
   setRevisionColor: (color: string) => void;
+  /** Move on to the next colour in the production sequence and turn the mode on. */
+  advanceRevisionColor: () => void;
+  setRevisionHistory: (h: RevisionHistoryEntry[]) => void;
+  setShowRevisionColors: (on: boolean) => void;
+  /** Mark characters and coloured-page output — saved with the script. */
+  revisionSettings: RevisionSettings;
+  setRevisionSettings: (patch: Partial<RevisionSettings>) => void;
+  /**
+   * The writer's pacing and genres — saved with the script (`_scriptProfile`).
+   * Pacing scales the runtime estimate; genres are descriptive only.
+   */
+  scriptProfile: ScriptProfile;
+  setScriptProfile: (profile: Partial<ScriptProfile>) => void;
+  /** Format ▸ Genre & Pacing… */
+  scriptProfileOpen: boolean;
+  setScriptProfileOpen: (open: boolean) => void;
+  /**
+   * Printed page labels while pages are locked ("12", "12A", "13-14"), index
+   * 0 being the script's first page; null when they are not. Derived from the
+   * document by the pagination plugin — see utils/lockedPages.ts.
+   */
+  pageLabels: string[] | null;
+  setPageLabels: (labels: string[] | null) => void;
+  /** Back to defaults — a new or freshly loaded document. */
+  resetRevisionState: () => void;
 
   // Character profiles (Final Draft CastList + CharacterHighlighting)
   characters: string[];
@@ -662,7 +922,10 @@ interface EditorState {
   pageLayout: PageLayout;
   setPageLayout: (layout: PageLayout) => void;
 
-  // Theme
+  // Theme — `appearance` is the user's choice (remembered); `theme` is the
+  // light/dark half of it, for code that only cares about the interface.
+  appearance: Appearance;
+  setAppearance: (a: Appearance) => void;
   theme: 'dark' | 'light';
   setTheme: (t: 'dark' | 'light') => void;
 
@@ -751,6 +1014,10 @@ interface EditorState {
   setTitlePageEditorOpen: (open: boolean) => void;
   moresContdsOpen: boolean;
   setMoresContdsOpen: (open: boolean) => void;
+  footnoteDialogOpen: boolean;
+  setFootnoteDialogOpen: (open: boolean) => void;
+  fontsDialogOpen: boolean;
+  setFontsDialogOpen: (open: boolean) => void;
   headerFooterOpen: boolean;
   setHeaderFooterOpen: (open: boolean) => void;
   // Registered by ScreenplayEditor; the menu/toolbar calls it to start image insertion.
@@ -842,6 +1109,13 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setPageCount: (count) => set({ pageCount: count }),
   currentPage: 1,
   setCurrentPage: (page) => set({ currentPage: page }),
+
+  includeTitlePageInOutput: _vs.includeTitlePageInOutput !== false,
+  toggleIncludeTitlePageInOutput: () => set((s) => {
+    const v = !s.includeTitlePageInOutput;
+    saveViewState({ includeTitlePageInOutput: v });
+    return { includeTitlePageInOutput: v };
+  }),
 
   scenes: [],
   setScenes: (scenes) => set({ scenes }),
@@ -1055,14 +1329,53 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setSceneNumbersVisible: (v) => set({ sceneNumbersVisible: v }),
   sceneNumbersLocked: false,
   setSceneNumbersLocked: (v) => set({ sceneNumbersLocked: v }),
+  elementNumbersVisible: true,
+  setElementNumbersVisible: (v) => set({ elementNumbersVisible: v }),
 
   sceneHeadingSpaceBefore: null,
   setSceneHeadingSpaceBefore: (v) => set({ sceneHeadingSpaceBefore: v }),
 
   revisionMode: false,
-  revisionColor: 'White',
-  setRevisionMode: (on) => set({ revisionMode: on }),
-  setRevisionColor: (color) => set({ revisionColor: color }),
+  revisionColor: DEFAULT_REVISION_COLOR,
+  revisionHistory: [],
+  showRevisionColors: false,
+  setRevisionMode: (on) => set((st) => ({
+    revisionMode: on,
+    revisionHistory: on ? withRevisionColor(st.revisionHistory, st.revisionColor) : st.revisionHistory,
+  })),
+  setRevisionColor: (color) => set((st) => ({
+    revisionColor: color,
+    revisionHistory: st.revisionMode ? withRevisionColor(st.revisionHistory, color) : st.revisionHistory,
+  })),
+  advanceRevisionColor: () => set((st) => {
+    const color = nextRevisionColor(st.revisionColor);
+    return { revisionMode: true, revisionColor: color, revisionHistory: withRevisionColor(st.revisionHistory, color) };
+  }),
+  setRevisionHistory: (h) => set({ revisionHistory: h }),
+  setShowRevisionColors: (on) => set({ showRevisionColors: on }),
+  revisionSettings: DEFAULT_REVISION_SETTINGS,
+  setRevisionSettings: (patch) => set((st) => ({ revisionSettings: { ...st.revisionSettings, ...patch } })),
+  scriptProfile: DEFAULT_SCRIPT_PROFILE,
+  // Normalized on the way in, so a hand-edited or peer-written value can never
+  // put a pacing this build does not know, or a duplicate genre, in the store.
+  setScriptProfile: (profile) => set((st) => ({
+    scriptProfile: normalizeScriptProfile({ ...st.scriptProfile, ...profile }),
+  })),
+  scriptProfileOpen: false,
+  setScriptProfileOpen: (open) => set({ scriptProfileOpen: open }),
+  pageLabels: null,
+  setPageLabels: (labels) => set((st) => (
+    st.pageLabels === labels || (st.pageLabels && labels && st.pageLabels.join('\u0000') === labels.join('\u0000'))
+      ? st
+      : { pageLabels: labels }
+  )),
+  resetRevisionState: () => set({
+    revisionMode: false,
+    revisionColor: DEFAULT_REVISION_COLOR,
+    revisionHistory: [],
+    showRevisionColors: false,
+    revisionSettings: DEFAULT_REVISION_SETTINGS,
+  }),
 
   characters: [],
   setCharacters: (names) => set({ characters: names }),
@@ -1200,14 +1513,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   pageLayout: DEFAULT_PAGE_LAYOUT,
   setPageLayout: (layout) => set({ pageLayout: layout }),
 
-  theme: (localStorage.getItem('opendraft:theme') as 'dark' | 'light') || 'dark',
-  setTheme: (t) => {
-    localStorage.setItem('opendraft:theme', t);
-    document.documentElement.setAttribute('data-theme', t);
-    set({ theme: t });
+  appearance: readAppearance(),
+  setAppearance: (a) => {
+    saveAppearance(a);
+    applyAppearance(a);
+    void applyNativeTheme(a);
+    set({ appearance: a, theme: themeOf(a) });
   },
+  theme: themeOf(readAppearance()),
+  setTheme: (t) => get().setAppearance(t),
 
-  toolbarMode: (_vs.toolbarMode as 'compact' | 'comfortable' | 'hidden') ?? 'compact',
+  toolbarMode: (_vs.toolbarMode as 'compact' | 'comfortable' | 'hidden') ?? defaultToolbarMode(),
   setToolbarMode: (mode) => { set({ toolbarMode: mode }); saveViewState({ toolbarMode: mode }); },
 
   characterSortBy: (_vs.characterSortBy as 'name' | 'importance' | 'scenes' | 'dialogues' | 'appearance') ?? 'importance',
@@ -1388,6 +1704,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setTitlePageEditorOpen: (open) => set({ titlePageEditorOpen: open }),
   moresContdsOpen: false,
   setMoresContdsOpen: (open) => set({ moresContdsOpen: open }),
+  footnoteDialogOpen: false,
+  setFootnoteDialogOpen: (open) => set({ footnoteDialogOpen: open }),
+  fontsDialogOpen: false,
+  setFontsDialogOpen: (open) => set({ fontsDialogOpen: open }),
   headerFooterOpen: false,
   setHeaderFooterOpen: (open) => set({ headerFooterOpen: open }),
   imageInsertHandler: null,
@@ -1416,5 +1736,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   // Screenplay" — one keystroke away from overwriting their screenplay in
   // Dropbox with nothing. Re-opening the file from Files re-establishes it.
   documentOrigin: null,
-  setDocumentOrigin: (origin) => set({ documentOrigin: origin }),
+  // A file just opened in place matches its file exactly, so it starts out
+  // clean. Without the reset it inherited the previous document's status, and
+  // an "unsaved" left over from that one would prompt about — or auto-save — a
+  // file nobody had touched.
+  setDocumentOrigin: (origin) =>
+    set(origin ? { documentOrigin: origin, saveStatus: 'idle', saveError: null } : { documentOrigin: null }),
 }));

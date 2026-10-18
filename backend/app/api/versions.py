@@ -1,29 +1,45 @@
 """Version control API endpoints for OpenDraft projects."""
 
-from fastapi import APIRouter, HTTPException, Query
 
-from app.config import get_projects_dir
+from fastapi import APIRouter, Depends, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
+
+from app.dependencies import require_verified_user
 from app.schemas.version import (
     CheckinRequest,
     DiffResponse,
     VersionCommitResponse,
     VersionInfo,
 )
-from app.services import git_service
+from app.services import git_backup_service, git_service, project_service
+from app.services.auth_service import AuthUser
 
 router = APIRouter()
 
 
 def _project_path(project_id: str):
-    """Resolve and validate project directory path."""
-    path = get_projects_dir() / project_id
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-    return path
+    """Resolve a project through the shared user-root containment policy."""
+    try:
+        return project_service.get_project_dir(project_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _validate_script_id(script_id: str) -> None:
+    try:
+        project_service.validate_resource_id(script_id, "Script")
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{project_id}/versions/checkin", response_model=VersionCommitResponse)
-async def checkin(project_id: str, body: CheckinRequest):
+async def checkin(
+    project_id: str,
+    body: CheckinRequest,
+    user: AuthUser = Depends(require_verified_user),
+):
     """Stage all changes and create a version checkpoint (git commit)."""
     path = _project_path(project_id)
 
@@ -31,6 +47,11 @@ async def checkin(project_id: str, body: CheckinRequest):
     git_service.init_repo(path)
 
     result = git_service.commit(path, body.message)
+    # A remote failure must never roll back the local checkpoint. A no-change
+    # check-in also retries a previously failed push.
+    result["backup"] = await run_in_threadpool(
+        git_backup_service.push_project, path, user.id, project_id
+    )
     return result
 
 
@@ -46,6 +67,8 @@ async def list_versions(
     matching ``scripts/<script_id>.json`` file are returned — so the client
     never sees versions where the script never existed.
     """
+    if script_id is not None:
+        _validate_script_id(script_id)
     path = _project_path(project_id)
 
     # Ensure repo is initialized
@@ -74,6 +97,7 @@ async def get_diff(
 @router.get("/{project_id}/versions/{commit_hash}/scripts/{script_id}")
 async def get_script_at_version(project_id: str, commit_hash: str, script_id: str):
     """Return script content as it existed at a specific commit."""
+    _validate_script_id(script_id)
     path = _project_path(project_id)
 
     try:
@@ -97,7 +121,11 @@ async def get_script_at_version(project_id: str, commit_hash: str, script_id: st
 
 
 @router.post("/{project_id}/versions/restore/{commit_hash}", response_model=VersionCommitResponse)
-async def restore_version(project_id: str, commit_hash: str):
+async def restore_version(
+    project_id: str,
+    commit_hash: str,
+    user: AuthUser = Depends(require_verified_user),
+):
     """Restore the project to a specific version (creates a new commit)."""
     path = _project_path(project_id)
 
@@ -106,4 +134,7 @@ async def restore_version(project_id: str, commit_hash: str):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    result["backup"] = await run_in_threadpool(
+        git_backup_service.push_project, path, user.id, project_id
+    )
     return result

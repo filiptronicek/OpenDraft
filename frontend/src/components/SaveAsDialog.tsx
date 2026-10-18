@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { FaCloud, FaDesktop } from 'react-icons/fa';
+import { FaCloud, FaDesktop, FaPlus } from 'react-icons/fa';
 import { api } from '../services/api';
 import { cloudApi } from '../services/cloudApi';
 import { isWeb } from '../services/platform';
@@ -35,6 +35,14 @@ interface SaveAsDialogProps {
   ) => void;
   onClose: () => void;
   buildContent: () => Record<string, unknown> | undefined;
+  /**
+   * Runs once the destination project exists but BEFORE the document is
+   * serialized, so images living outside a project can be moved into it and the
+   * very first stored copy already references real assets. Doing this after the
+   * save would leave that first copy — the one another device may open — full of
+   * references only this machine can resolve.
+   */
+  onProjectReady?: (projectId: string, destination: SaveDestination) => Promise<void>;
 }
 
 /** Web is always cloud-backed; the device/cloud toggle would be misleading. */
@@ -72,6 +80,7 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
   defaultFileName,
   defaultDestination,
   onSaved,
+  onProjectReady,
   onClose,
   buildContent,
 }) => {
@@ -202,6 +211,42 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
     }, 30);
   }, []);
 
+  /**
+   * Whether the name in the box would create a project rather than reuse one.
+   *
+   * The dialog has always created a project for a name it did not recognise —
+   * `handleSave` does it — but nothing said so, and a combo box full of
+   * existing projects reads as a list of the only choices available (issue
+   * #89). This drives the "New Project…" row and the line under the input, so
+   * the behaviour that was already there is visible before the writer commits
+   * to it.
+   */
+  const trimmedProjectName = projectName.trim();
+  const defaultProjectFolder = useSettingsStore((s) => s.defaultProjectFolder);
+  const isNewProject = trimmedProjectName !== ''
+    && !projects.some((p) => p.name.toLowerCase() === trimmedProjectName.toLowerCase());
+
+  /**
+   * Start naming a new project: empty the box and put the caret in it.
+   *
+   * Focusing the input is what re-opens the dropdown, so the focus this does
+   * would spring the list straight back open over the empty field. The flag
+   * lets that one focus through silently; it is cleared either by the focus
+   * handler consuming it or by the timeout, so it can never swallow the next
+   * genuine click into the field.
+   */
+  const skipNextFocusOpen = useRef(false);
+  const handleNewProject = useCallback(() => {
+    setProjectName('');
+    setIsTyping(true);
+    setDropdownOpen(false);
+    skipNextFocusOpen.current = true;
+    setTimeout(() => {
+      inputRef.current?.focus();
+      skipNextFocusOpen.current = false;
+    }, 30);
+  }, []);
+
   const handleSave = async () => {
     const trimmedProject = projectName.trim();
     const trimmedFile = fileName.trim();
@@ -233,7 +278,18 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
         project = cached;
       } else {
         try {
-          project = await client.createProject(trimmedProject);
+          // With a projects folder set in Settings, a new local project is
+          // kept in a folder of its own there, like one made from the
+          // project list (issue #135).
+          const lf = destination === 'local' ? await import('../services/linkedFiles') : null;
+          const folder = lf?.defaultFolderFor(trimmedProject) ?? null;
+          if (lf && folder) {
+            project = (await lf.createProjectInFolder(
+              trimmedProject, folder, lf.projectFileFormat(null),
+            )).project;
+          } else {
+            project = await client.createProject(trimmedProject);
+          }
         } catch (err: any) {
           if (err?.status === 409) {
             const fresh = await client.listProjects().catch(() => [] as ProjectInfo[]);
@@ -250,6 +306,17 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
             setSaving(false);
             return;
           }
+        }
+      }
+
+      // Move any images that live outside a project into this one, before the
+      // document is serialized. A failure here must not cost the writer the
+      // save: unpromoted images still resolve locally.
+      if (onProjectReady) {
+        try {
+          await onProjectReady(project.id, destination);
+        } catch (err) {
+          console.warn('[save-as] could not move images into the project:', err);
         }
       }
 
@@ -334,7 +401,14 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
                     setIsTyping(true);
                     setDropdownOpen(true);
                   }}
-                  onFocus={() => { setIsTyping(false); setDropdownOpen(true); }}
+                  onFocus={() => {
+                    if (skipNextFocusOpen.current) {
+                      skipNextFocusOpen.current = false;
+                      return;
+                    }
+                    setIsTyping(false);
+                    setDropdownOpen(true);
+                  }}
                   placeholder="Project name"
                   style={{ flex: 1, borderRadius: '4px 0 0 4px' }}
                 />
@@ -360,7 +434,10 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
                   &#9662;
                 </button>
               </div>
-              {dropdownOpen && filteredProjects.length > 0 && (
+              {/* Opens even with nothing to list: the "New Project…" row has to
+                  be reachable by a writer whose library is still empty, which
+                  is exactly when they most need it. */}
+              {dropdownOpen && (
                 <div
                   style={{
                     position: 'absolute',
@@ -377,6 +454,25 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
                     boxShadow: '0 4px 12px rgba(0,0,0,.3)',
                   }}
                 >
+                  <div
+                    onClick={handleNewProject}
+                    style={{
+                      padding: '8px 12px',
+                      cursor: 'pointer',
+                      fontSize: 13,
+                      color: 'var(--fd-accent, #3b82f6)',
+                      borderBottom: filteredProjects.length > 0
+                        ? '1px solid var(--fd-border)'
+                        : 'none',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--fd-menu-hover)')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    <FaPlus size={11} /> New Project&hellip;
+                  </div>
                   {filteredProjects.map((p) => (
                     <div
                       key={p.id}
@@ -402,6 +498,12 @@ const SaveAsDialog: React.FC<SaveAsDialogProps> = ({
                       {p.name}
                     </div>
                   ))}
+                </div>
+              )}
+              {isNewProject && (
+                <div style={{ fontSize: 12, color: 'var(--fd-text-muted)', marginTop: 6 }}>
+                  New project &mdash; &ldquo;{trimmedProjectName}&rdquo; will be created when you save
+                  {destination === 'local' && defaultProjectFolder ? <>, in a folder of its own in {defaultProjectFolder}</> : null}.
                 </div>
               )}
             </div>

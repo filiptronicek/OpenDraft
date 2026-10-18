@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import type { DBAdapter } from './adapter';
 
 /** Convert `?` placeholders to PostgreSQL `$1, $2, ...` style. */
@@ -64,7 +64,53 @@ export class PostgresAdapter implements DBAdapter {
     await this.pool.query(adapted);
   }
 
+  async transaction<T>(operation: (db: DBAdapter) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await operation(new PostgresTransactionAdapter(client));
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
+  }
+}
+
+class PostgresTransactionAdapter implements DBAdapter {
+  constructor(private readonly client: PoolClient) {}
+
+  async run(sql: string, params: unknown[] = []): Promise<{ changes: number }> {
+    const result = await this.client.query(toPgPlaceholders(sql), params);
+    return { changes: result.rowCount ?? 0 };
+  }
+
+  async get<T = any>(sql: string, params: unknown[] = []): Promise<T | undefined> {
+    const result = await this.client.query(toPgPlaceholders(sql), params);
+    return result.rows[0] as T | undefined;
+  }
+
+  async all<T = any>(sql: string, params: unknown[] = []): Promise<T[]> {
+    const result = await this.client.query(toPgPlaceholders(sql), params);
+    return result.rows as T[];
+  }
+
+  async exec(sql: string): Promise<void> {
+    await this.client.query(adaptDDL(sql));
+  }
+
+  async transaction<T>(_operation: (db: DBAdapter) => Promise<T>): Promise<T> {
+    throw new Error('Nested PostgreSQL transactions are not supported');
+  }
+
+  async close(): Promise<void> {
+    throw new Error('Cannot close a transaction adapter');
   }
 }

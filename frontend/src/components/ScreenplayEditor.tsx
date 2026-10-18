@@ -1,5 +1,5 @@
 import React, { useEffect, useCallback, useRef, useState, useMemo } from 'react';
-import { useEditor, EditorContent } from '@tiptap/react';
+import { useEditor, EditorContent, type Editor } from '@tiptap/react';
 import Document from '@tiptap/extension-document';
 import Text from '@tiptap/extension-text';
 import { ScreenplayHardBreak, HardBreakLeafText } from '../editor/extensions/ScreenplayHardBreak';
@@ -13,9 +13,11 @@ import Dropcursor from '@tiptap/extension-dropcursor';
 import Gapcursor from '@tiptap/extension-gapcursor';
 import TextAlign from '@tiptap/extension-text-align';
 import Placeholder from '@tiptap/extension-placeholder';
-import TextStyle from '@tiptap/extension-text-style';
-import Color from '@tiptap/extension-color';
-import FontFamily from '@tiptap/extension-font-family';
+import { InkAwareColor } from '../editor/extensions/InkAwareColor';
+import { RevisionMark, RevisionTextStyle } from '../editor/extensions/RevisionMark';
+import { LockedPages } from '../editor/extensions/LockedPages';
+import { assignSceneNumbers } from '../utils/sceneNumbers';
+import FontFamily from '../editor/extensions/ScreenplayFontFamily';
 import { Extension } from '@tiptap/core';
 import * as Y from 'yjs';
 import { HocuspocusProvider } from '@hocuspocus/provider';
@@ -23,27 +25,37 @@ import { HocuspocusProvider } from '@hocuspocus/provider';
 import {
   SceneHeading, Action, Character, Dialogue, Parenthetical,
   Transition, General, Shot, NewAct, EndOfAct, Lyrics,
-  ShowEpisode, CastList, FontSize, ScriptNoteMark, TagMark,
+  Section, Note,
+  ShowEpisode, CastList, FontSize, PasteFormatting, ScriptNoteMark, TagMark,
   FormatOverride, CustomElement, DualDialogue, DualDialogueColumn,
   TitlePage,
-  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvKeymap,
+  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage, AvKeymap, AvCueDecorations,
   StartsNewPage,
 } from '../editor/extensions';
-import { registerAvCellPicker } from '../editor/extensions/AvBlock';
+import { ElementNumbers, ELEMENT_NUMBERS_REFRESH } from '../editor/extensions/ElementNumbers';
+import { getElementNumberingRules } from '../utils/elementNumbers';
+import { registerAvCellPicker, isInAvCell, AV_BASE_CELL_ELEMENT_IDS } from '../editor/extensions/AvBlock';
+import { avCellElementRules } from '../utils/avCellElements';
+import { isBlankBlock, previousSiblingBlock, blankLineTypeFor } from '../editor/blankLine';
 import Strike from '@tiptap/extension-strike';
 import Subscript from '@tiptap/extension-subscript';
 import Superscript from '@tiptap/extension-superscript';
-import Highlight from '@tiptap/extension-highlight';
+import { PastedHighlight } from '../editor/extensions/PastedHighlight';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
 import { generateTemplateCss, injectTemplateCss } from '../utils/templateCss';
 import { docHasAnyText } from '../utils/docText';
 import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFormatting';
 import { createPaginationPlugin, getPageMetrics, activeTemplateHints } from '../editor/pagination';
+import type { FootnotePageAssignment } from '../editor/pagination';
+import type { EndnotePage } from '../utils/footnotes';
 import { createContdCasePlugin } from '../editor/contdCase';
 import { ScreenplayImage } from '../editor/extensions/ScreenplayImage';
-import { insertImageNode } from '../utils/insertImage';
+import { buildImageAttrs, insertImageNode, warnIfImageDegraded } from '../utils/insertImage';
+import { demoteDataUrlsToScratch, promoteScratchImages } from '../services/promoteScratchAssets';
+import { docHasInlineImageBytes, docHasScratchImages } from '../utils/scratchRefs';
+import { setLiveScratchDocSource } from '../services/scratchSweep';
 
-import { useEditorStore, DEFAULT_PAGE_LAYOUT, DEFAULT_TAG_CATEGORIES, resolveMoresContds, resolveHeaderFooter, printedPageNumber } from '../stores/editorStore';
+import { useEditorStore, DEFAULT_PAGE_LAYOUT, DEFAULT_TAG_CATEGORIES, resolveMoresContds, resolveHeaderFooter, printedPageNumber, savedProfileFields, type SceneInfo } from '../stores/editorStore';
 import type { ElementType, HeaderFooterContent } from '../stores/editorStore';
 import HeaderFooterBand from './HeaderFooterBand';
 import HeaderFooterDialog from './HeaderFooterDialog';
@@ -54,9 +66,14 @@ import SceneNavigator from './SceneNavigator';
 import IndexCards from './IndexCards';
 import BeatBoard from './BeatBoard';
 import ScriptStatistics from './ScriptStatistics';
+import TableReadPanel from './TableReadPanel';
+import VoiceProviderDialog from './VoiceProviderDialog';
+import { TableReadHighlight } from '../editor/extensions/TableReadHighlight';
+import { useTableReadStore } from '../stores/tableReadStore';
 import ScriptNotes from './ScriptNotes';
 import CharacterProfiles from './CharacterProfiles';
 import TagsPanel from './TagsPanel';
+import { PluginPanelTabs } from './PluginPanelTabs';
 import LocationDatabase from './LocationDatabase';
 import FormatPanel from './FormatPanel';
 import StatusBar from './StatusBar';
@@ -69,12 +86,32 @@ import WritingSuggestionsModal from './WritingSuggestionsModal';
 import GrammarRulesPanel from './GrammarRulesPanel';
 // MobileAccessoryBar removed — context menu via 3-finger touch only
 import ScriptContextMenu from './ScriptContextMenu';
+import ScribbleInput from './ScribbleInput';
+import PencilCaret from './PencilCaret';
+import SelectionHandles from './SelectionHandles';
+import { useFootnotePlan } from '../hooks/useFootnotePlan';
+import { footnotePlanSignature, type FootnotePlan } from '../utils/footnotes';
+import { createFootnoteMarkerPlugin } from '../editor/footnoteMarkers';
+import { stripNoteBackgrounds } from '../editor/stripNoteBackgrounds';
+import { sweepStrayNoteHighlights } from '../editor/scriptNoteMarks';
+import FootnoteBlock from './FootnoteBlock';
+import FootnoteDialog from './FootnoteDialog';
+import EndnotePages from './EndnotePages';
+
+/** Shared empty list, so "nothing prints" never re-renders the overlays. */
+const NO_FOOTNOTE_PAGES: FootnotePageAssignment[] = [];
+const NO_ENDNOTE_PAGES: EndnotePage[] = [];
+import { HANDWRITING_EVENT } from '../utils/handwriting';
+import { ELEMENT_MENU_EVENT } from '../utils/elementMenu';
+import { matchesShortcut } from '../utils/shortcuts';
 import { SpellCheck, spellCheckPluginKey } from '../editor/extensions/SpellCheck';
 import { Grammar, grammarPluginKey } from '../editor/extensions/Grammar';
 import { spellChecker, BUILTIN_LANGUAGE } from '../editor/spellchecker';
 import { grammarIgnore } from '../editor/grammar/grammarIgnore';
 import { buildSaveContent as buildSaveContentShared, stripSaveMetadata } from '../utils/saveContent';
 import { hydrateEditorStoresFromContent } from '../utils/hydrateStores';
+import { DEFAULT_SCRIPT_PROFILE, normalizeScriptProfile } from '../utils/scriptProfile';
+import { restoreRevisionState } from '../utils/revisionState';
 import { characterKey } from '../utils/nodeText';
 import { computeContdChanges, type ContdBlock } from '../editor/contdAuto';
 import { useBackupScheduler } from '../hooks/useBackupScheduler';
@@ -102,12 +139,15 @@ import { api } from '../services/api';
 import { cloudApi } from '../services/cloudApi';
 import { projectApi } from '../services/projectApi';
 import { scriptApi } from '../services/scriptApi';
-import { API_BASE, getCollabWsUrl } from '../config';
+import { getApiBase, getCollabWsUrl } from '../config';
+import { buildCollabProviderToken, readCollabRouteToken } from '../services/collabInvite';
+import { scrubCapabilityUrl } from '../services/capabilityUrl';
 import { showToast } from './Toast';
 import VersionHistory from './VersionHistory';
 import AssetManager from './AssetManager';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useGoBack } from '../hooks/useGoBack';
+import { useGoBack, useGoBackTo } from '../hooks/useGoBack';
+import { setPendingSaveFlush } from '../services/pendingSave';
 import OpenFile from './OpenFile';
 import type { OpenSource } from './OpenFile';
 import WelcomeDialog, { type WelcomeChoice } from './WelcomeDialog';
@@ -126,6 +166,9 @@ import { stashSessionDoc, takeSessionDoc, clearSessionDoc } from '../utils/sessi
 import SaveAsDialog from './SaveAsDialog';
 import TitlePageEditor from './TitlePageEditor';
 import MoresContdsDialog from './MoresContdsDialog';
+import FontsDialog from './FontsDialog';
+import { fontStack } from '../utils/fonts';
+import { titlePageRuleId, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
 import ShareDialog from './ShareDialog';
 import CollabLoginDialog from './CollabLoginDialog';
 import JoinCollabDialog from './JoinCollabDialog';
@@ -133,13 +176,64 @@ import CompareVersionPicker from './CompareVersionPicker';
 import ZoomPanel from './ZoomPanel';
 import { useIsTouchDevice, useSwipeEdge, usePinchZoom } from '../hooks/useTouch';
 import { useSettingsStore } from '../stores/settingsStore';
+import { useLinkedFileStore, autoSaveAppliesToOpenDocument } from '../stores/linkedFileStore';
 import { startCollabSync, stopCollabSync } from '../services/collabSync';
-import { collabAuthApi, setLogoutCollabTeardown, setLogoutEditorReset, isCollabAuthenticated } from '../services/collabAuth';
-import { platformFetch, isTauri, isDesktopTauri } from '../services/platform';
+import { collabAuthApi, setLogoutCollabTeardown, setLogoutEditorReset, ensureCollabAuthenticated, COLLAB_AUTH_UNAVAILABLE_MESSAGE } from '../services/collabAuth';
+import { platformFetch, isTauri, isDesktopTauri, needsSelectionHandles } from '../services/platform';
 import { reportSaveError } from '../stores/saveErrorStore';
 import { pluginRegistry } from '../plugins/registry';
 import { createTrackChangesPlugin, trackChangesPluginKey } from '../editor/trackChanges';
 import type { VersionInfo } from '../services/api';
+
+/**
+ * Bring a linked script's library copy and its file on disk into agreement
+ * before the script is shown (issue #135), and tell the writer what happened.
+ * Returns the linked file's path, or null when the script is not linked.
+ *
+ * Never throws: a file that cannot be reached is reported, and the library
+ * copy — which is always there — is what opens.
+ */
+async function syncLinkedFileBeforeOpen(
+  projectId: string,
+  scriptId: string,
+  scriptTitle?: string,
+): Promise<string | null> {
+  try {
+    if (useProjectStore.getState().isCloudScript(projectId, scriptId)) return null;
+    const lf = await import('../services/linkedFiles');
+    if (!lf.linkingSupported()) return null;
+    const result = await lf.syncScriptWithFile(projectId, scriptId, { scriptTitle });
+    const name = 'path' in result && result.path ? lf.basenameOf(result.path) : '';
+    switch (result.kind) {
+      case 'none':
+        return null;
+      case 'loaded-from-file':
+        showToast(`${name} was changed outside OpenDraft — opened that version.`, 'info');
+        break;
+      case 'kept-library':
+        showToast(
+          result.preservedAs
+            ? `Kept OpenDraft's version and saved it to ${name}. The other version was kept as ${lf.basenameOf(result.preservedAs)}.`
+            : `Kept OpenDraft's version and saved it to ${name}.`,
+          'success',
+        );
+        break;
+      case 'missing':
+        showToast(`${name} is no longer in its folder. Saving will create it again.`, 'error');
+        break;
+      case 'unreachable':
+        showToast(
+          `Could not reach ${name || 'the linked file'}: ${result.error}. Showing OpenDraft's copy — it will be saved to the file when the drive is back.`,
+          'error',
+        );
+        break;
+    }
+    return result.path || (await lf.getLink(scriptId))?.path || null;
+  } catch (err) {
+    console.error('[linked-files] check before opening failed:', err);
+    return null;
+  }
+}
 
 // Vibrant dark colors for collaboration cursors and avatars
 const COLLAB_COLORS = [
@@ -170,8 +264,126 @@ const DEFAULT_NEXT_TYPE: Record<string, string> = {
 const ALL_ELEMENT_TYPES: ElementType[] = [
   'sceneHeading', 'action', 'character', 'dialogue', 'parenthetical',
   'transition', 'general', 'shot', 'newAct', 'endOfAct', 'lyrics',
-  'showEpisode', 'castList',
+  'showEpisode', 'castList', 'section', 'note',
 ];
+
+/**
+ * Load a shared script's project and saved content for a collaboration guest.
+ *
+ * Best-effort: the backend serves a project only to its owner, so a guest
+ * signed in as somebody else — or not at all — gets nulls back. That is fine:
+ * the guest edits the host's live Yjs document, and the saved copy only lets
+ * the editor show text before the first sync. Plain fetches on purpose, so a
+ * refusal cannot raise the sign-in prompt.
+ */
+async function fetchSharedScript(projectId: string, scriptId: string, collabWsUrl = getCollabWsUrl()): Promise<{ project: any; scriptResp: any }> {
+  // Try multiple backends (local + alternatives) for cross-backend joins.
+  // Derive host from the collab server URL so cross-machine access works.
+  const collabHttpUrl = collabWsUrl.replace(/^ws/, 'http');
+  const collabHost = (() => { try { return new URL(collabHttpUrl).hostname; } catch { return 'localhost'; } })();
+  const backends = [
+    getApiBase(),
+    `http://${collabHost}:8000/api`,
+    `http://${collabHost}:18321/api`,
+  ].filter((v, i, a) => a.indexOf(v) === i);
+
+  let project: any = null;
+  let scriptResp: any = null;
+  for (const base of backends) {
+    try {
+      const pRes = await platformFetch(`${base}/projects/${projectId}`);
+      if (!pRes.ok) continue;
+      project = await pRes.json();
+      const sRes = await platformFetch(`${base}/projects/${projectId}/scripts/${scriptId}`);
+      if (!sRes.ok) continue;
+      scriptResp = await sRes.json();
+      break;
+    } catch { /* try next */ }
+  }
+  return { project, scriptResp };
+}
+
+/** The collab server refused an invite: revoked, expired or never issued there. */
+class CollabInviteRefusedError extends Error {}
+
+/**
+ * Look an invite up on the collab server the session lives on.
+ *
+ * A guest's own settings may name a different server (or none — the default
+ * is production), so the lookup goes to `collabWsUrl`, the server the guest
+ * actually joined through. A plain fetch, like joining: the invite is the
+ * credential, and the guest's own sign-in has no say. Only when that server
+ * cannot be reached at all does it fall back to the configured one.
+ */
+async function lookupCollabSession(token: string, collabWsUrl: string): Promise<import('../services/api').CollabSession> {
+  const collabHttpUrl = collabWsUrl.replace(/^ws/, 'http');
+  let res: Response;
+  try {
+    res = await platformFetch(`${collabHttpUrl}/api/collab/session/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+  } catch (err) {
+    console.warn(`[Collab] ${collabHttpUrl} unreachable for invite lookup, trying the configured server:`, err);
+    return api.validateCollabSession(token);
+  }
+  if (res.ok) return res.json();
+  const detail = await res.text().catch(() => '');
+  if (res.status === 404) throw new CollabInviteRefusedError(`Invite refused by ${collabHttpUrl}: ${detail}`);
+  throw new Error(`Collab server ${collabHttpUrl} answered ${res.status}: ${detail}`);
+}
+
+/** The ProseMirror document to seed a collab room with, or null if there is none. */
+function collabSeedFrom(content: unknown): Record<string, unknown> | null {
+  if (!content || typeof content !== 'object') return null;
+  const doc = content as Record<string, unknown>;
+  if (doc.type === 'doc') {
+    const { _notes, _generalNotes, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId, _pageLayout, ...pmDoc } = doc;
+    return pmDoc;
+  }
+  return Object.keys(doc).length > 0 ? doc : null;
+}
+
+/**
+ * Which element the caret is standing on, or null when nothing answers.
+ *
+ * Shared by `onSelectionUpdate` and every path that replaces the document
+ * wholesale. Tiptap raises `selectionUpdate` only when the mapped selection
+ * differs from the old one, so swapping in a whole new document can leave the
+ * store reporting the element the *previous* document's caret was on — and
+ * every control derived from it reading the wrong script: the toolbar's element
+ * list, the AV row buttons, the language selector.
+ *
+ * Order matters. Custom elements and title-page fields are one node type with
+ * an attribute, and the four AV cell paragraph types are deliberately absent
+ * from ALL_ELEMENT_TYPES (they are not top-level screenplay elements and have
+ * to stay out of TextAlign's node list), so each needs asking about separately
+ * before the general sweep.
+ */
+function resolveActiveElement(ed: Editor): ElementType | null {
+  try {
+    if (ed.isActive('customElement')) {
+      const attrs = ed.getAttributes('customElement');
+      if (attrs?.customTypeId) return attrs.customTypeId as ElementType;
+    }
+    if (ed.isActive('titlePage')) {
+      const field = (ed.getAttributes('titlePage')?.field as string) || 'title';
+      return titlePageRuleId(field) as ElementType;
+    }
+    // Only the four AV paragraph types need asking about here — the screenplay
+    // elements a cell also accepts are in ALL_ELEMENT_TYPES below.
+    for (const type of AV_BASE_CELL_ELEMENT_IDS) {
+      if (ed.isActive(type)) return type as ElementType;
+    }
+    for (const type of ALL_ELEMENT_TYPES) {
+      if (ed.isActive(type)) return type;
+    }
+  } catch (err) {
+    console.warn('[editor] could not resolve the active element', err);
+  }
+  return null;
+}
 
 const SAMPLE_CONTENT = {
   type: 'doc',
@@ -253,9 +465,27 @@ interface OverlayInfo {
 
 const ScreenplayEditor: React.FC = () => {
   const { projectId: urlProjectId, scriptId: urlScriptId, commitHash: urlCommitHash, collabToken: urlCollabToken } = useParams<{ projectId?: string; scriptId?: string; commitHash?: string; collabToken?: string }>();
+  const [routeCollabToken] = useState(() => readCollabRouteToken(
+    urlCollabToken,
+    window.location.pathname,
+    window.location.hash,
+  ));
   const navigate = useNavigate();
+  useEffect(() => {
+    if (routeCollabToken) scrubCapabilityUrl('/collab');
+  }, [routeCollabToken]);
   const goBack = useGoBack();
   const isHistoryMode = Boolean(urlCommitHash);
+  // Read by the revision plugin, which lives as long as the editor does —
+  // longer than any one render's isHistoryMode.
+  const isHistoryModeRef = useRef(isHistoryMode);
+  isHistoryModeRef.current = isHistoryMode;
+  // Leaving read-only history mode unwinds to the editor entry it was opened
+  // from; pushing a second one instead left the version sitting on the stack
+  // for the next Back press to walk into (issue #66).
+  const leaveHistoryMode = useGoBackTo(
+    urlProjectId && urlScriptId ? `/project/${urlProjectId}/edit/${urlScriptId}` : '/',
+  );
 
   const {
     setActiveElement, setScenes, setPageCount, setCurrentPage,
@@ -268,8 +498,11 @@ const ScreenplayEditor: React.FC = () => {
     grammarRulesPanelOpen, setGrammarRulesPanelOpen,
     setDocumentTitle,
     sceneNumbersVisible, sceneNumbersLocked,
+    includeTitlePageInOutput,
+    showRevisionColors,
     saveStatus, saveError, setSaveStatus,
   } = useEditorStore();
+  const tableReadOpen = useTableReadStore((s) => s.open);
 
   const { currentProject, currentScriptId, setCurrentProject, setCurrentScriptId, scriptReloadKey, markCloudScript, isCloudScript } = useProjectStore();
 
@@ -341,6 +574,10 @@ const ScreenplayEditor: React.FC = () => {
   const collabEditorRef = useRef<ReturnType<typeof useEditor>>(null);
   // Track current collab document name to prevent duplicate setup (React StrictMode)
   const collabDocNameRef = useRef<string | null>(null);
+  // Every room the host has had open this session. A guest who did not follow
+  // a document switch is still in an earlier one, so ending the session has
+  // to close all of them, not only the current one.
+  const collabSessionDocsRef = useRef<{ projectId: string; scriptId: string; docName: string }[]>([]);
 
   // Cleanup collab provider
   const destroyCollab = useCallback(() => {
@@ -375,14 +612,21 @@ const ScreenplayEditor: React.FC = () => {
     setCurrentScriptId(null);
     setDocumentTitle('Untitled Screenplay');
     setEditorKey((k) => k + 1);
-    navigate('/');
+    // replace, not push: the session behind us is over, and leaving
+    // /collab/:token on the stack puts a dead session one Back press away.
+    navigate('/', { replace: true });
   }, [destroyCollab, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
+  // Shared invite of the last host document switch this guest followed.
+  const followedSwitchTokenRef = useRef('');
+  // The collab server this session is on — the one from the invite link,
+  // which need not be the one in Settings. Following the host stays there.
+  const collabWsUrlRef = useRef('');
   const handleSessionEndedRef = useRef(handleSessionEnded);
   handleSessionEndedRef.current = handleSessionEnded;
 
   // Ref for document-switch handler (defined after setupCollab to avoid circular dependency)
-  const handleDocumentSwitchRef = useRef<(projectId: string, scriptId: string, token: string) => void>(() => {});
+  const handleDocumentSwitchRef = useRef<(projectId: string, scriptId: string, token: string, title?: string) => void>(() => {});
 
   const setupCollab = useCallback((docName: string, inviteToken: string, _userName: string, isHost = false, overrideWsUrl?: string) => {
     // Skip if already setting up the same document (prevents React StrictMode
@@ -398,29 +642,16 @@ const ScreenplayEditor: React.FC = () => {
     addCollabActivity('Starting collaboration session');
     const ydoc = new Y.Doc();
 
-    // Build compound token: "jwt:<access>|invite:<invite>" when auth is available and valid
-    const { collabAuth, clearCollabAuth } = useSettingsStore.getState();
-    let token = inviteToken;
-    if (collabAuth.accessToken) {
-      // Check JWT expiry client-side to avoid sending expired tokens
-      try {
-        const payload = JSON.parse(atob(collabAuth.accessToken.split('.')[1]));
-        if (payload.exp && payload.exp * 1000 > Date.now()) {
-          token = `jwt:${collabAuth.accessToken}|invite:${inviteToken}`;
-        } else {
-          // JWT expired — clear it so we don't keep sending it
-          clearCollabAuth();
-        }
-      } catch {
-        // Malformed JWT — just use invite token
-        clearCollabAuth();
-      }
-    }
-
     // Use the collab server URL extracted from the invite link if provided,
     // otherwise fall back to the local setting.
-    const wsUrl = overrideWsUrl || getCollabWsUrl();
-    console.log(`[Collab] setupCollab: docName="${docName}", wsUrl="${wsUrl}", isHost=${isHost}, tokenPrefix="${inviteToken.slice(0, 8)}..."`);
+    const configuredWsUrl = getCollabWsUrl();
+    const wsUrl = overrideWsUrl || configuredWsUrl;
+    const { collabAuth } = useSettingsStore.getState();
+    const token = buildCollabProviderToken(
+      inviteToken, collabAuth.accessToken, wsUrl, configuredWsUrl,
+    );
+    console.log(`[Collab] setupCollab: docName="${docName}", wsUrl="${wsUrl}", isHost=${isHost}`);
+    collabWsUrlRef.current = wsUrl;
 
     const provider = new HocuspocusProvider({
       url: wsUrl,
@@ -436,6 +667,40 @@ const ScreenplayEditor: React.FC = () => {
         console.log(`[Collab] Connection closed for "${docName}": code=${event.code}`);
         setCollabConnectionState('disconnected');
         addCollabActivity(`Connection lost (code ${event.code})`);
+
+        // The server closed this document but left the socket open — what
+        // Hocuspocus does when the host ends the session (close-document) or
+        // an idle room is evicted. The provider only reconnects when the
+        // socket itself drops, so without this a guest sat on "Reconnecting…"
+        // until the socket timed out, a minute or more. Reconnect now: an
+        // invite the host revoked is refused at once (onAuthenticationFailed
+        // takes the guest out), and a valid one simply resyncs.
+        const socket = (event as { target?: unknown }).target;
+        const socketStillOpen = typeof WebSocket !== 'undefined'
+          && socket instanceof WebSocket && socket.readyState === WebSocket.OPEN;
+        if (socketStillOpen && !collabExitingRef.current) {
+          setTimeout(() => {
+            if (providerRef.current !== provider || collabExitingRef.current) return;
+            console.log(`[Collab] Server closed "${docName}" — reconnecting to re-check access`);
+            const socketProvider = provider.configuration.websocketProvider;
+            // connect() is a no-op until the old socket has finished closing,
+            // so reconnect from its disconnect event rather than straight away.
+            const reconnect = () => {
+              socketProvider.off('disconnect', reconnect);
+              if (providerRef.current !== provider || collabExitingRef.current) return;
+              provider.connect().catch((err: unknown) => {
+                console.error(`[Collab] Could not reconnect to "${docName}":`, err);
+              });
+            };
+            try {
+              socketProvider.on('disconnect', reconnect);
+              provider.disconnect();
+            } catch (err) {
+              socketProvider.off('disconnect', reconnect);
+              console.error(`[Collab] Could not reconnect to "${docName}":`, err);
+            }
+          }, 0);
+        }
       },
       onSynced: ({ state }) => {
         console.log(`[Collab] Synced for "${docName}": state=${state}, isHost=${isHost}`);
@@ -468,7 +733,12 @@ const ScreenplayEditor: React.FC = () => {
         collabExitingRef.current = true;
 
         console.error(`[Collab] Auth FAILED for "${docName}": ${reason}`);
-        const isSessionEnded = reason?.includes('expired') || reason?.includes('Invalid');
+        // Hocuspocus reports a refused invite as "permission-denied" — what a
+        // guest gets back once the host has ended the session and revoked it.
+        // A link that was bad from the start never gets this far: joining
+        // validates it first.
+        const isSessionEnded = reason?.includes('expired') || reason?.includes('Invalid')
+          || reason === 'permission-denied';
         showToast(
           isSessionEnded
             ? 'The collaboration session has ended'
@@ -488,7 +758,8 @@ const ScreenplayEditor: React.FC = () => {
             setDocumentTitle('Untitled Screenplay');
           }
           setEditorKey((k) => k + 1);
-          if (!isHost) navigate('/');
+          // replace: the collab route no longer leads anywhere (see above).
+          if (!isHost) navigate('/', { replace: true });
         }, 0);
       },
       onAwarenessUpdate: ({ states }) => {
@@ -500,13 +771,15 @@ const ScreenplayEditor: React.FC = () => {
         let switchProjectId = '';
         let switchScriptId = '';
         let switchToken = '';
+        let switchTitle: string | undefined;
         states.forEach((state: Record<string, unknown>) => {
-          const user = state.user as { name: string; color: string; sessionEnded?: boolean; documentSwitch?: { projectId: string; scriptId: string; token: string } } | undefined;
+          const user = state.user as { name: string; color: string; sessionEnded?: boolean; documentSwitch?: { projectId: string; scriptId: string; token: string; title?: string } } | undefined;
           if (user?.sessionEnded) sessionEnded = true;
           if (user?.documentSwitch) {
             switchProjectId = user.documentSwitch.projectId;
             switchScriptId = user.documentSwitch.scriptId;
             switchToken = user.documentSwitch.token;
+            switchTitle = user.documentSwitch.title;
           }
           if (user?.name) users.push(user);
         });
@@ -531,7 +804,7 @@ const ScreenplayEditor: React.FC = () => {
           handleSessionEndedRef.current();
         }
         if (switchProjectId && switchScriptId && switchToken) {
-          handleDocumentSwitchRef.current(switchProjectId, switchScriptId, switchToken);
+          handleDocumentSwitchRef.current(switchProjectId, switchScriptId, switchToken, switchTitle);
         }
       },
     });
@@ -543,37 +816,64 @@ const ScreenplayEditor: React.FC = () => {
   }, [destroyCollab]);
 
   // Called when host broadcasts document-switch — guest auto-follows
-  const handleDocumentSwitch = useCallback(async (projectId: string, scriptId: string, sharedToken: string) => {
+  const handleDocumentSwitch = useCallback(async (projectId: string, scriptId: string, sharedToken: string, title?: string) => {
+    // The host's awareness keeps carrying the switch, so every awareness
+    // update repeats it. Follow each switch once.
+    if (followedSwitchTokenRef.current === sharedToken) return;
+    followedSwitchTokenRef.current = sharedToken;
+    const collabWs = collabWsUrlRef.current || getCollabWsUrl();
+    const named = title ? `“${title}”` : 'the new script';
+
+    // A dropped request should not strand the guest: try twice before giving up.
+    let session: import('../services/api').CollabSession | null = null;
+    for (let attempt = 1; attempt <= 2 && !session; attempt++) {
+      try {
+        session = await lookupCollabSession(sharedToken, collabWs);
+      } catch (err) {
+        console.error(`[Collab] Could not follow the host to ${projectId}/${scriptId} (attempt ${attempt}):`, err);
+        if (err instanceof CollabInviteRefusedError || attempt === 2) {
+          showToast(
+            err instanceof CollabInviteRefusedError
+              ? `The host moved to ${named}, but its invite is no longer valid. Ask the host for a new link.`
+              : `Couldn't follow the host to ${named}. You're still in the previous script — check your connection or ask the host for a new link.`,
+            'error',
+          );
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+    // A newer switch arrived while this one was retrying — that one wins.
+    if (!session || followedSwitchTokenRef.current !== sharedToken) return;
+
     try {
-      // Validate the shared token to get the session_nonce for the room name
-      const session = await api.validateCollabSession(sharedToken);
       const nonce = session.session_nonce || '';
 
-      const project = await projectApi.getProject(projectId);
-      const scriptResp = await scriptApi.getScript(projectId, scriptId);
+      // Optional, as when joining: a guest is rarely allowed to read the
+      // host's project, and following must not depend on it.
+      const { project, scriptResp } = await fetchSharedScript(projectId, scriptId, collabWs);
 
-      const content = scriptResp.content as Record<string, unknown> | null;
-      if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-        const { _notes, _generalNotes, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId, _pageLayout: _plCollab, ...pmDoc } = content as Record<string, unknown>;
-        collabInitialContent.current = pmDoc;
-      } else if (content && typeof content === 'object' && Object.keys(content).length > 0) {
-        collabInitialContent.current = content;
-      }
+      // Reset even when nothing loaded, so the previous document's text is
+      // never carried into the new room.
+      const content = scriptResp?.content as Record<string, unknown> | null | undefined;
+      collabInitialContent.current = collabSeedFrom(content);
 
       // Restore per-document template
       const tplId = (content as any)?._templateId;
       useFormattingTemplateStore.getState().setActiveTemplateId(typeof tplId === 'string' ? tplId : null);
 
       const docName = `${projectId}/${scriptId}${nonce ? `/${nonce}` : ''}`;
-      setupCollab(docName, sharedToken, collabUserName);
+      setupCollab(docName, sharedToken, collabUserName, false, collabWs);
 
-      setCurrentProject(project);
+      const docTitle = scriptResp?.meta?.title || title || 'Untitled';
+      setCurrentProject(project || { id: projectId, name: 'Collaboration' });
       setCurrentScriptId(scriptId);
-      setDocumentTitle(scriptResp.meta.title);
+      setDocumentTitle(docTitle);
       setEditorKey((k) => k + 1);
-      showToast(`Host switched to: ${scriptResp.meta.title}`, 'info');
-    } catch {
-      showToast('Failed to follow host to new document', 'error');
+      showToast(`Host switched to: ${docTitle}`, 'info');
+    } catch (err) {
+      console.error('[Collab] Could not open the document the host switched to:', err);
+      showToast(`Couldn't follow the host to ${named}. You're still in the previous script.`, 'error');
     }
   }, [setupCollab, collabUserName, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
@@ -612,6 +912,11 @@ const ScreenplayEditor: React.FC = () => {
     if (!isTouch) return;
     const handleThreeFingerTouch = (e: TouchEvent) => {
       if (e.touches.length === 3) {
+        // Not inside the handwriting panel. It has its own selection and
+        // clipboard controls, and the field's native callout carries the
+        // Pencil's own gestures — opening the script's context menu on top of
+        // it would take both away.
+        if ((e.target as HTMLElement | null)?.closest?.('.scribble-panel')) return;
         e.preventDefault();
         // Use center of the three touches as position
         let cx = 0, cy = 0;
@@ -654,6 +959,8 @@ const ScreenplayEditor: React.FC = () => {
     openFileOpen, setOpenFileOpen, saveAsOpen, setSaveAsOpen,
     titlePageEditorOpen, setTitlePageEditorOpen,
     moresContdsOpen, setMoresContdsOpen,
+    footnoteDialogOpen, setFootnoteDialogOpen,
+    fontsDialogOpen, setFontsDialogOpen,
     compareVersionOpen, setCompareVersionOpen,
     setTrackChangesEnabled, setTrackChangesLabel,
   } = useEditorStore();
@@ -687,73 +994,43 @@ const ScreenplayEditor: React.FC = () => {
   // ── Handle /collab/:token route — resolve token to project/script, then enter collab mode ──
   const collabInitDone = useRef(false);
   const collabInitialContent = useRef<Record<string, unknown> | null>(null);
-  const [collabLoading, setCollabLoading] = useState(Boolean(urlCollabToken));
+  const [collabLoading, setCollabLoading] = useState(Boolean(routeCollabToken));
   useEffect(() => {
-    if (!urlCollabToken || collabInitDone.current) return;
+    if (!routeCollabToken || collabInitDone.current) return;
     collabInitDone.current = true;
     (async () => {
       try {
-        // Try collab server first (validates against all configured backends),
-        // then fall back to local backend
+        // Validate against the configured collaboration service,
+        // then use the platform API wrapper as a compatibility fallback.
         let session: import('../services/api').CollabSession | null = null;
         const collabHttpUrl = getCollabWsUrl().replace(/^ws/, 'http');
         try {
-          const res = await platformFetch(`${collabHttpUrl}/api/collab/session/${urlCollabToken}`);
+          const res = await platformFetch(`${collabHttpUrl}/api/collab/session/validate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: routeCollabToken }),
+          });
           if (res.ok) session = await res.json();
         } catch { /* collab server unreachable */ }
         if (!session) {
-          session = await api.validateCollabSession(urlCollabToken);
+          session = await api.validateCollabSession(routeCollabToken);
         }
 
-        // Load script content FIRST so the editor can seed the Yjs doc.
-        // Try multiple backends (local + alternatives) for cross-backend joins.
-        // Derive host from the collab server URL setting so cross-machine access works.
-        const collabHost = (() => { try { return new URL(collabHttpUrl).hostname; } catch { return 'localhost'; } })();
-        const backends = [
-          API_BASE,
-          `http://${collabHost}:8000/api`,
-          `http://${collabHost}:18321/api`,
-        ].filter((v, i, a) => a.indexOf(v) === i);
-
-        let project: any = null;
-        let scriptResp: any = null;
-        for (const base of backends) {
-          try {
-            const pRes = await platformFetch(`${base}/projects/${session.project_id}`);
-            if (!pRes.ok) continue;
-            project = await pRes.json();
-            const sRes = await platformFetch(`${base}/projects/${session.project_id}/scripts/${session.script_id}`);
-            if (!sRes.ok) continue;
-            scriptResp = await sRes.json();
-            break;
-          } catch { /* try next */ }
-        }
-
-        // Seed the Yjs doc if content was loaded; otherwise Yjs will sync from host
-        if (scriptResp) {
-          const content = scriptResp.content as Record<string, unknown> | null;
-          if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-            const { _notes, _generalNotes, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId, _pageLayout: _plGuest, ...pmDoc } = content as Record<string, unknown>;
-            collabInitialContent.current = pmDoc;
-          } else if (content && typeof content === 'object' && Object.keys(content).length > 0) {
-            collabInitialContent.current = content;
-          }
-        }
 
         // Setup provider synchronously before triggering editor rebuild
         // Include session_nonce so guest joins the exact same Yjs room as the host
         const nonce = session.session_nonce || '';
         const docName = `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
-        setupCollab(docName, urlCollabToken, session.collaborator_name);
+        setupCollab(docName, routeCollabToken, session.collaborator_name);
 
         setCollabUserName(session.collaborator_name);
         setCollabRole((session.role as 'editor' | 'viewer') || 'editor');
         setCollabMode(true);
         setEditorKey((k) => k + 1);
 
-        setCurrentProject(project || { id: session.project_id, name: 'Collaboration' });
+        setCurrentProject({ id: session.project_id, name: 'Collaboration' } as any);
         setCurrentScriptId(session.script_id);
-        setDocumentTitle(scriptResp?.meta?.title || 'Untitled');
+        setDocumentTitle('Untitled');
         setCollabLoading(false);
 
         if (session.role === 'viewer') {
@@ -762,10 +1039,12 @@ const ScreenplayEditor: React.FC = () => {
       } catch (err) {
         showToast('Invalid or expired collaboration link', 'error');
         setCollabLoading(false);
-        navigate('/');
+        // replace: pushing here left the bad link one Back press away, and
+        // returning to it just failed and pushed again.
+        navigate('/', { replace: true });
       }
     })();
-  }, [urlCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
+  }, [routeCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
 
   // handleStartCollab is defined after the editor — see below useEditor
 
@@ -802,17 +1081,33 @@ const ScreenplayEditor: React.FC = () => {
         // Brief delay to allow awareness to propagate before destroying
         await new Promise((r) => setTimeout(r, 300));
       }
+      // Every document this session visited, the current one included.
+      const docs = [...collabSessionDocsRef.current];
+      const currentDocName = collabDocNameRef.current || `${currentProject.id}/${currentScriptId}`;
+      if (!docs.some((d) => d.docName === currentDocName)) {
+        docs.push({ projectId: currentProject.id, scriptId: currentScriptId, docName: currentDocName });
+      }
+      collabSessionDocsRef.current = [];
+
       // Host: revoke all invitation links
-      try {
-        await api.revokeAllCollabSessions(currentProject.id, currentScriptId);
-      } catch { /* ignore — cleanup is best-effort */ }
+      const scripts = new Map(docs.map((d) => [`${d.projectId}/${d.scriptId}`, d]));
+      for (const d of scripts.values()) {
+        try {
+          await api.revokeAllCollabSessions(d.projectId, d.scriptId);
+        } catch (err) {
+          console.warn(`[Collab] Could not revoke invites for ${d.projectId}/${d.scriptId}:`, err);
+        }
+      }
 
       // Host: kick all remaining connections on the collab server.
       // Use the actual room name (includes nonce) so closeConnections matches.
-      const docName = collabDocNameRef.current || `${currentProject.id}/${currentScriptId}`;
-      try {
-        await collabAuthApi.closeDocument(docName);
-      } catch { /* best-effort */ }
+      for (const d of docs) {
+        try {
+          await collabAuthApi.closeDocument(d.docName);
+        } catch (err) {
+          console.warn(`[Collab] Could not close ${d.docName}:`, err);
+        }
+      }
     }
 
     destroyCollab();
@@ -821,8 +1116,9 @@ const ScreenplayEditor: React.FC = () => {
     setCollabRole('editor');
 
     if (isHost && currentProject && currentScriptId) {
-      // Navigate to the project URL so the content-loading effect reloads the saved file
-      navigate(`/project/${currentProject.id}/edit/${currentScriptId}`);
+      // Navigate to the project URL so the content-loading effect reloads the
+      // saved file. replace: the collab route it came from is finished.
+      navigate(`/project/${currentProject.id}/edit/${currentScriptId}`, { replace: true });
       showToast('Collaboration session ended', 'success');
     } else if (isHost) {
       setEditorKey((k) => k + 1);
@@ -833,7 +1129,7 @@ const ScreenplayEditor: React.FC = () => {
       setCurrentScriptId(null);
       setDocumentTitle('Untitled Screenplay');
       setEditorKey((k) => k + 1);
-      navigate('/');
+      navigate('/', { replace: true });
     }
   }, [destroyCollab, collabUserName, collabColor, currentProject, currentScriptId, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
@@ -841,7 +1137,21 @@ const ScreenplayEditor: React.FC = () => {
   const switchCollabDocument = useCallback(async (newProjectId: string, newScriptId: string) => {
     if (!providerRef.current) return;
 
-    // 1. Create a shared invite token for the new document so guests can follow
+    // 1. Load the new script before telling anyone: its title travels with
+    //    the switch (guests usually cannot read the host's project), and a
+    //    failure here leaves everybody in the current document together.
+    let project: Awaited<ReturnType<typeof projectApi.getProject>>;
+    let scriptResp: Awaited<ReturnType<typeof scriptApi.getScript>>;
+    try {
+      project = await projectApi.getProject(newProjectId);
+      scriptResp = await scriptApi.getScript(newProjectId, newScriptId);
+    } catch (err) {
+      console.error('[Collab] Could not load the document to switch to:', err);
+      showToast('Failed to switch collab document', 'error');
+      return;
+    }
+
+    // 2. Create a shared invite token for the new document so guests can follow
     let sharedToken: string;
     let sharedNonce: string;
     try {
@@ -853,34 +1163,25 @@ const ScreenplayEditor: React.FC = () => {
       return;
     }
 
-    // 2. Broadcast document-switch to all guests via awareness
-    // (Old invites are NOT revoked here — they expire naturally.
-    //  Revoking during switch caused a race where the backend file write
-    //  from revoke could corrupt reads from concurrent token validation.)
-    providerRef.current.setAwarenessField('user', {
+    // 3. Broadcast document-switch to all guests via awareness
+    // (Old invites are NOT revoked here — a guest still on the old document
+    //  would lose it mid-sentence. Ending the session revokes them all; see
+    //  collabSessionDocsRef.)
+    providerRef.current?.setAwarenessField('user', {
       name: collabUserName,
       color: collabColor,
-      documentSwitch: { projectId: newProjectId, scriptId: newScriptId, token: sharedToken },
+      documentSwitch: { projectId: newProjectId, scriptId: newScriptId, token: sharedToken, title: scriptResp.meta.title },
     });
     await new Promise((r) => setTimeout(r, 400));
 
-    // 4. Load the new script content and reconnect host
+    // 4. Reconnect host to the new document
     try {
-      const project = await projectApi.getProject(newProjectId);
-      const scriptResp = await scriptApi.getScript(newProjectId, newScriptId);
-
-      const content = scriptResp.content as Record<string, unknown> | null;
-      if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-        const { _notes, _generalNotes, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId, ...pmDoc } = content as Record<string, unknown>;
-        collabInitialContent.current = pmDoc;
-      } else if (content && typeof content === 'object' && Object.keys(content).length > 0) {
-        collabInitialContent.current = content;
-      }
+      collabInitialContent.current = collabSeedFrom(scriptResp.content);
 
       // Create host's own token for the new document, sharing the same nonce
       let hostToken: string;
       try {
-        const hostInvite = await api.createCollabInvite(newProjectId, newScriptId, collabUserName, 'editor', 24, sharedNonce);
+        const hostInvite = await api.createCollabInvite(newProjectId, newScriptId, collabUserName, 'editor', 24);
         hostToken = hostInvite.token;
       } catch {
         hostToken = sharedToken;
@@ -888,12 +1189,14 @@ const ScreenplayEditor: React.FC = () => {
 
       const docName = `${newProjectId}/${newScriptId}${sharedNonce ? `/${sharedNonce}` : ''}`;
       setupCollab(docName, hostToken, collabUserName, true);
+      collabSessionDocsRef.current.push({ projectId: newProjectId, scriptId: newScriptId, docName });
 
       setCurrentProject(project);
       setCurrentScriptId(newScriptId);
       setDocumentTitle(scriptResp.meta.title);
       setEditorKey((k) => k + 1);
-    } catch {
+    } catch (err) {
+      console.error('[Collab] Could not switch the collab document:', err);
       showToast('Failed to switch collab document', 'error');
     }
   }, [collabColor, currentProject, currentScriptId, setupCollab, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
@@ -928,22 +1231,6 @@ const ScreenplayEditor: React.FC = () => {
         showToast(`Joined collaboration as ${session.collaborator_name}`, 'success');
       }
 
-      // Try to load project metadata in the background (non-blocking).
-      // This fills in the title and project name if reachable, but is not required.
-      try {
-        const pRes = await platformFetch(`${API_BASE}/projects/${session.project_id}`);
-        if (pRes.ok) {
-          const project = await pRes.json();
-          setCurrentProject(project as any);
-          const sRes = await platformFetch(`${API_BASE}/projects/${session.project_id}/scripts/${session.script_id}`);
-          if (sRes.ok) {
-            const scriptResp = await sRes.json();
-            setDocumentTitle(scriptResp?.meta?.title || 'Untitled');
-          }
-        }
-      } catch {
-        // Backend unreachable — fine, Yjs handles content sync
-      }
     } catch (err) {
       console.error('[Collab] handleJoinCollab failed:', err);
       showToast(`Failed to join collaboration: ${err instanceof Error ? err.message : String(err)}`, 'error');
@@ -982,7 +1269,7 @@ const ScreenplayEditor: React.FC = () => {
 
   // Welcome dialog — show on first visit
   const [showWelcome, setShowWelcome] = useState(() => {
-    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !urlCollabToken;
+    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !routeCollabToken;
   });
 
   // ── Drag-and-drop file import state ──
@@ -990,16 +1277,44 @@ const ScreenplayEditor: React.FC = () => {
   const [pendingDropFile, setPendingDropFile] = useState<File | null>(null);
   const [dropConfirmOpen, setDropConfirmOpen] = useState(false);
 
-  // Element picker state. `availableTypes`, when set, restricts the picker
-  // to that exact list (used inside AV cells where only avPara/avShot/avDirection apply).
+  // Element picker state. `availableTypes`, when set, restricts the picker to
+  // that exact list — used inside AV cells, where the list is whatever the
+  // active template allows in that column (utils/avCellElements.ts).
   const [pickerState, setPickerState] = useState<{
     visible: boolean;
     position: { top: number; left: number };
     defaultType: ElementType;
     availableTypes?: ElementType[];
-  }>({ visible: false, position: { top: 0, left: 0 }, defaultType: 'action' });
+    /**
+     * Whether the line the menu opened on is blank. The menu used to open only
+     * on blank lines; the shortcut and the Format menu can now open it on a
+     * line with text, where "one more blank line" is not what a writer means
+     * and the menu is a plain type chooser again (issue #100).
+     */
+    blankLine: boolean;
+    /**
+     * Whether the menu opened inside an AV cell. The type list is already
+     * scoped by `availableTypes`; this additionally offers "New AV Row", which
+     * on touch is the only row control reachable from the keyboard's Return
+     * key (issue #116).
+     */
+    avCell: boolean;
+  }>({ visible: false, position: { top: 0, left: 0 }, defaultType: 'action', blankLine: false, avCell: false });
+  /** Read by the shortcut handler, which must not re-open a menu already up. */
+  const pickerVisibleRef = useRef(false);
+  pickerVisibleRef.current = pickerState.visible;
 
   const showPickerRef = useRef<(defaultType: ElementType, availableTypes?: ElementType[]) => void>(() => {});
+  /** Opens the menu wherever the caret is, from a shortcut or a menu item. */
+  const openElementMenuRef = useRef<() => void>(() => {});
+  /** Splits the current (blank) block to leave one more blank line behind. */
+  const insertBlankLineRef = useRef<(typeId?: string) => void>(() => {});
+  /**
+   * Start position of the block whose element menu was last dismissed, so the
+   * next Enter there inserts a line instead of re-opening the menu the writer
+   * just refused. Cleared as soon as the caret is anywhere else (issue #100).
+   */
+  const pickerDismissedAtRef = useRef<number | null>(null);
 
   // Character autocomplete state
   const [knownCharacters, setKnownCharacters] = useState<string[]>([]);
@@ -1011,6 +1326,13 @@ const ScreenplayEditor: React.FC = () => {
   const charAutoDismissedRef = useRef(false);
 
   const [formatPanelOpen, setFormatPanelOpen] = useState(false);
+  /**
+   * Whether the handwriting panel is up. Only whether — where it inserts is the
+   * editor's live selection, read by the panel itself, because the panel is not
+   * modal and the writer moves the insertion point by tapping the script behind
+   * it (issue #90).
+   */
+  const [scribbleOpen, setScribbleOpen] = useState(false);
 
   // Script context menu state
   const [ctxMenuState, setCtxMenuState] = useState<{
@@ -1044,6 +1366,15 @@ const ScreenplayEditor: React.FC = () => {
         !el.classList.contains('track-change-deleted-block'),
     );
     const breaks = breaksRef.current;
+
+    // Mark the title-page region so Print can drop it when the writer has asked
+    // for a script without one. Marked by model index rather than by class: the
+    // region takes in the blank spacers and any images above the title, and only
+    // the titlePage nodes carry a class of their own (issue #98). The title-page
+    // break is where the body starts, so its nodeIndex is the region's length.
+    const titleEnd = breaks.find((b) => b.isTitlePage)?.nodeIndex ?? 0;
+    children.forEach((el, i) => el.classList.toggle('sp-title-region', i < titleEnd));
+
     if (breaks.length === 0) { setOverlays([]); return; }
 
     // getBoundingClientRect returns coordinates in viewport space (affected by
@@ -1051,12 +1382,18 @@ const ScreenplayEditor: React.FC = () => {
     // (unscaled) coordinate system.  Divide by zoom to convert.
     const scale = (zoomLevelRef.current || 100) / 100;
     const lineHeightPx = 12 * (96 / 72); // 16px — matches pagination LINE_HEIGHT_PT
+    // Room for the CONT'D line is only reserved when the marker is actually
+    // drawn — the pagination decoration reads the same setting the same way.
+    // Subtracting it here unconditionally moved the whole break band, footer
+    // and header included, a line higher than the break it belongs to whenever
+    // a writer had turned (MORE)/(CONT'D) off.
+    const showContd = resolveMoresContds(pageLayoutRef.current).dialogueBreakContd;
     const newOverlays: OverlayInfo[] = [];
     for (const brk of breaks) {
       const el = children[brk.nodeIndex];
       if (!el) continue;
       const elRect = el.getBoundingClientRect();
-      const contdHeight = brk.isDialogueSplit ? lineHeightPx : 0;
+      const contdHeight = brk.isDialogueSplit && showContd ? lineHeightPx : 0;
       const overlayTop = (elRect.top - pageRect.top) / scale - m.sepHeightPx - contdHeight;
       newOverlays.push({
         top: overlayTop,
@@ -1069,6 +1406,29 @@ const ScreenplayEditor: React.FC = () => {
     setOverlays(newOverlays);
   }, []);
 
+  // Which notes print, where, and how much room they need. Null — and free —
+  // whenever nothing prints. Held in a ref as well, because the pagination and
+  // marker plugins are built once and read it lazily, exactly as they read the
+  // page layout and the template hints.
+  const footnotePlanRef = useRef<FootnotePlan | null>(null);
+
+  const [FootnoteMarkerExtension] = React.useState(() =>
+    Extension.create({
+      name: 'footnoteMarkers',
+      addProseMirrorPlugins() {
+        return [createFootnoteMarkerPlugin(() => footnotePlanRef.current)];
+      },
+    })
+  );
+
+  // Which notes each page owes at its foot. Always empty while nothing prints.
+  const [footnotePages, setFootnotePages] = useState<FootnotePageAssignment[]>(NO_FOOTNOTE_PAGES);
+  const setFootnotePagesRef = useRef(setFootnotePages);
+  setFootnotePagesRef.current = setFootnotePages;
+  const [endnotePages, setEndnotePages] = useState<EndnotePage[]>(NO_ENDNOTE_PAGES);
+  const setEndnotePagesRef = useRef(setEndnotePages);
+  setEndnotePagesRef.current = setEndnotePages;
+
   const [PaginationExtension] = React.useState(() =>
     Extension.create({
       name: 'pagination',
@@ -1078,12 +1438,19 @@ const ScreenplayEditor: React.FC = () => {
             (state) => {
               setPageCountRef.current(state.pageCount);
               breaksRef.current = state.breaks;
+              useEditorStore.getState().setPageLabels(state.pageLabels ?? null);
+              // Keep the identity stable when nothing prints, so the overlays
+              // do not re-render for a change that cannot have happened.
+              setFootnotePagesRef.current(state.footnotePages ?? NO_FOOTNOTE_PAGES);
+              setEndnotePagesRef.current(state.endnotePages ?? NO_ENDNOTE_PAGES);
               // Measure from DOM after ProseMirror applies decoration margins
               requestAnimationFrame(() => requestAnimationFrame(measureOverlays));
             },
             () => pageLayoutRef.current,
             // Template-driven page rules (e.g. "every New Act starts a page").
             () => activeTemplateHints(),
+            // Room to hold back for printing notes; null when none print.
+            () => footnotePlanRef.current,
           ),
         ];
       },
@@ -1213,8 +1580,31 @@ const ScreenplayEditor: React.FC = () => {
                   return true;
                 }
               }
-              // Normal blank line: show element picker
-              showPickerRef.current(currentType as ElementType);
+              // Enter opens the element menu on a blank line, which left the
+              // keystroke no way to mean "just another blank line" — and at the
+              // end of a script there is no populated line below to insert
+              // against either, so there was no workaround at all (issue #100).
+              // Three conditions insert the line rather than open the menu; the
+              // menu's own Enter and its Blank Line row reach the same code.
+              const blockStart = $from.before($from.depth);
+              const menuEnabled = useSettingsStore.getState().elementMenuOnEnter;
+              //   1. the writer turned the menu off outright;
+              //   2. this blank line already follows a blank line, so the menu
+              //      offered itself on the first one and the answer was "space";
+              //   3. the menu was just dismissed on this very line — Escape has
+              //      to leave Enter meaning what it means everywhere else.
+              if (!menuEnabled
+                  || isBlankBlock(previousSiblingBlock($from))
+                  || pickerDismissedAtRef.current === blockStart) {
+                insertBlankLineRef.current();
+                return true;
+              }
+              // Normal blank line: show element picker. Pass the custom id
+              // rather than the `customElement` wrapper, so the menu can mark
+              // the row the line is already on.
+              showPickerRef.current((currentType === 'customElement'
+                ? (currentNode.attrs?.customTypeId || currentType)
+                : currentType) as ElementType);
               return true;
             }
 
@@ -1419,8 +1809,8 @@ const ScreenplayEditor: React.FC = () => {
       Text, ScreenplayHardBreak, HardBreakLeafText,
       Bold, Italic, Underline, Strike, Dropcursor, Gapcursor,
       Subscript, Superscript,
-      Highlight.configure({ multicolor: true }),
-      TextStyle, Color, FontFamily, FontSize,
+      PastedHighlight.configure({ multicolor: true }),
+      RevisionTextStyle, InkAwareColor, FontFamily, FontSize, PasteFormatting,
       FormatOverride, CustomElement, ScreenplayImage,
       // Use History in normal mode, Collaboration in collab mode
       ...(collabMode ? collabExtensions : [History.configure({ newGroupDelay: 150 })]),
@@ -1450,16 +1840,33 @@ const ScreenplayEditor: React.FC = () => {
             general: 'Text...', shot: 'SHOT DESCRIPTION',
             newAct: 'ACT ONE', endOfAct: 'END OF ACT',
             lyrics: 'Lyrics...', showEpisode: 'SHOW TITLE', castList: 'Cast...',
+            section: 'Section name (outline only)', note: 'Note (not printed)',
           };
           return m[node.type.name] || '';
         },
       }),
       SceneHeading, Action, Character, Dialogue, Parenthetical,
       Transition, General, Shot, NewAct, EndOfAct, Lyrics,
+      Section, Note,
       ShowEpisode, CastList, DualDialogue, DualDialogueColumn, TitlePage,
-      AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvKeymap,
-      ScriptNoteMark, TagMark,
+      AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage, AvKeymap, AvCueDecorations,
+      ElementNumbers.configure({
+        getRules: getElementNumberingRules,
+        getSceneNumbersVisible: () => useEditorStore.getState().sceneNumbersVisible,
+      }),
+      ScriptNoteMark, TagMark, TableReadHighlight,
+      RevisionMark.configure({
+        // A checked-in draft is read-only: draw its revisions, add none.
+        getConfig: () => {
+          if (isHistoryModeRef.current) return null;
+          const st = useEditorStore.getState();
+          return { enabled: st.revisionMode, color: st.revisionColor };
+        },
+        getSettings: () => useEditorStore.getState().revisionSettings,
+      }),
       StartsNewPage,
+      LockedPages,
+      FootnoteMarkerExtension,
       PaginationExtension,
       ContdCaseExtension,
       SearchExtension,
@@ -1477,20 +1884,15 @@ const ScreenplayEditor: React.FC = () => {
     editable: !isHistoryMode && !(collabMode && collabRole === 'viewer'),
     editorProps: {
       attributes: { class: `screenplay-content${isHistoryMode ? ' history-readonly' : ''}`, spellcheck: 'false' },
+      // A script note paints itself with an inline background, and the pasted
+      // highlight rule matches any element carrying one — so pasting a noted
+      // passage back used to lay a second highlight over it. See
+      // editor/stripNoteBackgrounds.
+      transformPastedHTML: (html) => stripNoteBackgrounds(html),
     },
     onSelectionUpdate: ({ editor: ed }) => {
-      // Check custom element first
-      if (ed.isActive('customElement')) {
-        // Use customTypeId as the active element label
-        const attrs = ed.getAttributes('customElement');
-        if (attrs?.customTypeId) {
-          setActiveElement(attrs.customTypeId as ElementType);
-          return;
-        }
-      }
-      for (const type of ALL_ELEMENT_TYPES) {
-        if (ed.isActive(type)) { setActiveElement(type); break; }
-      }
+      const type = resolveActiveElement(ed);
+      if (type) setActiveElement(type);
     },
   }, [editorKey]);
 
@@ -1501,6 +1903,12 @@ const ScreenplayEditor: React.FC = () => {
   useEffect(() => {
     if (!editor) return;
     const handleBeforeInput = (e: Event) => {
+      // prosemirror-history (1.5+) answers historyUndo/historyRedo itself when
+      // the event reaches the editor, and marks it handled. Acting again here
+      // undid two steps for one Cmd+Z whenever the browser routed its native
+      // undo through the editor — after any click outside it, a closed dialog
+      // or a menu. This is only for the events ProseMirror never saw.
+      if (e.defaultPrevented) return;
       const ie = e as InputEvent;
       if (ie.inputType === 'historyUndo') {
         e.preventDefault();
@@ -1536,16 +1944,34 @@ const ScreenplayEditor: React.FC = () => {
       ? `.screenplay-content .scene-heading { margin-top: ${sceneHeadingSpaceBefore}pt; }\n`
         + '.screenplay-content .scene-heading:first-child { margin-top: 0; }'
       : '';
-    // If the resolved template is industry standard, use static CSS
+    // If the resolved template is industry standard, the body elements are
+    // served by the static stylesheet — but the title page is not. It has no
+    // static rules a template can reach, so its own are emitted even here, or
+    // setting a title-page font would work on every template except the one
+    // most writers are using.
     if (template.id === '__industry_standard__') {
-      injectTemplateCss(overrideCss || null);
-      return;
+      const titlePageCss = generateTemplateCss(template, pageLayout, { titlePageOnly: true });
+      const combined = [titlePageCss, overrideCss].filter(Boolean).join('\n');
+      injectTemplateCss(combined || null);
+      return () => { injectTemplateCss(null); };
     }
     const css = generateTemplateCss(template, pageLayout);
     injectTemplateCss(overrideCss ? `${css}\n${overrideCss}` : css);
 
     return () => { injectTemplateCss(null); };
   }, [activeTemplateId, templatesLoaded, templates, pageLayout, sceneHeadingSpaceBefore]);
+
+  // Element numbers follow the format and the scene numbers, neither of which
+  // is in the document — so a change to either has to ask for a recount.
+  const elementNumbersVisible = useEditorStore((s) => s.elementNumbersVisible);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try {
+      editor.view.dispatch(editor.state.tr.setMeta(ELEMENT_NUMBERS_REFRESH, true).setMeta('addToHistory', false));
+    } catch (err) {
+      console.warn('[elementNumbers] could not refresh element numbers', err);
+    }
+  }, [editor, activeTemplateId, templatesLoaded, templates, sceneNumbersVisible]);
 
   // ── Owner starts collaboration — save current content, create own token, switch to collab mode ──
   const handleStartCollab = useCallback(async (guestSession: import('../services/api').CollabSession) => {
@@ -1564,7 +1990,7 @@ const ScreenplayEditor: React.FC = () => {
     let ownerToken: string;
     try {
       const ownerSession = await api.createCollabInvite(
-        currentProject.id, currentScriptId, 'Host', 'editor', 1, nonce,
+        currentProject.id, currentScriptId, 'Host', 'editor', 1,
       );
       ownerToken = ownerSession.token;
     } catch {
@@ -1576,6 +2002,7 @@ const ScreenplayEditor: React.FC = () => {
     // Use the logged-in user's display name so remote users see the real name
     const hostDisplayName = useSettingsStore.getState().collabAuth.user?.displayName || 'Host';
     setupCollab(docName, ownerToken, hostDisplayName, true);
+    collabSessionDocsRef.current = [{ projectId: currentProject.id, scriptId: currentScriptId, docName }];
 
     setCollabUserName(hostDisplayName);
     setIsCollabHost(true);
@@ -1607,25 +2034,16 @@ const ScreenplayEditor: React.FC = () => {
     if (!file.type.startsWith('image/')) { showToast('Please choose an image file', 'error'); return; }
     // Insert at the captured cursor position (valid block position), not doc start.
     const pos = imageInsertPosRef.current ?? editor.state.selection.to;
-    const insertAt = (attrs: Record<string, unknown>) => insertImageNode(editor, attrs, pos);
     try {
-      if (currentProject) {
-        const asset = await api.uploadAsset(currentProject.id, file, ['inline-image']);
-        insertAt({ assetId: asset.id, projectId: currentProject.id, filename: asset.filename ?? file.name, align: 'center' });
-      } else {
-        // No project yet (unsaved local doc) — embed as a data URL.
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(r.result as string);
-          r.onerror = () => reject(r.error);
-          r.readAsDataURL(file);
-        });
-        insertAt({ src: dataUrl, align: 'center' });
-      }
+      // Shared with paste and drop: a project asset when there is a project, the
+      // scratch store when there isn't, and never bytes inside the document.
+      const attrs = await buildImageAttrs(file);
+      insertImageNode(editor, attrs, pos);
+      warnIfImageDegraded(attrs);
     } catch (err) {
       showToast(`Failed to insert image: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
-  }, [editor, currentProject]);
+  }, [editor]);
 
   // Helper: clear track changes when switching documents
   const clearTrackChanges = useCallback(() => {
@@ -1640,46 +2058,50 @@ const ScreenplayEditor: React.FC = () => {
     }
   }, [editor]);
 
+  // The revision gutter measures on editor updates; a change of mark (Revision
+  // Settings, or a collaborator's) changes no document, so nudge it to redraw.
+  const revisionSettings = useEditorStore((st) => st.revisionSettings);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try {
+      editor.view.dispatch(editor.state.tr.setMeta('addToHistory', false));
+    } catch (err) {
+      console.warn('[revisions] could not redraw revision marks', err);
+    }
+  }, [editor, revisionSettings]);
+
   // --- Scene navigator + scene number assignment ---
+  // The numbering rules — locked numbers kept, A-numbers for inserted scenes,
+  // numbers that survive being hidden — live in utils/sceneNumbers.
   const updateScenes = useCallback(() => {
     if (!editor) return;
-    const list: { id: string; heading: string; sceneNumber: number | null; color: string; synopsis: string }[] = [];
-    const locked = useEditorStore.getState().sceneNumbersLocked;
-    const visible = useEditorStore.getState().sceneNumbersVisible;
-    let idx = 0;
-    // Collect scene positions for attribute updates
-    const attrUpdates: { pos: number; number: string }[] = [];
+    const { sceneNumbersLocked: locked, sceneNumbersVisible: visible } = useEditorStore.getState();
+    const headings: { pos: number; node: import('@tiptap/pm/model').Node }[] = [];
     editor.state.doc.descendants((node, pos) => {
-      if (node.type.name === 'sceneHeading') {
-        idx++;
-        let num: string;
-        if (locked && node.attrs.sceneNumber != null) {
-          // Keep the locked number
-          num = String(node.attrs.sceneNumber);
-        } else {
-          num = String(idx);
-        }
-        const sceneId = `scene-${idx}`;
-        list.push({ id: sceneId, heading: node.textContent || 'Untitled Scene', sceneNumber: parseInt(num, 10), color: node.attrs.sceneColor || '', synopsis: node.attrs.synopsis || '' });
-        // Update node attrs if scene numbers are visible and the number changed
-        if (visible && String(node.attrs.sceneNumber) !== num) {
-          attrUpdates.push({ pos, number: num });
-        }
-        // Clear scene number attr if not visible and it was set
-        if (!visible && node.attrs.sceneNumber != null) {
-          attrUpdates.push({ pos, number: '' });
-        }
-      }
+      if (node.type.name === 'sceneHeading') headings.push({ pos, node });
       return true;
     });
+    const numbers = assignSceneNumbers(
+      headings.map((h) => (h.node.attrs.sceneNumber == null ? null : String(h.node.attrs.sceneNumber))),
+      { visible, locked },
+    );
+    const list: SceneInfo[] = headings.map(({ node }, i) => ({
+      id: `scene-${i + 1}`,
+      heading: node.textContent || 'Untitled Scene',
+      // The navigator always shows a number; hidden unlocked numbers are
+      // just the scene's place in the script.
+      sceneNumber: numbers[i] ?? String(i + 1),
+      color: node.attrs.sceneColor || '',
+      synopsis: node.attrs.synopsis || '',
+    }));
+    const attrUpdates = headings
+      .map((h, i) => ({ pos: h.pos, number: numbers[i], was: h.node.attrs.sceneNumber }))
+      .filter((u) => (u.was == null ? null : String(u.was)) !== u.number);
     // Batch attribute updates in a single transaction
     if (attrUpdates.length > 0) {
       const { tr } = editor.state;
       for (const { pos, number } of attrUpdates) {
-        tr.setNodeMarkup(pos, undefined, {
-          ...editor.state.doc.nodeAt(pos)?.attrs,
-          sceneNumber: number || null,
-        });
+        tr.setNodeAttribute(pos, 'sceneNumber', number);
       }
       tr.setMeta('addToHistory', false);
       editor.view.dispatch(tr);
@@ -1739,17 +2161,24 @@ const ScreenplayEditor: React.FC = () => {
     [setHeaderFooterOpen],
   );
 
-  const { documentTitle: hfDocTitle, revisionColor: hfRevColor, pageCount: hfPageCount } = useEditorStore();
+  const { documentTitle: hfDocTitle, revisionColor: hfRevColor, pageCount: hfPageCount, pageLabels } = useEditorStore();
+  /** A locked page's printed label, by script page index; undefined when
+   *  pages are not locked and the band prints its number. */
+  const lockedLabel = useCallback(
+    (pageIndex: number): string | undefined => pageLabels?.[pageIndex - 1],
+    [pageLabels],
+  );
   // `{pages}` reads as the number on the LAST page, so it stays consistent with
   // `{page}` once the starting number is offset.
   const hfTotalPrinted = printedPageNumber(Math.max(1, hfPageCount || 1), headerFooter.startingPageNumber);
 
   const renderHFBand = useCallback(
-    (kind: BandKind, printedPage: number) => (
+    (kind: BandKind, printedPage: number, pageLabel?: string) => (
       <HeaderFooterBand
         kind={kind}
         content={kind === 'header' ? headerFooter.headerContent : headerFooter.footerContent}
         printedPage={printedPage}
+        pageLabel={pageLabel}
         totalPages={hfTotalPrinted}
         docTitle={hfDocTitle}
         revisionColor={hfRevColor}
@@ -1934,11 +2363,18 @@ const ScreenplayEditor: React.FC = () => {
     return () => { editor.off('update', run); timers.forEach(clearTimeout); };
   }, [editor, measureOverlays]);
 
-  // Re-paginate when the page layout changes (e.g. after FDX import) or when the
-  // active formatting template changes. Neither touches the document, and the
-  // pagination plugin only recomputes on doc changes — so without this nudge a
-  // template's page rules (forceBreakBefore, lineHeightMultiplier) would not take
-  // effect until the writer's next keystroke.
+  const footnotePlan = useFootnotePlan(editor);
+  footnotePlanRef.current = footnotePlan;
+  // Changes exactly when the footnotes would lay out differently, so editing a
+  // note's text does not dispatch a repagination on every debounce tick.
+  const footnoteSig = footnotePlanSignature(footnotePlan);
+
+  // Re-paginate when the page layout changes (e.g. after FDX import), when the
+  // active formatting template changes, or when a printing note appears, moves
+  // or grows. None of those touches the document, and the pagination plugin only
+  // recomputes on doc changes — so without this nudge a template's page rules
+  // (forceBreakBefore, lineHeightMultiplier), or the room a footnote needs,
+  // would not take effect until the writer's next keystroke.
   useEffect(() => {
     if (!editor) return;
     const t = setTimeout(() => {
@@ -1947,7 +2383,7 @@ const ScreenplayEditor: React.FC = () => {
       editor.view.dispatch(tr);
     }, 300);
     return () => clearTimeout(t);
-  }, [editor, pageLayout, activeTemplateId, templates, templatesLoaded, sceneHeadingSpaceBefore]);
+  }, [editor, pageLayout, activeTemplateId, templates, templatesLoaded, sceneHeadingSpaceBefore, footnoteSig]);
 
   // --- Initialize spell checker on mount ---
   useEffect(() => {
@@ -2037,9 +2473,16 @@ const ScreenplayEditor: React.FC = () => {
     [editor],
   );
 
-  // --- Auto-save to backend every 30 seconds if a project/script is active ---
+  // --- Auto-save to the library on a timer if a project/script is active ---
   // Skip for collab guests — they don't own the document and the project may
-  // not exist on their local backend.
+  // not exist on their local backend. The writer can switch it off or change
+  // the interval in Settings → Saving (issue #135).
+  // A script saved to a file on disk (issue #135) follows this setting too —
+  // see autoSaveAppliesToOpenDocument.
+  const autoSaveLibrary = useSettingsStore((s) => s.autoSaveLibrary);
+  const openScriptFile = useLinkedFileStore((s) => s.openScriptFile);
+  const scriptIsLinked = Boolean(openScriptFile && openScriptFile.scriptId === currentScriptId);
+  const autoSaveIntervalSeconds = useSettingsStore((s) => s.autoSaveIntervalSeconds);
   const lastSavedJsonRef = useRef<string>('');
   // Tracks whether the script currently in the editor has real (textful) content
   // saved. When true, an auto-save that finds the editor body suddenly empty is
@@ -2105,6 +2548,7 @@ const ScreenplayEditor: React.FC = () => {
         store.setCharacterRelationships([]);
         store.setScenes([]);
         store.setPageLayout({ ...DEFAULT_PAGE_LAYOUT });
+        store.setScriptProfile(DEFAULT_SCRIPT_PROFILE);
         lastSavedJsonRef.current = '';
         // Signing out must not leave a cloud script queued to reopen itself on
         // the next launch, under whoever signs in next.
@@ -2299,6 +2743,15 @@ const ScreenplayEditor: React.FC = () => {
     editor.commands.setContent(pmDoc, true);
     clearEditorHistory(editor);
     hydrateEditorStoresFromContent(snapshot.content);
+    // Resync by hand: `setContent` raises `selectionUpdate` only when the
+    // mapped selection differs from the old one, so a restore can leave the
+    // store naming the element the *previous* document's caret was on. For a
+    // recovered AV script that meant the toolbar was still scoped to the blank
+    // screenplay it replaced — an element list whose types an avCell rejects,
+    // and no AV row buttons — with nothing left to move the caret and put it
+    // right.
+    const restoredElement = resolveActiveElement(editor);
+    if (restoredElement) setActiveElement(restoredElement);
     setDocumentTitle(snapshot.title || 'Untitled Screenplay');
     // Recovered content is not the file any in-place origin points at, and the
     // snapshot does not carry the origin's security-scoped bookmark. Clearing
@@ -2318,7 +2771,13 @@ const ScreenplayEditor: React.FC = () => {
     useBackupStatusStore.getState().noteDocumentOpened();
     useEditorStore.getState().setSaveStatus('unsaved');
     showToast('Unsaved changes restored from your last session.', 'success');
-  }, [editor, currentProject, currentScriptId, setDocumentTitle, setCurrentProject, setCurrentScriptId]);
+
+    // A snapshot written by an older build can carry its images inline. Moving
+    // them into the scratch store shrinks the payload immediately, so the
+    // restored document is protected again rather than staying over the size
+    // limit until the writer happens to save it somewhere.
+    if (docHasInlineImageBytes(snapshot.content)) void demoteDataUrlsToScratch(editor);
+  }, [editor, currentProject, currentScriptId, setDocumentTitle, setCurrentProject, setCurrentScriptId, setActiveElement]);
 
   // Crash-recovery copy. Unlike the two above it covers every platform and
   // every document, including one that was never saved to the library — which
@@ -2338,7 +2797,7 @@ const ScreenplayEditor: React.FC = () => {
   });
 
   useEffect(() => {
-    if (!editor || !currentProject || !currentScriptId || isCollabGuest) return;
+    if (!editor || !currentProject || !currentScriptId || isCollabGuest || !autoSaveLibrary) return;
     const { setSaveStatus } = useEditorStore.getState();
     const timer = setInterval(() => {
       if (scriptSwitchingRef.current) return;
@@ -2367,13 +2826,56 @@ const ScreenplayEditor: React.FC = () => {
           reportSaveError(err, 'auto-save');
         });
       }
-    }, 30000);
+    }, autoSaveIntervalSeconds * 1000);
     return () => clearInterval(timer);
-  }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest]);
+  }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest, autoSaveLibrary, autoSaveIntervalSeconds]);
+
+  // Let the scratch sweeper see the document on screen, so it never mistakes a
+  // picture in the open screenplay for an orphan.
+  useEffect(() => {
+    if (!editor) return;
+    setLiveScratchDocSource(() => (editor.isDestroyed ? null : editor.getJSON()));
+    return () => setLiveScratchDocSource(null);
+  }, [editor]);
+
+  // --- Migrate images that predate the scratch store ---
+  // A script saved by an older build can hold its images as base64 inside the
+  // document, which is what used to push a screenplay past the recovery
+  // snapshot's size limit and silently cost it crash protection. Once, per
+  // document, move them into the project's assets; the resulting edit is picked
+  // up by the auto-save above, so the conversion is paid for exactly once
+  // rather than repeated on every open.
+  const migratedImagesForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!editor || !currentProject || !currentScriptId || isCollabGuest || isHistoryMode) return;
+    const key = `${currentProject.id}:${currentScriptId}`;
+    if (migratedImagesForRef.current === key) return;
+
+    const timer = setTimeout(() => {
+      if (scriptSwitchingRef.current || editor.isDestroyed) return;
+      const content = editor.getJSON();
+      if (!docHasInlineImageBytes(content) && !docHasScratchImages(content)) {
+        migratedImagesForRef.current = key;
+        return;
+      }
+      migratedImagesForRef.current = key;
+      void promoteScratchImages(
+        editor,
+        currentProject.id,
+        useProjectStore.getState().isCloudProject(currentProject.id) ? cloudApi : api,
+      );
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [editor, currentProject, currentScriptId, isCollabGuest, isHistoryMode]);
 
   // --- Track unsaved changes for status bar ---
+  // A file opened in place needs this as much as a library script: it is what
+  // the close prompt and the file auto-save both read. It used to be tracked
+  // for library scripts only, so edits to an opened file never counted as
+  // unsaved and closing the window dropped them without asking.
+  const hasSaveTarget = Boolean((currentProject && currentScriptId) || documentOriginPath);
   useEffect(() => {
-    if (!editor || !currentProject || !currentScriptId || isCollabGuest) return;
+    if (!editor || !hasSaveTarget || isCollabGuest) return;
     const markUnsaved = () => {
       const { saveStatus } = useEditorStore.getState();
       // Only mark unsaved if we're in idle or saved state (not during saving or error)
@@ -2383,17 +2885,112 @@ const ScreenplayEditor: React.FC = () => {
     };
     editor.on('update', markUnsaved);
     return () => { editor.off('update', markUnsaved); };
-  }, [editor, currentProject, currentScriptId, isCollabGuest]);
+  }, [editor, hasSaveTarget, isCollabGuest]);
+
+  // --- Keep a linked script and its file on disk in agreement (issue #135) ---
+  // The link belongs to one script; opening anything else drops it.
+  useEffect(() => {
+    const open = useLinkedFileStore.getState().openScriptFile;
+    if (open && open.scriptId !== currentScriptId) useLinkedFileStore.getState().setOpenScriptFile(null);
+  }, [currentScriptId]);
+
+  // The file may be edited elsewhere while the script is open — on another
+  // machine, in another app, by a sync client. Check again whenever the window
+  // comes back into focus, and whenever a save finds the file changed under
+  // it; load the file's version if nothing here is unsaved, and ask if both
+  // changed. Auto-save is held off while that happens, so it cannot write the
+  // editor's copy over the one the writer is choosing between.
+  const linkCheckRunningRef = useRef(false);
+  const recheckLinkedFile = useCallback(async () => {
+    if (!editor || !currentProject || !currentScriptId || !scriptIsLinked || isCollabGuest || collabMode) return;
+    if (linkCheckRunningRef.current || scriptSwitchingRef.current) return;
+    linkCheckRunningRef.current = true;
+    const pid = currentProject.id;
+    const sid = currentScriptId;
+    scriptSwitchingRef.current = true;
+    let reload = false;
+    let storedJson: string | null = null;
+    try {
+      const lf = await import('../services/linkedFiles');
+      const status = useEditorStore.getState().saveStatus;
+      const result = await lf.syncScriptWithFile(pid, sid, {
+        scriptTitle: useEditorStore.getState().documentTitle,
+        hasUnsavedEdits: status === 'unsaved' || status === 'error',
+        // Edits only on screen go into the library once the writer has
+        // answered: kept, they are what goes to the file; replaced, they are
+        // in the version recorded first.
+        saveUnsavedEdits: async () => {
+          const content = buildSaveContent();
+          if (!content) return;
+          await api.saveScript(pid, sid, { content, skipFileSync: true });
+          storedJson = JSON.stringify(content);
+        },
+      });
+      if (result.kind === 'loaded-from-file') {
+        // What the editor holds is now superseded by the file. Mark it as
+        // saved so nothing on the way to the reload writes it back.
+        const current = buildSaveContent();
+        if (current) lastSavedJsonRef.current = JSON.stringify(current);
+        useEditorStore.getState().setSaveStatus('idle');
+        showToast(`${lf.basenameOf(result.path)} was changed outside OpenDraft — loaded that version.`, 'info');
+        reload = true;
+      } else if (result.kind === 'kept-library') {
+        // What was on screen is now in the library and the file. Edits typed
+        // while the question was open stay unsaved and go with the next save.
+        if (result.unsavedStored && storedJson !== null) {
+          lastSavedJsonRef.current = storedJson;
+          const now = buildSaveContent();
+          useEditorStore.getState().setSaveStatus(now && JSON.stringify(now) !== storedJson ? 'unsaved' : 'saved');
+        }
+        showToast(
+          result.preservedAs
+            ? `Kept OpenDraft's version in ${lf.basenameOf(result.path)}. The other version was kept as ${lf.basenameOf(result.preservedAs)}.`
+            : `Kept OpenDraft's version and saved it to ${lf.basenameOf(result.path)}.`,
+          'success',
+        );
+      }
+    } catch (err) {
+      console.error('[linked-files] re-check failed:', err);
+    } finally {
+      scriptSwitchingRef.current = false;
+      linkCheckRunningRef.current = false;
+    }
+    if (reload) {
+      if (urlProjectId === pid && urlScriptId === sid) useProjectStore.getState().triggerScriptReload();
+      else navigate(`/project/${pid}/edit/${sid}`, { replace: true });
+    }
+  }, [editor, currentProject, currentScriptId, scriptIsLinked, isCollabGuest, collabMode, buildSaveContent, urlProjectId, urlScriptId, navigate]);
+
+  useEffect(() => {
+    if (!scriptIsLinked || !currentScriptId) return;
+    const onFocus = () => { void recheckLinkedFile(); };
+    window.addEventListener('focus', onFocus);
+    // A save that found the file changed under it raises 'conflict' rather
+    // than overwrite it; that is the same question, asked now.
+    const sid = currentScriptId;
+    const unsub = useLinkedFileStore.subscribe((state, prev) => {
+      if (state.byScript[sid]?.state === 'conflict' && prev.byScript[sid]?.state !== 'conflict') {
+        void recheckLinkedFile();
+      }
+    });
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      unsub();
+    };
+  }, [scriptIsLinked, currentScriptId, recheckLinkedFile]);
 
   // --- Flush metadata-only changes to backend ---
   // Store metadata (profiles, relationships, notes, etc.) can change without an
   // editor document update.  The 30s auto-save would eventually persist them, but
   // users expect "Save" to mean "saved" — a refresh within 30s would lose data.
   // This effect watches key metadata fields and triggers a debounced save (2s).
+  // With auto-save off — or for a file opened in place, whose own auto-save
+  // runs from the menu bar — it only marks the document unsaved.
   useEffect(() => {
-    if (!editor || !currentProject || !currentScriptId || isCollabGuest) return;
-    const pid = currentProject.id;
+    if (!editor || !hasSaveTarget || isCollabGuest) return;
+    const pid = currentProject?.id ?? null;
     const sid = currentScriptId;
+    const saveToLibrary = Boolean(pid && sid) && autoSaveLibrary;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const unsub = useEditorStore.subscribe((state, prev) => {
@@ -2406,6 +3003,7 @@ const ScreenplayEditor: React.FC = () => {
         state.tags === prev.tags &&
         state.beats === prev.beats &&
         state.beatColumns === prev.beatColumns &&
+        state.scriptProfile === prev.scriptProfile &&
         state.spellCheckEnabled === prev.spellCheckEnabled &&
         state.grammarCheckEnabled === prev.grammarCheckEnabled
       ) return;
@@ -2413,6 +3011,7 @@ const ScreenplayEditor: React.FC = () => {
       // Mark unsaved immediately
       const { saveStatus, setSaveStatus } = useEditorStore.getState();
       if (saveStatus === 'idle' || saveStatus === 'saved') setSaveStatus('unsaved');
+      if (!saveToLibrary || !pid || !sid) return;
       // Debounce the actual save (2s)
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
@@ -2443,7 +3042,7 @@ const ScreenplayEditor: React.FC = () => {
     });
 
     return () => { unsub(); if (timer) clearTimeout(timer); };
-  }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest]);
+  }, [editor, hasSaveTarget, currentProject, currentScriptId, buildSaveContent, isCollabGuest, autoSaveLibrary]);
 
   // --- Persist project dictionary words when they change ---
   // Words live on the Project entity (shared by every script in the project).
@@ -2499,10 +3098,36 @@ const ScreenplayEditor: React.FC = () => {
     const pid = currentProject.id;
     const sid = currentScriptId;
 
+    // Auto-save off: nothing is written on the way out. The desktop close
+    // button is asked about by the menu bar, leaving for another screen by the
+    // leave guard; all that is left here is the browser's own "Leave page?"
+    // for a tab with unsaved changes.
+    if (!autoSaveLibrary) {
+      const promptBeforeUnload = (event: BeforeUnloadEvent) => {
+        if (editor.isDestroyed) return;
+        const status = useEditorStore.getState().saveStatus;
+        if (status !== 'unsaved' && status !== 'error') return;
+        event.preventDefault();
+        event.returnValue = '';
+      };
+      window.addEventListener('beforeunload', promptBeforeUnload);
+      return () => window.removeEventListener('beforeunload', promptBeforeUnload);
+    }
+
+    // The timed auto-save's data-loss guard, for the saves on the way out: an
+    // empty body never goes over a script that has text saved. An editor reset
+    // while still bound to a script would otherwise be written over it by
+    // closing the tab or leaving the screen.
+    const blankOverSaved = (content: Record<string, unknown>): boolean => {
+      if (docHasAnyText(content) || !lastSavedNonEmptyRef.current) return false;
+      console.warn('Save on leaving skipped: editor body is empty but saved content is not.');
+      return true;
+    };
+
     const flushPendingSave = async (): Promise<void> => {
       if (editor.isDestroyed) return;
       const content = buildSaveContent();
-      if (!content) return;
+      if (!content || blankOverSaved(content)) return;
       const json = JSON.stringify(content);
       if (json === lastSavedJsonRef.current) return;
       lastSavedJsonRef.current = json;
@@ -2530,7 +3155,7 @@ const ScreenplayEditor: React.FC = () => {
           const unlisten = await win.onCloseRequested(async (event) => {
             if (editor.isDestroyed) return;
             const content = buildSaveContent();
-            if (!content) return;
+            if (!content || blankOverSaved(content)) return;
             const json = JSON.stringify(content);
             if (json === lastSavedJsonRef.current) return;
             // We have unsaved edits.  Block the close, run the save, then
@@ -2561,7 +3186,7 @@ const ScreenplayEditor: React.FC = () => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
       if (editor.isDestroyed) return;
       const content = buildSaveContent();
-      if (!content) return;
+      if (!content || blankOverSaved(content)) return;
       const json = JSON.stringify(content);
       if (json === lastSavedJsonRef.current) return;
       lastSavedJsonRef.current = json;
@@ -2580,12 +3205,19 @@ const ScreenplayEditor: React.FC = () => {
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
 
+    // ── Router path ───────────────────────────────────────────────────────
+    // Neither hook above fires when the app navigates to another screen of
+    // its own, so hand the same flush to whatever is doing the navigating
+    // (issue #65). Unregistered below, so a destroyed editor is never asked.
+    const unregisterFlush = setPendingSaveFlush(flushPendingSave);
+
     return () => {
       cancelled = true;
       if (unlistenCloseRequested) unlistenCloseRequested();
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      unregisterFlush();
     };
-  }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest]);
+  }, [editor, currentProject, currentScriptId, buildSaveContent, isCollabGuest, autoSaveLibrary]);
 
   // --- Keep the open document across route changes ---
   // Going to Settings (or any other route) unmounts this component and destroys
@@ -2659,13 +3291,19 @@ const ScreenplayEditor: React.FC = () => {
     if (lastSessionRestoreRef.current) return;
     lastSessionRestoreRef.current = true;
     if (urlScriptId || urlCommitHash || currentScriptId) return;
+    // A project with no script is a new screenplay being started in it
+    // (Project ▸ New Document). The store starts empty on launch, so this never
+    // holds there; reopening the last script here would put the blank page the
+    // format prompt is about to create on top of that script, and the first
+    // auto-save would write it over the script.
+    if (currentProject) return;
     if (useEditorStore.getState().documentOrigin) return;
 
     const last = readLastSession();
     if (!last) return;
     setShowWelcome(false);
     navigate(`/project/${last.projectId}/edit/${last.scriptId}`, { replace: true });
-  }, [editor, collabMode, isHistoryMode, urlScriptId, urlCommitHash, currentScriptId, navigate]);
+  }, [editor, collabMode, isHistoryMode, urlScriptId, urlCommitHash, currentScriptId, currentProject, navigate]);
 
   // Keep that record current. Cleared for anything without a library identity,
   // so closing a script or starting a blank one does not leave the last script
@@ -2737,7 +3375,9 @@ const ScreenplayEditor: React.FC = () => {
         // Only do this if we actually loaded a prior script in this mount —
         // otherwise the "pending" content is just the editor's default empty
         // state and would clobber a stored screenplay.
-        if (prevLoadKey && currentProject && currentScriptId) {
+        // With auto-save off the writer was already asked on the way here,
+        // and "Discard" has to mean discard.
+        if (prevLoadKey && currentProject && currentScriptId && autoSaveAppliesToOpenDocument(useSettingsStore.getState(), false)) {
           const pendingContent = buildSaveContent();
           if (pendingContent) {
             const pendingJson = JSON.stringify(pendingContent);
@@ -2760,6 +3400,10 @@ const ScreenplayEditor: React.FC = () => {
           scriptResp = await api.getScriptAtVersion(urlProjectId, urlCommitHash, urlScriptId);
           setHistoryVersionLabel(urlCommitHash.slice(0, 7));
         } else {
+          const linkedPath = await syncLinkedFileBeforeOpen(urlProjectId, urlScriptId);
+          useLinkedFileStore.getState().setOpenScriptFile(
+            linkedPath ? { scriptId: urlScriptId, path: linkedPath } : null,
+          );
           scriptResp = await scriptApi.getScript(urlProjectId, urlScriptId);
         }
         const content = scriptResp.content as Record<string, unknown> | null;
@@ -2767,9 +3411,11 @@ const ScreenplayEditor: React.FC = () => {
         // Strip app metadata keys before feeding to ProseMirror
         let pmDoc: Record<string, unknown> | null = null;
         if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-          const { _notes, _generalNotes: _gn, _tags, _tagCategories, _characterProfiles, _characterRelationships, _beats, _beatColumns, _beatArrangeMode, _templateId: _tpl, _ignoredWords: _iw, _ignoredOnce: _io, _customDictWords: _cdw, _enabledGlobalDicts: _egd, _projectDictEnabled: _pde, _enabledLanguages: _elx, _ignoredGrammarRules: _igr, _ignoredGrammarOnce: _igo, _spellCheckEnabled: _sce, _grammarCheckEnabled: _gce, _sceneNumbersVisible: _snv, _sceneNumbersLocked: _snl, _pageLayout: _pl, ...rest } = content as any;
-          pmDoc = rest;
+          pmDoc = stripSaveMetadata(content).pmDoc;
         }
+        // Before setContent: the load must not be marked as a revision by the
+        // document that was open before it still being in Revision Mode.
+        restoreRevisionState(isHistoryMode ? null : content);
 
         try {
           if (pmDoc && Array.isArray(pmDoc.content) && pmDoc.content.length > 0) {
@@ -2803,6 +3449,8 @@ const ScreenplayEditor: React.FC = () => {
           store.setBeats([]);
           store.setBeatColumns([]);
           store.setPageLayout({ ...DEFAULT_PAGE_LAYOUT });
+          // Pacing and genres; a script without them opens as Standard.
+          store.setScriptProfile(normalizeScriptProfile((content as Record<string, unknown> | null | undefined)?._scriptProfile));
           const parseAttr = (val: unknown): unknown[] => {
             if (typeof val === 'string') { try { const p = JSON.parse(val); return Array.isArray(p) ? p : []; } catch { return []; } }
             if (Array.isArray(val)) return val;
@@ -2822,21 +3470,7 @@ const ScreenplayEditor: React.FC = () => {
             if (profiles.length > 0) {
               for (const prof of profiles as Record<string, unknown>[]) {
                 if (prof.name && typeof prof.name === 'string') {
-                  store.upsertCharacterProfile(prof.name, {
-                    description: (prof.description as string) || '',
-                    color: (prof.color as string) || '',
-                    highlighted: (prof.highlighted as boolean) || false,
-                    gender: (prof.gender as string) || '',
-                    age: (prof.age as string) || '',
-                    role: (prof.role as string) || '',
-                    backstory: (prof.backstory as string) || '',
-                    arc: (prof.arc as string) || '',
-                    speechPattern: (prof.speechPattern as string) || '',
-                    vocabulary: (prof.vocabulary as string) || '',
-                    verbalTics: (prof.verbalTics as string) || '',
-                    sampleDialogue: (prof.sampleDialogue as string) || '',
-                    images: Array.isArray(prof.images) ? (prof.images as string[]) : [],
-                  });
+                  store.upsertCharacterProfile(prof.name, savedProfileFields(prof));
                 }
               }
             }
@@ -2858,6 +3492,7 @@ const ScreenplayEditor: React.FC = () => {
             if (typeof c._sceneNumbersLocked === 'boolean') {
               store.setSceneNumbersLocked(c._sceneNumbersLocked);
             }
+            store.setElementNumbersVisible(c._elementNumbersVisible !== false);
             // Restore per-document formatting template
             if (c._templateId && typeof c._templateId === 'string') {
               useFormattingTemplateStore.getState().setActiveTemplateId(c._templateId);
@@ -3002,6 +3637,13 @@ const ScreenplayEditor: React.FC = () => {
           contextLabel: '', color: 'Yellow' as const, createdAt: new Date().toISOString(), sceneId: null,
         }))]);
       }
+      // Clear highlights an older bug left on top of notes and tags. Done here
+      // because this already runs once, after the document has settled.
+      const swept = sweepStrayNoteHighlights(editor);
+      if (swept > 0) {
+        console.info(`[notes] cleared ${swept} stray highlight(s) left over an annotation`);
+      }
+
       if (orphanedTags.length > 0) {
         store.setTags([...store.tags, ...orphanedTags.map((o) => ({
           id: o.tagId, categoryId: o.categoryId, name: o.text, text: o.text, notes: '',
@@ -3069,28 +3711,141 @@ const ScreenplayEditor: React.FC = () => {
     // Use requestAnimationFrame so the DOM has settled after the split
     requestAnimationFrame(() => {
       if (!editor.view) return;
-      const { from } = editor.state.selection;
+      const { from, $from } = editor.state.selection;
       const coords = editor.view.coordsAtPos(from);
       setPickerState({
         visible: true,
         position: { top: coords.bottom + 4, left: coords.left },
         defaultType,
         availableTypes,
+        blankLine: isBlankBlock($from.parent),
+        avCell: isInAvCell(editor.state),
       });
     });
   }, [editor]);
 
-  // Bridge: let the AvKeymap extension surface the same element picker, but
-  // restricted to the cell-valid types (avPara/avShot/avDirection).
+  // Open the handwriting panel when the Edit menu or the touch context menu
+  // asks for it. Asking again while it is open is a no-op rather than a reset:
+  // the panel already follows the selection, so there is nothing to re-capture.
   React.useEffect(() => {
-    registerAvCellPicker((defaultType, types) => {
-      showPickerRef.current(defaultType as ElementType, types as readonly ElementType[] as ElementType[]);
+    if (!editor) return;
+    const onRequest = () => setScribbleOpen(true);
+    window.addEventListener(HANDWRITING_EVENT, onRequest);
+    return () => window.removeEventListener(HANDWRITING_EVENT, onRequest);
+  }, [editor]);
+
+  // The "menu was refused here" marker only holds for the line it was refused
+  // on: step away and Enter offers the menu again, exactly as it did before.
+  React.useEffect(() => {
+    if (!editor) return;
+    const onSelection = () => {
+      if (pickerDismissedAtRef.current === null) return;
+      const { $from } = editor.state.selection;
+      if ($from.depth === 0 || $from.before($from.depth) !== pickerDismissedAtRef.current) {
+        pickerDismissedAtRef.current = null;
+      }
+    };
+    editor.on('selectionUpdate', onSelection);
+    return () => { editor.off('selectionUpdate', onSelection); };
+  }, [editor]);
+
+  // Adds one blank line at the caret. With no argument it keeps the element
+  // type the writer already has, except where a plain Action is the right
+  // neutral spacer; `typeId` is the writer naming the type outright, which the
+  // element menu does when the row picked is the one the line is already on.
+  insertBlankLineRef.current = useCallback((typeId?: string) => {
+    if (!editor) return;
+    pickerDismissedAtRef.current = null;
+    const node = editor.state.selection.$from.parent;
+    const blankType = typeId ?? blankLineTypeFor(node.type.name, isInAvCell(editor.state));
+    // setNode is not optional. `splitBlock` gives the new node the schema's
+    // default block type whenever the caret sits at the end of a block — always
+    // true on a blank one — and this document's default is `sceneHeading`.
+    const chain = editor.chain().focus().splitBlock();
+    if (editor.schema.nodes[blankType]) {
+      // A customElement carries its identity in attrs, which the split drops.
+      chain.setNode(blankType, blankType === 'customElement' ? { ...node.attrs } : undefined);
+    } else {
+      // An id that exists only as a template rule — same wrapper the menu uses.
+      const rule = useFormattingTemplateStore.getState().getActiveTemplate().rules[blankType];
+      if (!rule) return;
+      chain.setNode('customElement', { customTypeId: blankType, customLabel: rule.label });
+    }
+    chain.run();
+  }, [editor]);
+
+  // The element menu, asked for from outside the editor. Opening it on a line
+  // with text is allowed — it is then an ordinary type chooser.
+  openElementMenuRef.current = useCallback(() => {
+    if (!editor || pickerVisibleRef.current) return;
+    const node = editor.state.selection.$from.parent;
+    if (!node.isTextblock) return;
+    const type = node.type.name === 'customElement'
+      ? (node.attrs?.customTypeId || node.type.name)
+      : node.type.name;
+    showPickerRef.current(type as ElementType);
+  }, [editor]);
+
+  React.useEffect(() => {
+    const onRequest = () => openElementMenuRef.current();
+    const onKey = (e: KeyboardEvent) => {
+      const spec = useSettingsStore.getState().elementMenuShortcut;
+      if (!spec || !matchesShortcut(e, spec)) return;
+      // Only when the writer is actually in the script — the same keys may
+      // mean something else in a dialog or a side panel.
+      if (!editor?.isFocused) return;
+      e.preventDefault();
+      openElementMenuRef.current();
+    };
+    window.addEventListener(ELEMENT_MENU_EVENT, onRequest);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener(ELEMENT_MENU_EVENT, onRequest);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [editor]);
+
+  // Bridge: let the AvKeymap extension surface the same element picker,
+  // restricted to what this column accepts. The keymap knows the side; the
+  // template — which only exists out here — decides what that means.
+  React.useEffect(() => {
+    registerAvCellPicker((defaultType, side) => {
+      const template = useFormattingTemplateStore.getState().getActiveTemplate();
+      const types = avCellElementRules(template, side, defaultType).map(r => r.id as ElementType);
+      showPickerRef.current(defaultType as ElementType, types);
     });
     return () => registerAvCellPicker(null);
   }, []);
 
   const handlePickerSelect = useCallback((type: ElementType) => {
     if (!editor) return;
+    pickerDismissedAtRef.current = null;
+    setPickerState(s => ({ ...s, visible: false }));
+
+    // "AV Columns" is not a paragraph type — it inserts a two-column body.
+    // It rides in the element menu because that is where a writer goes to ask
+    // "what is this line?", and a template that offers it has said the format
+    // may contain one. `insertAvRow` places it: beside the current line, never
+    // through it, and joined to an adjacent body rather than stacked on it.
+    if (type === AV_BLOCK_RULE_ID) {
+      editor.chain().focus().insertAvRow('below').run();
+      return;
+    }
+
+    // On a blank line, picking the type that line already has cannot mean
+    // "convert it" — it would be a no-op, and it is the row a writer lands on
+    // most, since the list is ordered current-type first. Read it the only way
+    // it makes sense: one more line of this element (issue #100). On a line
+    // with text, the same pick really is a no-op, and is left as one.
+    const node = editor.state.selection.$from.parent;
+    const currentId = node.type.name === 'customElement'
+      ? ((node.attrs?.customTypeId as string) || 'customElement')
+      : node.type.name;
+    if (type === currentId && isBlankBlock(node)) {
+      insertBlankLineRef.current(type);
+      return;
+    }
+
     // setNode works for any real schema node (built-in screenplay elements as
     // well as the AV inner types avPara/avShot/avDirection). Custom-id elements
     // declared only in template rules go through the customElement wrapper.
@@ -3106,11 +3861,24 @@ const ScreenplayEditor: React.FC = () => {
         }).run();
       }
     }
+  }, [editor]);
+
+  const handlePickerInsertLine = useCallback(() => {
     setPickerState(s => ({ ...s, visible: false }));
+    insertBlankLineRef.current();
+  }, []);
+
+  const handlePickerInsertAvRow = useCallback(() => {
+    setPickerState(s => ({ ...s, visible: false }));
+    editor?.chain().focus().insertAvRow('below').run();
   }, [editor]);
 
   const handlePickerDismiss = useCallback(() => {
     setPickerState(s => ({ ...s, visible: false }));
+    if (editor) {
+      const { $from } = editor.state.selection;
+      pickerDismissedAtRef.current = $from.depth === 0 ? null : $from.before($from.depth);
+    }
     // Re-focus editor
     editor?.commands.focus();
   }, [editor]);
@@ -3141,8 +3909,10 @@ const ScreenplayEditor: React.FC = () => {
       clearTrackChanges();
       scriptSwitchingRef.current = true;
       try {
-        // Flush unsaved changes to the CURRENT script before switching
-        if (currentProject && currentScriptId) {
+        // Flush unsaved changes to the CURRENT script before switching —
+        // unless auto-save is off, in which case File → Open has already
+        // asked, and "Discard" has to mean discard.
+        if (currentProject && currentScriptId && autoSaveAppliesToOpenDocument(useSettingsStore.getState(), false)) {
           const pendingContent = buildSaveContent();
           if (pendingContent) {
             const pendingJson = JSON.stringify(pendingContent);
@@ -3153,6 +3923,8 @@ const ScreenplayEditor: React.FC = () => {
           }
         }
 
+        const linkedPath = await syncLinkedFileBeforeOpen(projectId, scriptId, scriptTitle);
+        useLinkedFileStore.getState().setOpenScriptFile(linkedPath ? { scriptId, path: linkedPath } : null);
         const scriptResp = await scriptApi.getScript(projectId, scriptId);
         const content = scriptResp.content as Record<string, unknown> | null;
 
@@ -3162,11 +3934,12 @@ const ScreenplayEditor: React.FC = () => {
         setCurrentScriptId(scriptId);
         // Opening a project script clears any prior "imported file" notice.
         useEditorStore.getState().setImportedSource(null);
+        // Before setContent, so the load is not marked as a revision.
+        restoreRevisionState(content);
 
         try {
           if (content && typeof content === 'object' && 'type' in content && content.type === 'doc') {
-            const { _notes, _generalNotes: _gn2, _tags, _tagCategories, _characterProfiles, _characterRelationships, _beats, _beatColumns, _beatArrangeMode: _bam, _templateId: _tpl2, _ignoredWords: _iw2, _ignoredOnce: _io2, _customDictWords: _cdw2, _enabledGlobalDicts: _egd2, _projectDictEnabled: _pde2, _enabledLanguages: _elx2, _ignoredGrammarRules: _igr2, _ignoredGrammarOnce: _igo2, _spellCheckEnabled: _sce2, _grammarCheckEnabled: _gce2, _sceneNumbersVisible: _snv2, _sceneNumbersLocked: _snl2, _pageLayout: _pl2, ...pmDoc } = content as any;
-            editor.commands.setContent(pmDoc);
+            editor.commands.setContent(stripSaveMetadata(content).pmDoc);
           } else if (content && typeof content === 'object' && Object.keys(content).length > 0) {
             editor.commands.setContent(content);
           } else {
@@ -3191,6 +3964,7 @@ const ScreenplayEditor: React.FC = () => {
         store.setBeats([]);
         store.setBeatColumns([]);
         store.setPageLayout({ ...DEFAULT_PAGE_LAYOUT });
+        store.setScriptProfile(normalizeScriptProfile((content as Record<string, unknown> | null | undefined)?._scriptProfile));
         // Default per-doc spell/grammar to off; the block below overrides
         // from the loaded content if the user had enabled them previously.
         store.setSpellCheckEnabled(false);
@@ -3214,21 +3988,7 @@ const ScreenplayEditor: React.FC = () => {
           if (profiles2.length > 0) {
             for (const prof of profiles2 as Record<string, unknown>[]) {
               if (prof.name && typeof prof.name === 'string') {
-                store.upsertCharacterProfile(prof.name, {
-                  description: (prof.description as string) || '',
-                  color: (prof.color as string) || '',
-                  highlighted: (prof.highlighted as boolean) || false,
-                  gender: (prof.gender as string) || '',
-                  age: (prof.age as string) || '',
-                  role: (prof.role as string) || '',
-                  backstory: (prof.backstory as string) || '',
-                  arc: (prof.arc as string) || '',
-                  speechPattern: (prof.speechPattern as string) || '',
-                  vocabulary: (prof.vocabulary as string) || '',
-                  verbalTics: (prof.verbalTics as string) || '',
-                  sampleDialogue: (prof.sampleDialogue as string) || '',
-                  images: Array.isArray(prof.images) ? (prof.images as string[]) : [],
-                });
+                store.upsertCharacterProfile(prof.name, savedProfileFields(prof));
               }
             }
           }
@@ -3720,6 +4480,15 @@ const ScreenplayEditor: React.FC = () => {
             const pos = payload.position;
             if (pos) {
               const el = document.elementFromPoint(pos.x, pos.y);
+              // Font files dropped on the Fonts dialog are installed, not
+              // imported as a script — the dialog reads the paths itself.
+              if (el?.closest('.fonts-dropzone')) {
+                const paths = payload.paths;
+                if (paths && paths.length > 0) {
+                  window.dispatchEvent(new CustomEvent('tauri-font-drop', { detail: { paths } }));
+                }
+                return;
+              }
               if (el?.closest('.asset-manager')) {
                 const paths = payload.paths;
                 if (paths && paths.length > 0) {
@@ -3785,6 +4554,30 @@ const ScreenplayEditor: React.FC = () => {
     };
   }, [editor, hasUnsavedChanges, importDroppedFile]);
 
+  /**
+   * Move images that live outside a project into the one being saved to.
+   *
+   * Runs before the document is serialized (see SaveAsDialog.onProjectReady),
+   * so the first stored copy already references real assets rather than this
+   * machine's scratch store.
+   */
+  const handlePromoteImagesInto = useCallback(
+    async (projectId: string, destination: 'local' | 'cloud') => {
+      const result = await promoteScratchImages(
+        editor,
+        projectId,
+        destination === 'cloud' ? cloudApi : api,
+      );
+      if (result.failed > 0) {
+        showToast(
+          `${result.failed} image${result.failed === 1 ? '' : 's'} could not be moved into the project and may not open on another device.`,
+          'error',
+        );
+      }
+    },
+    [editor],
+  );
+
   const handleSaveAsComplete = useCallback(
     async (
       projectId: string,
@@ -3817,6 +4610,17 @@ const ScreenplayEditor: React.FC = () => {
         setCurrentProject(project);
         setCurrentScriptId(scriptId);
         setDocumentTitle(scriptTitle);
+        // In a project kept in a folder the new script already has a file of
+        // its own (issue #135), which every library save also writes.
+        if (destination !== 'cloud') {
+          try {
+            const lf = await import('../services/linkedFiles');
+            const link = await lf.getLink(scriptId);
+            useLinkedFileStore.getState().setOpenScriptFile(link ? { scriptId, path: link.path } : null);
+          } catch (err) {
+            console.warn('[linked-files] could not look up the new script\'s file', err);
+          }
+        }
         // Save-as resolved an imported document into a real project script —
         // the "imported file" notice is no longer relevant.
         store.setImportedSource(null);
@@ -3966,9 +4770,14 @@ const ScreenplayEditor: React.FC = () => {
     const handleContextMenu = (e: MouseEvent) => {
       const editorDom = editor.view.dom;
       if (!editorDom.contains(e.target as Node)) return;
-      e.preventDefault();
-      // No context menu on touch devices — use 3-finger touch instead
+      // No context menu on touch devices — three fingers opens it instead —
+      // and nothing prevented either. On iPadOS the long press that fires this
+      // event is the same gesture that selects a word and puts the selection
+      // UI on screen, so preventing it here took the selection handles with it
+      // (issue #108). This used to run before the check, which meant that on a
+      // touch device the handler did nothing *but* cancel the gesture.
       if (isTouchDevice) return;
+      e.preventDefault();
 
       // Move cursor to click position only if no text is selected,
       // or if the click is outside the current selection
@@ -4051,6 +4860,39 @@ const ScreenplayEditor: React.FC = () => {
 
   const zoomScale = zoomLevel / 100;
 
+  // What each page owes at its foot. Empty whenever nothing prints, so the
+  // lookups below cost nothing in the overwhelmingly common case.
+  const footnotesByPage = useMemo(() => {
+    const map = new Map<number, FootnotePageAssignment>();
+    for (const fp of footnotePages) map.set(fp.pageNumber, fp);
+    return map;
+  }, [footnotePages]);
+
+  // Script pages, excluding the NOTES sheets those endnotes will be drawn on.
+  const scriptPageCount = Math.max(1, (hfPageCount || 1) - endnotePages.length);
+  const endnoteExtraHeight = useMemo(() => {
+    if (endnotePages.length === 0) return 0;
+    const m = getPageMetrics(pageLayout);
+    return endnotePages.length * (m.sepHeightPx + m.pageContentPx);
+  }, [endnotePages, pageLayout]);
+
+  const renderFootnotes = useCallback((pageNumber: number) => {
+    // Not gated on the document's Location: a note can be sent to the foot of
+    // its page on its own, and only the notes that actually go there reach
+    // `footnotesByPage` in the first place.
+    if (!footnotePlan) return null;
+    const owed = footnotesByPage.get(pageNumber);
+    if (!owed || owed.slices.length === 0) return null;
+    return (
+      <FootnoteBlock
+        plan={footnotePlan}
+        slices={owed.slices}
+        noteIds={owed.noteIds}
+        pageNumber={pageNumber}
+      />
+    );
+  }, [footnotePlan, footnotesByPage]);
+
   // Compute last-page footer position so the last page shows its full extent
   const lastPageEnd = useMemo(() => {
     const m = getPageMetrics(pageLayout);
@@ -4085,13 +4927,7 @@ const ScreenplayEditor: React.FC = () => {
           </span>
           <button
             className="history-banner-back"
-            onClick={() => {
-              if (urlProjectId && urlScriptId) {
-                navigate(`/project/${urlProjectId}/edit/${urlScriptId}`);
-              } else {
-                goBack();
-              }
-            }}
+            onClick={urlProjectId && urlScriptId ? leaveHistoryMode : goBack}
           >
             Back to Current Version
           </button>
@@ -4131,10 +4967,15 @@ const ScreenplayEditor: React.FC = () => {
             ))}
           </div>
           {isCollabHost && (
-            <button className="collab-banner-btn" onClick={() => {
+            <button className="collab-banner-btn" onClick={async () => {
               // Close any stale login dialog before reopening share dialog
               setCollabLoginOpen(false);
-              if (!isCollabAuthenticated()) {
+              const authStatus = await ensureCollabAuthenticated();
+              if (authStatus === 'unavailable') {
+                showToast(COLLAB_AUTH_UNAVAILABLE_MESSAGE, 'error');
+                return;
+              }
+              if (authStatus === 'signed-out') {
                 setCollabLoginOpen(true);
                 return;
               }
@@ -4232,14 +5073,21 @@ const ScreenplayEditor: React.FC = () => {
           </button>
         </div>
       )}
-      {!isHistoryMode && <MenuBar editor={editor} onDocumentSaved={(json) => { lastSavedJsonRef.current = json; }} onCollaborate={() => {
+      {!isHistoryMode && <MenuBar editor={editor} onDocumentSaved={(json) => { lastSavedJsonRef.current = json; }} onCollaborate={async () => {
         if (!currentProject || !currentScriptId) {
           showToast('Save your screenplay to a project first — opening Save As...', 'info');
           useEditorStore.getState().setSaveAsOpen(true);
           return;
         }
-        // Check if user is authenticated to the collab server (also clears expired tokens)
-        if (!isCollabAuthenticated()) {
+        // Check the user is signed in, renewing an expired access token first.
+        // A session that just could not be renewed right now is still a
+        // session — say so instead of showing the sign-in form.
+        const authStatus = await ensureCollabAuthenticated();
+        if (authStatus === 'unavailable') {
+          showToast(COLLAB_AUTH_UNAVAILABLE_MESSAGE, 'error');
+          return;
+        }
+        if (authStatus === 'signed-out') {
           setCollabLoginOpen(true);
           return;
         }
@@ -4269,7 +5117,15 @@ const ScreenplayEditor: React.FC = () => {
               <div
                 className="page-container"
                 style={{
-                  transform: `scale(${zoomScale})`,
+                  // No transform at 1:1. WebKit does not paint the caret inside
+                  // a transformed contenteditable — selection and typing work,
+                  // the caret is simply invisible — and an identity scale is
+                  // enough to trigger it. Since scale(1) changes nothing but
+                  // costs the writer their cursor, it is left off entirely at
+                  // the default zoom, which is where nearly everyone writes.
+                  ...(zoomScale === 1
+                    ? {}
+                    : { transform: `scale(${zoomScale})` }),
                   transformOrigin: 'top left',
                   width: `${pageLayout.pageWidth}in`,
                   minWidth: `${pageLayout.pageWidth}in`,
@@ -4277,13 +5133,13 @@ const ScreenplayEditor: React.FC = () => {
                 }}
               >
                 <div
-                  className={`page${!tagsVisible ? ' tags-hidden' : ''}${!notesVisible ? ' notes-hidden' : ''}${isHistoryMode ? ' history-readonly' : ''}${sceneNumbersVisible ? ' show-scene-numbers' : ''}`}
+                  className={`page${!tagsVisible ? ' tags-hidden' : ''}${!notesVisible ? ' notes-hidden' : ''}${isHistoryMode ? ' history-readonly' : ''}${sceneNumbersVisible ? ' show-scene-numbers' : ''}${elementNumbersVisible ? ' show-element-numbers' : ''}${includeTitlePageInOutput ? '' : ' print-skip-title-page'}${showRevisionColors ? ' show-revision-colors' : ''}`}
                   ref={pageRef}
                   style={{
-                    fontFamily: `'${fontFamily}', 'Courier New', Courier, monospace`,
+                    fontFamily: fontStack(fontFamily),
                     fontSize: `${fontSize}pt`,
                     width: `${pageLayout.pageWidth}in`,
-                    minHeight: `${lastPageEnd + (pageLayout.bottomMargin / 72) * 96}px`,
+                    minHeight: `${lastPageEnd + endnoteExtraHeight + (pageLayout.bottomMargin / 72) * 96}px`,
                     paddingTop: `${pageLayout.topMargin}pt`,
                     paddingBottom: `${pageLayout.bottomMargin}pt`,
                     paddingLeft: `${pageLayout.leftMargin}in`,
@@ -4298,7 +5154,7 @@ const ScreenplayEditor: React.FC = () => {
                     // variable has to be overridden here for the page to
                     // actually render in the font the document is set in.
                     ...{
-                      '--screenplay-font': `'${fontFamily}', 'Courier New', Courier, monospace`,
+                      '--screenplay-font': fontStack(fontFamily),
                       '--screenplay-font-size': `${fontSize}pt`,
                     } as React.CSSProperties,
                   }}
@@ -4325,11 +5181,15 @@ const ScreenplayEditor: React.FC = () => {
                         {ov.isDialogueSplit && moresContds.dialogueBreakContd && (
                           <div className="page-sep-more">{moresContds.moreText}</div>
                         )}
-                        {showFooterForPrev && renderHFBand('footer', footerPrinted)}
+                        {showFooterForPrev && renderHFBand('footer', footerPrinted, lockedLabel(ov.pageNumber - 1))}
+                        {/* The bottom band belongs to the page above this
+                            break, which is the page whose footnotes these are —
+                            the same off-by-one `footerPrinted` accounts for. */}
+                        {!ov.isTitlePage && renderFootnotes(ov.pageNumber - 1)}
                       </div>
                       <div className="page-sep-gap" />
                       <div className="page-sep-top" style={{ height: `${pageLayout.topMargin}pt` }}>
-                        {showHeader && renderHFBand('header', headerPrinted)}
+                        {showHeader && renderHFBand('header', headerPrinted, lockedLabel(ov.pageNumber))}
                       </div>
                       {ov.isDialogueSplit && ov.characterName && moresContds.dialogueBreakContd && (
                         <div className="page-sep-contd">
@@ -4353,7 +5213,7 @@ const ScreenplayEditor: React.FC = () => {
                     return (
                       <div className="page-sep page-sep-first" style={{ top: 0 }}>
                         <div className="page-sep-top" style={{ height: `${pageLayout.topMargin}pt` }}>
-                          {renderHFBand('header', printed)}
+                          {renderHFBand('header', printed, lockedLabel(1))}
                         </div>
                       </div>
                     );
@@ -4365,24 +5225,73 @@ const ScreenplayEditor: React.FC = () => {
                       ? overlays[overlays.length - 1].pageNumber
                       : 1;
                     const printed = printedPageNumber(lastPage, headerFooter.startingPageNumber);
-                    if (printed < headerFooter.footerStartPage) return null;
+                    const showFooter = printed >= headerFooter.footerStartPage;
+                    const footnotes = renderFootnotes(lastPage);
+                    // Footnotes belong to the page whether or not it carries a
+                    // footer — the two are unrelated, and a script whose footer
+                    // starts on page 2 still cites sources on page 1.
+                    if (!showFooter && !footnotes) return null;
                     return (
                       <div
                         className="page-sep"
                         style={{ top: `${lastPageEnd}px` }}
                       >
                         <div className="page-sep-bottom" style={{ height: `${pageLayout.bottomMargin}pt`, position: 'relative' }}>
-                          {renderHFBand('footer', printed)}
+                          {showFooter && renderHFBand('footer', printed, lockedLabel(lastPage))}
+                          {footnotes}
                         </div>
                       </div>
                     );
                   })()}
 
+                  {footnotePlan && endnotePages.length > 0 && (
+                    <EndnotePages
+                      plan={footnotePlan}
+                      pages={endnotePages}
+                      layout={pageLayout}
+                      lastPageEnd={lastPageEnd}
+                      scriptPageCount={scriptPageCount}
+                      renderBands={(pageNumber) => {
+                        const printed = printedPageNumber(pageNumber, headerFooter.startingPageNumber);
+                        return {
+                          header: printed >= headerFooter.headerStartPage
+                            ? renderHFBand('header', printed, lockedLabel(pageNumber)) : null,
+                          footer: printed >= headerFooter.footerStartPage
+                            ? renderHFBand('footer', printed - 1, lockedLabel(pageNumber - 1)) : null,
+                        };
+                      }}
+                    />
+                  )}
+
                   <EditorContent editor={editor} />
+                  {/* iPadOS paints no caret in a web view while the soft
+                      keyboard is down, which is how the Pencil is used, so the
+                      app draws one. A sibling of the editor, never inside it —
+                      ProseMirror replaces its own children. */}
+                  <PencilCaret
+                    editor={editor}
+                    enabled={isTouch && !isHistoryMode}
+                    // While the handwriting panel is up the editor does not hold
+                    // focus — the writing field does — but the writer still has
+                    // to see which line the next insert lands on, and iPadOS
+                    // draws nothing for an unfocused view.
+                    showUnfocused={scribbleOpen}
+                  />
+                  {/* And no selection handles either, so the app draws those
+                      too — see SelectionHandles.tsx. Same reason it is a
+                      sibling and not a child of the editor. */}
+                  <SelectionHandles
+                    editor={editor}
+                    enabled={needsSelectionHandles() && !isHistoryMode}
+                  />
                 </div>
               </div>
               </div>
             </div>
+          )}
+          {/* Table Read docks over the bottom of the script it is reading. */}
+          {!isHistoryMode && tableReadOpen && editor && !statisticsOpen && !beatBoardOpen && (
+            <TableReadPanel editor={editor} />
           )}
         </div>
         {!isHistoryMode && rightPanelVisible && (
@@ -4392,9 +5301,13 @@ const ScreenplayEditor: React.FC = () => {
         {!isHistoryMode && <CharacterProfiles editor={editor} projectId={currentProject?.id || ''} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
         {!isHistoryMode && <TagsPanel editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
         {!isHistoryMode && <LocationDatabase editor={editor} style={{ width: rightPanelWidth, minWidth: rightPanelWidth }} />}
-        {!isHistoryMode && pluginRegistry.getPanels('right-sidebar').map((p) => (
-          <p.component key={p.id} editor={editor} />
-        ))}
+        {!isHistoryMode && (
+          <PluginPanelTabs
+            editor={editor}
+            width={rightPanelWidth}
+            onResizePointerDown={(e) => handleResizePointerDown('right', e)}
+          />
+        )}
       </div>
       {!isHistoryMode && (
         <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
@@ -4413,6 +5326,8 @@ const ScreenplayEditor: React.FC = () => {
           defaultType={pickerState.defaultType}
           availableTypes={pickerState.availableTypes}
           onSelect={handlePickerSelect}
+          onInsertBlankLine={pickerState.blankLine ? handlePickerInsertLine : undefined}
+          onInsertAvRow={pickerState.avCell ? handlePickerInsertAvRow : undefined}
           onDismiss={handlePickerDismiss}
         />
       )}
@@ -4422,6 +5337,16 @@ const ScreenplayEditor: React.FC = () => {
           suggestions={charAutoState.suggestions}
           onSelect={handleCharAutoSelect}
           onDismiss={handleCharAutoDismiss}
+        />
+      )}
+      {/* Handwriting input (Apple Pencil). Mounted here rather than on a
+          toolbar because it has to be reachable whatever else is on screen —
+          notably with a hardware keyboard attached, where no on-screen
+          accessory bar is showing at all (issue #90). */}
+      {scribbleOpen && editor && (
+        <ScribbleInput
+          editor={editor}
+          onClose={() => setScribbleOpen(false)}
         />
       )}
       {/* Context menu on mobile: 3-finger touch only */}
@@ -4472,6 +5397,7 @@ const ScreenplayEditor: React.FC = () => {
           onClose={() => setOpenFileOpen(false)}
         />
       )}
+      {!isHistoryMode && <VoiceProviderDialog />}
       {!isHistoryMode && showWelcome && !recoveryPending && <WelcomeDialog onChoice={handleWelcomeChoice} />}
       {/* After the recovery prompt, never alongside it — two launch dialogs at
           once is what #68 warned about. */}
@@ -4507,6 +5433,7 @@ const ScreenplayEditor: React.FC = () => {
               : 'local'
           }
           onSaved={handleSaveAsComplete}
+          onProjectReady={handlePromoteImagesInto}
           onClose={() => setSaveAsOpen(false)}
           buildContent={buildSaveContent}
         />
@@ -4523,8 +5450,15 @@ const ScreenplayEditor: React.FC = () => {
           onClose={() => setTitlePageEditorOpen(false)}
         />
       )}
+      {fontsDialogOpen && (
+        <FontsDialog onClose={() => setFontsDialogOpen(false)} />
+      )}
+
       {!isHistoryMode && moresContdsOpen && (
         <MoresContdsDialog onClose={() => setMoresContdsOpen(false)} />
+      )}
+      {!isHistoryMode && footnoteDialogOpen && (
+        <FootnoteDialog onClose={() => setFootnoteDialogOpen(false)} />
       )}
       {!isHistoryMode && headerFooterOpen && (
         <HeaderFooterDialog

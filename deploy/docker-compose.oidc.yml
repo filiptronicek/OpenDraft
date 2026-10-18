@@ -1,0 +1,17 @@
+# Opt-in OIDC client-secret overlay for the split source-build stack.
+# deploy.sh adds it when OIDC_ISSUER_URL is configured.
+services:
+  collab:
+    environment:
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET_FILE: /run/secrets/opendraft_oidc_client_secret
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI}
+      OIDC_DISPLAY_NAME: ${OIDC_DISPLAY_NAME:-OpenID Connect}
+    secrets:
+      - source: opendraft_oidc_client_secret
+        target: opendraft_oidc_client_secret
+
+secrets:
+  opendraft_oidc_client_secret:
+    file: ${OIDC_CLIENT_SECRET_HOST_FILE}

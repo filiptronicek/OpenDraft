@@ -2,6 +2,18 @@
 import type { JSONContent } from '@tiptap/react';
 import { jsonBlockRuns, mergeRuns, singleLine } from './nodeText';
 import { sanitizeExportFilename } from './exportFilename';
+import { clampSectionLevel } from '../editor/extensions/Section';
+import { DEFAULT_TITLE_PAGE_CREDIT } from './titlePageBlocks';
+import { blockRevision, fountainRevisionNote } from './revisionExport';
+import type { RevisionSettings } from '../editor/revisionColors';
+
+export interface FountainExportOptions {
+  /** The marks revised lines are written with; absent writes `*`. */
+  revisionSettings?: RevisionSettings | null;
+  /** False leaves `#12#` scene numbers out — hidden numbers, kept on the
+   *  scenes while locked, are not printed ones. Absent writes them. */
+  sceneNumbersVisible?: boolean;
+}
 
 /**
  * Escape the characters Fountain reads as emphasis markup, so text the writer
@@ -110,8 +122,24 @@ const SCENE_HEADING_RE = /^(INT\.|EXT\.|EST\.|INT\.\/EXT\.|I\/E\.)/;
 /** The parser's all-caps-ending-in-`TO:` transition heuristic. */
 const TRANSITION_RE = /^[A-Z\s]+TO:$/;
 
-/** Leading characters the parser reads as a forcing sigil or block marker. */
-const SIGIL_RE = /^[!~.>@=]/;
+/**
+ * Leading characters the parser reads as a forcing sigil or block marker.
+ *
+ * `#` joined the list when Sections did: without it a line of Action that opens
+ * with a hash — a hashtag, a scene number a writer typed by hand — came back as
+ * a section heading and vanished from the printed page.
+ */
+const SIGIL_RE = /^[!~.>@=#]/;
+
+/**
+ * The opening of a Fountain note, which has no escape in the spec — so Action
+ * containing one has to be forced with `!`, or the brackets and everything
+ * between them are lifted out of the line as an annotation on the way back in.
+ *
+ * The boneyard's `/*` needs no equivalent: `escapeFountain` backslashes every
+ * asterisk, so the marker can never survive into the output intact.
+ */
+const NOTE_MARKER_RE = /\[\[/;
 
 /** Mirrors `isCharacterLine` in fountainParser. */
 function parsesAsCharacter(line: string): boolean {
@@ -135,6 +163,7 @@ function actionText(text: string): string {
       if (trimmed === '') return line;
       const ambiguous =
         SIGIL_RE.test(trimmed) ||
+        NOTE_MARKER_RE.test(trimmed) ||
         SCENE_HEADING_RE.test(trimmed.toUpperCase()) ||
         TRANSITION_RE.test(trimmed) ||
         parsesAsCharacter(trimmed);
@@ -149,10 +178,10 @@ function actionText(text: string): string {
  * cue and drags the following action into dialogue. The scene number is
  * re-attached in the spec's trailing `#…#` form rather than being dropped.
  */
-function sceneHeadingLine(node: JSONContent): string {
+function sceneHeadingLine(node: JSONContent, withNumber = true): string {
   let heading = lineText(node).toUpperCase();
   const sceneNumber = node.attrs?.sceneNumber;
-  if (typeof sceneNumber === 'string' && sceneNumber.trim() !== '') {
+  if (withNumber && typeof sceneNumber === 'string' && sceneNumber.trim() !== '') {
     heading = `${heading} #${sceneNumber.trim()}#`;
   }
   // `..X` is not a forced heading — the parser reads a second dot as literal —
@@ -173,6 +202,45 @@ function sceneHeadingLine(node: JSONContent): string {
  * General exists precisely to hold text that does not follow screenplay shape —
  * guessing which of its lines are safe is the behaviour the element opts out of.
  */
+/**
+ * One paragraph of an AV cell, as Fountain lines.
+ *
+ * The four AV paragraph types have no Fountain equivalent and are forced
+ * Action, which is the downgrade this export has always made — forcing matters,
+ * because an unforced all-caps line preceded by a blank one is a character cue
+ * and would silently pull the next paragraph into dialogue.
+ *
+ * The screenplay elements a cell can also hold DO have a Fountain form, and get
+ * it. Fountain is a single column and cannot say "these two are side by side",
+ * so the column note above is what marks them; within that, a cue is a cue and
+ * dialogue is dialogue.
+ */
+function avCellFountainLines(para: JSONContent): string[] {
+  const text = getTextContent(para);
+  switch (para.type) {
+    case 'character':
+      return ['', characterLine(para)];
+    case 'parenthetical': {
+      const p = lineText(para);
+      return [p.startsWith('(') ? p : `(${p})`];
+    }
+    case 'dialogue':
+      return [dialogueText(para)];
+    case 'lyrics':
+      return [`~${text}`];
+    case 'transition':
+      return ['', `> ${lineText(para)}`, ''];
+    case 'general':
+      return [generalText(text)];
+    default:
+      // avPara, avShot, avDirection, avGraphic, action, sceneHeading, shot —
+      // all forced Action. A scene heading inside one cell of one row is not a
+      // scene in the script's own outline, and writing it as one would put a
+      // phantom scene in every reader's navigator.
+      return text.trim() === '' ? [] : [actionText(text)];
+  }
+}
+
 function generalText(text: string): string {
   return text
     .split('\n')
@@ -190,7 +258,37 @@ function characterLine(node: JSONContent, suffix = ''): string {
   return `${needsForce ? '@' : ''}${cue}${suffix}`;
 }
 
-export function exportFountain(doc: JSONContent): string {
+/**
+ * Elements that continue the dialogue block they are in.
+ *
+ * Fountain ends a dialogue block at a blank line, so a blank line may only be
+ * written where the block is actually meant to end. The exporter used to put
+ * one after every Dialogue node — and a speech is several nodes whenever it
+ * came from the Fountain parser, which makes one node per line. Saved and
+ * reopened, every line of a speech after the first came back as Action.
+ */
+const DIALOGUE_FAMILY = new Set(['dialogue', 'parenthetical', 'lyrics']);
+
+/** Does the block after this one belong to the same dialogue block? */
+function continuesDialogue(next: JSONContent | undefined): boolean {
+  return !!next && DIALOGUE_FAMILY.has(next.type ?? '');
+}
+
+/**
+ * The `=` lines for an element's synopsis.
+ *
+ * A synopsis is stored as one string and may hold several lines — the parser
+ * files every `=` line it finds under the same heading. Each needs its own `=`
+ * on the way out: a raw newline would end the synopsis and turn the rest into
+ * Action.
+ */
+function synopsisLines(node: JSONContent): string[] {
+  const synopsis = node.attrs?.synopsis;
+  if (typeof synopsis !== 'string' || synopsis.trim() === '') return [];
+  return synopsis.split('\n').map((line) => `= ${line.trim()}`);
+}
+
+export function exportFountain(doc: JSONContent, options: FountainExportOptions = {}): string {
   const lines: string[] = [];
 
   if (!doc.content) return '';
@@ -200,23 +298,52 @@ export function exportFountain(doc: JSONContent): string {
   for (const node of doc.content) {
     if (node.type === 'titlePage' && node.attrs?.field === 'title') {
       if (node.attrs.tpTitle) titlePageMeta['Title'] = node.attrs.tpTitle;
-      if (node.attrs.tpWrittenBy) titlePageMeta['Author'] = node.attrs.tpWrittenBy;
-      if (node.attrs.tpDraft) titlePageMeta['Draft date'] = node.attrs.tpDraftDate || node.attrs.tpDraft;
-      if (node.attrs.tpContact) titlePageMeta['Contact'] = node.attrs.tpContact.replace(/\n/g, '\\n');
+      // `Credit:` is the label line above the author, and `Source:` is the
+      // "based on" line below it. This used to write the source as the credit,
+      // prefixed with "Based on" — which read back as the label and printed
+      // where the label goes (issue #87). A credit is written whenever there is
+      // an author, so a file that names one is explicit about it rather than
+      // relying on the reader's own default.
+      if (node.attrs.tpWrittenBy) {
+        titlePageMeta['Credit'] = node.attrs.tpCredit || DEFAULT_TITLE_PAGE_CREDIT;
+        titlePageMeta['Author'] = node.attrs.tpWrittenBy;
+      }
+      if (node.attrs.tpBasedOn) titlePageMeta['Source'] = node.attrs.tpBasedOn;
+      if (node.attrs.tpDraft) titlePageMeta['Draft'] = node.attrs.tpDraft;
+      if (node.attrs.tpDraftDate) titlePageMeta['Draft date'] = node.attrs.tpDraftDate;
+      if (node.attrs.tpContact) titlePageMeta['Contact'] = node.attrs.tpContact;
       if (node.attrs.tpCopyright) titlePageMeta['Copyright'] = node.attrs.tpCopyright;
-      if (node.attrs.tpBasedOn) titlePageMeta['Credit'] = `Based on ${node.attrs.tpBasedOn}`;
+      // `Notes:` is a key the parser has always read and this never wrote, so a
+      // title page's notes survived an import and were dropped by the next save.
+      // The registration has no standard key, but a Fountain title page is open
+      // key/value and a reader that does not know this one ignores it — which
+      // costs nothing and lets OpenDraft read its own file back whole.
+      if (node.attrs.tpNotes) titlePageMeta['Notes'] = node.attrs.tpNotes;
+      if (node.attrs.tpWgaRegistration) {
+        titlePageMeta['WGA registration'] = node.attrs.tpWgaRegistration;
+      }
       break;
     }
   }
   if (Object.keys(titlePageMeta).length > 0) {
     for (const [key, value] of Object.entries(titlePageMeta)) {
-      lines.push(`${key}: ${value}`);
+      // A value that runs over several lines is written the way the spec says
+      // to write one — the first line after the key, the rest indented under
+      // it. A contact block used to be flattened to a literal `\n`, which
+      // nothing converts back, so the address came home with the escape in it.
+      const [first, ...rest] = value.split('\n');
+      lines.push(`${key}: ${first}`);
+      for (const line of rest) lines.push(`    ${line}`);
     }
     lines.push('');
   }
 
-  for (const node of doc.content) {
+  doc.content.forEach((node, index) => {
     const text = getTextContent(node);
+    const next = doc.content?.[index + 1];
+    // Where this element's lines start, so a revised one can be marked on its
+    // last line once it is written (see utils/revisionExport).
+    const firstLine = lines.length;
 
     // A manual page break before this element — Fountain spells it `===`.
     if (node.attrs?.startsNewPage && node.type !== 'titlePage') {
@@ -234,14 +361,37 @@ export function exportFountain(doc: JSONContent): string {
         break;
       case 'sceneHeading':
         lines.push('');
-        lines.push(sceneHeadingLine(node));
-        if (node.attrs?.synopsis) {
-          lines.push(`= ${node.attrs.synopsis}`);
-        }
+        lines.push(sceneHeadingLine(node, options.sceneNumbersVisible !== false));
+        lines.push(...synopsisLines(node));
         lines.push('');
         break;
       case 'action':
+        // Centred Action is Fountain's `>text<`, and the only way to say
+        // "centred" in the format. Written as plain Action it came back flush
+        // left, so the centring survived neither a save nor a re-open.
+        if (node.attrs?.textAlign === 'center') {
+          lines.push('');
+          lines.push(`> ${singleLine(text).trim()} <`);
+          lines.push('');
+          break;
+        }
         lines.push(actionText(text));
+        lines.push('');
+        break;
+      // Fountain's two non-printing elements. Neither is Action: written as
+      // Action a Section prints on the page it exists to stay off, which is
+      // what issue #82 saw on the way in.
+      case 'section': {
+        const level = clampSectionLevel(node.attrs?.level);
+        lines.push('');
+        lines.push(`${'#'.repeat(level)} ${lineText(node)}`.trimEnd());
+        lines.push(...synopsisLines(node));
+        lines.push('');
+        break;
+      }
+      case 'note':
+        lines.push('');
+        lines.push(`[[${text.trim()}]]`);
         lines.push('');
         break;
       case 'general':
@@ -259,7 +409,7 @@ export function exportFountain(doc: JSONContent): string {
       }
       case 'dialogue':
         lines.push(dialogueText(node));
-        lines.push('');
+        if (!continuesDialogue(next)) lines.push('');
         break;
       case 'transition':
         lines.push('');
@@ -278,6 +428,17 @@ export function exportFountain(doc: JSONContent): string {
         lines.push(actionText(lineText(node).toUpperCase()));
         lines.push('');
         break;
+      // Cast List was missing from this switch entirely and fell through to the
+      // `default` branch, which writes the text raw. A cast list is a run of
+      // names in capitals, so it came back as a character cue with the
+      // paragraph under it as that character's dialogue. It is Action like the
+      // rest of them, forced, and it keeps its own lines rather than being
+      // collapsed onto one — a cast list is a list.
+      case 'castList':
+        lines.push('');
+        lines.push(actionText(text));
+        lines.push('');
+        break;
       case 'lyrics':
         lines.push(`~${text}`);
         break;
@@ -285,7 +446,7 @@ export function exportFountain(doc: JSONContent): string {
         if (node.content) {
           node.content.forEach((col, colIndex) => {
             if (col.type === 'dualDialogueColumn' && col.content) {
-              for (const child of col.content) {
+              col.content.forEach((child, childIndex) => {
                 if (child.type === 'character') {
                   lines.push('');
                   // Second column character gets ^ marker — it must stay on the
@@ -296,24 +457,67 @@ export function exportFountain(doc: JSONContent): string {
                   lines.push(p.startsWith('(') ? p : `(${p})`);
                 } else if (child.type === 'dialogue') {
                   lines.push(dialogueText(child));
-                  lines.push('');
+                  if (!continuesDialogue(col.content?.[childIndex + 1])) lines.push('');
                 }
-              }
+              });
             }
           });
+        }
+        break;
+      // Fountain is a single column of text and has no way to say "these two
+      // paragraphs are side by side", so an AV script is flattened to the rows
+      // in order, each cell's paragraphs as forced Action. Before this the
+      // whole block matched nothing and `getTextContent` returned '' for it, so
+      // exporting an AV script to Fountain wrote an empty file.
+      //
+      // Which column a paragraph came from is kept as a note: `[[Video]]` is
+      // not printed, so it labels the file for a human reading it without
+      // putting a word into the script itself.
+      //
+      // A cell holds ordinary screenplay elements too when the active template
+      // allows it, and those keep their own Fountain form — see
+      // `avCellFountainLines`. Forcing a Character cue to Action, as every cell
+      // paragraph used to be, turned an on-camera interview into two lines of
+      // description and lost the only thing marking it as speech.
+      case 'avBlock':
+        for (const row of node.content ?? []) {
+          if (row.type !== 'avRow') continue;
+          for (const cell of row.content ?? []) {
+            if (cell.type !== 'avCell') continue;
+            const side = (cell.attrs as { side?: string } | undefined)?.side === 'audio'
+              ? 'Audio'
+              : 'Video';
+            const paras = (cell.content ?? []).flatMap(avCellFountainLines);
+            if (paras.every((para) => para.trim() === '')) continue;
+            lines.push('');
+            lines.push(`[[${side}]]`);
+            lines.push(...paras);
+          }
+          lines.push('');
         }
         break;
       default:
         lines.push(text);
         break;
     }
-  }
+
+    if (node.type !== 'titlePage' && node.type !== 'note' && node.type !== 'section') {
+      const revision = blockRevision(node);
+      if (revision !== null) {
+        for (let k = lines.length - 1; k >= firstLine; k--) {
+          if (lines[k].trim() === '' || lines[k] === '===') continue;
+          lines[k] = `${lines[k]} ${fountainRevisionNote(revision, options.revisionSettings)}`;
+          break;
+        }
+      }
+    }
+  });
 
   return lines.join('\n');
 }
 
-export async function downloadFountain(doc: JSONContent, title: string = 'Untitled') {
-  const text = exportFountain(doc);
+export async function downloadFountain(doc: JSONContent, title: string = 'Untitled', options: FountainExportOptions = {}) {
+  const text = exportFountain(doc, options);
   const filename = `${sanitizeExportFilename(title)}.fountain`;
   const { saveFile } = await import('./fileOps');
   await saveFile(text, filename, [{ name: 'Fountain', extensions: ['fountain'] }]);

@@ -12,9 +12,10 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
+import { leaveEditor } from '../services/pendingSave';
 import { FaCloud, FaUserCircle } from 'react-icons/fa';
 import { useSettingsStore } from '../stores/settingsStore';
-import { performLogout } from '../services/collabAuth';
+import { hasLocalPassword, performLogout } from '../services/collabAuth';
 import CollabLoginDialog from './CollabLoginDialog';
 
 const AuthIndicator: React.FC = () => {
@@ -95,19 +96,20 @@ const AuthIndicator: React.FC = () => {
 
   const user = collabAuth.user!;
   const initial = (user.displayName || user.email || '?').charAt(0).toUpperCase();
+  const needsLocalEmailVerification = hasLocalPassword(user) && !user.emailVerified;
 
   return (
     <div className="auth-indicator-wrap" style={{ position: 'relative' }}>
       <button
         ref={buttonRef}
         type="button"
-        className={`auth-indicator auth-indicator--signed-in ${user.emailVerified ? '' : 'auth-indicator--unverified'}`}
+        className={`auth-indicator auth-indicator--signed-in ${needsLocalEmailVerification ? 'auth-indicator--unverified' : ''}`}
         onClick={() => setMenuOpen((v) => !v)}
-        title={user.emailVerified ? `Signed in as ${user.displayName}` : 'Email not verified — saving disabled'}
+        title={needsLocalEmailVerification ? 'Email not verified — saving disabled' : `Signed in as ${user.displayName}`}
       >
         <span className="auth-indicator__avatar" aria-hidden="true">{initial}</span>
         <span className="auth-indicator__name">{user.displayName || user.email}</span>
-        {!user.emailVerified && <span className="auth-indicator__badge">verify</span>}
+        {needsLocalEmailVerification && <span className="auth-indicator__badge">verify</span>}
       </button>
       {menuOpen && menuRect && createPortal(
         <div
@@ -119,7 +121,14 @@ const AuthIndicator: React.FC = () => {
           <button
             type="button"
             className="auth-indicator__menu-item"
-            onClick={() => { setMenuOpen(false); navigate('/settings'); }}
+            onClick={() => {
+              setMenuOpen(false);
+              // Leaving the editor by router navigation fires neither
+              // `beforeunload` nor Tauri's close handler, so the open document
+              // is flushed — or, with auto-save off, asked about — first
+              // (issues #65, #135).
+              void leaveEditor(() => navigate('/settings'));
+            }}
           >
             <FaUserCircle /> Account settings
           </button>

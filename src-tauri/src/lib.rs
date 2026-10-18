@@ -1,4 +1,7 @@
 use std::sync::Mutex;
+
+/// Platform text-to-speech for Table Read (issue #131).
+mod tts;
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 #[cfg(desktop)]
@@ -56,6 +59,52 @@ fn android_context() -> Option<AndroidCtx> {
 #[cfg(target_os = "android")]
 const NO_ANDROID_CONTEXT: &str = "Android activity is not available yet";
 
+/// Clears a pending Java exception when it goes out of scope.
+///
+/// A JNI call that throws leaves the exception set on the thread, and the jni
+/// crate reports it as `Error::JavaException` — so the `?` on the next line
+/// returns while the exception is still pending. Nothing fails at that point.
+/// ART aborts the process on the *next* JNI call made on that thread, with
+/// "No pending exception expected", which is a SIGABRT with no error anywhere
+/// near the code that caused it.
+///
+/// That is how a `SecurityException` from `ContentResolver` — a file the user
+/// picked that we turned out not to be allowed to read — became a crash rather
+/// than a message. Any Java-side failure on these paths does the same: a
+/// revoked URI grant, a deleted file, a full disk.
+///
+/// Clearing on drop is what makes this reliable. The check has to cover every
+/// `?` in the function, and one written at the end of the body does not: the
+/// early return jumps straight over it. Declare the guard immediately after
+/// attaching and every exit is covered, including the `?` that returns the
+/// error being reported.
+#[cfg(target_os = "android")]
+struct ExceptionGuard(*mut jni::sys::JNIEnv);
+
+#[cfg(target_os = "android")]
+impl ExceptionGuard {
+    fn new(env: &jni::JNIEnv) -> Self {
+        Self(env.get_raw())
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for ExceptionGuard {
+    fn drop(&mut self) {
+        // The attachment that produced this pointer is declared before the
+        // guard, and locals drop in reverse, so the thread is still attached.
+        let Ok(env) = (unsafe { jni::JNIEnv::from_raw(self.0) }) else {
+            return;
+        };
+        if env.exception_check().unwrap_or(false) {
+            // describe() writes the Java stack trace to logcat, which is the
+            // only place the class and message survive — clear() discards it.
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
+    }
+}
+
 // ── Android content URI reading (JNI) ────────────────────────────────────
 // On Android, files opened via intents use content:// URIs. These cannot be
 // read with std::fs — we must go through Android's ContentResolver via JNI.
@@ -105,6 +154,62 @@ fn read_content_uri_bytes(uri: String) -> Result<ContentUriBytes, String> {
     }
 }
 
+/// The clipboard's HTML flavour, when the platform has one.
+///
+/// The clipboard plugin reads plain text only, so an Edit ▸ Paste on Android
+/// lost every mark the long-press callout keeps — the callout hands the web
+/// view the real clipboard, flavours and all, while the plugin hands back a
+/// string. This reads `ClipData.Item.getHtmlText()`, which is the same flavour
+/// the callout would have delivered (issue #102).
+///
+/// `Ok(None)` is the ordinary answer on a plain-text clip and everywhere that
+/// is not Android; the caller falls back to plain text. Only a genuine JNI
+/// failure is an `Err`.
+#[tauri::command]
+fn read_clipboard_html() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_read_clipboard_html()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_read_clipboard_html() -> Result<Option<String>, String> {
+    use jni::objects::{JObject, JString, JValue};
+    use jni::JavaVM;
+
+    let ctx = android_context().ok_or(NO_ANDROID_CONTEXT)?;
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
+        .map_err(|e| format!("Failed to get JVM: {}", e))?;
+    let mut env = vm.attach_current_thread()
+        .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
+    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    // In Kotlin rather than raw JNI for the same reason as readUriBytes: the
+    // getSystemService cast, the null primaryClip and the empty-item case are
+    // three guards that read as one line there and a dozen calls here.
+    let html_obj = env.call_static_method(
+        "com/proteus/opendraft/MainActivity", "readClipboardHtml",
+        "(Landroid/content/Context;)Ljava/lang/String;",
+        &[JValue::Object(&activity)],
+    ).map_err(|e| format!("readClipboardHtml: {}", e))?
+     .l().map_err(|e| format!("readClipboardHtml cast: {}", e))?;
+
+    if html_obj.is_null() {
+        return Ok(None);
+    }
+
+    let html: String = env.get_string(&JString::from(html_obj))
+        .map_err(|e| format!("clipboard html to string: {}", e))?
+        .into();
+    Ok(if html.is_empty() { None } else { Some(html) })
+}
+
 #[cfg(target_os = "android")]
 fn android_read_content_uri_bytes(uri_str: &str) -> Result<ContentUriBytes, String> {
     use jni::objects::{JByteArray, JObject, JValue};
@@ -115,6 +220,7 @@ fn android_read_content_uri_bytes(uri_str: &str) -> Result<ContentUriBytes, Stri
         .map_err(|e| format!("Failed to get JVM: {}", e))?;
     let mut env = vm.attach_current_thread()
         .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // Converted to a JObject once: the URI string is needed twice below, and
@@ -147,7 +253,7 @@ fn android_read_content_uri_bytes(uri_str: &str) -> Result<ContentUriBytes, Stri
         }
     }
 
-    // The read itself lives in MainActivity.readUriBytes: minSdk is 24, so
+    // The read itself lives in MainActivity.readUriBytes: minSdk is 26, so
     // InputStream.readAllBytes() is unavailable and a JNI read loop would be
     // far more code than a Kotlin one-liner.
     let bytes_obj = env.call_static_method(
@@ -217,6 +323,7 @@ fn android_write_content_uri(uri_str: &str, contents: &[u8]) -> Result<(), Strin
         .map_err(|e| format!("Failed to get JVM: {}", e))?;
     let mut env = vm.attach_current_thread()
         .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     let uri_jstr = env.new_string(uri_str)
@@ -291,6 +398,7 @@ fn android_read_content_uri(uri_str: &str) -> Result<ContentUriResult, String> {
         .map_err(|e| format!("Failed to get JVM: {}", e))?;
     let mut env = vm.attach_current_thread()
         .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // Parse URI string → android.net.Uri
@@ -380,6 +488,14 @@ fn android_query_display_name(
 ) -> Option<String> {
     use jni::objects::{JObject, JValue};
 
+    // This one matters more than most. `query()` below is what threw the
+    // SecurityException behind the SIGABRT reported from a vivo on 0.23.0 —
+    // a picked `content://` URI that turned out to belong to the contacts
+    // provider. Every failure here is an `.ok()?`, which discards the error
+    // and returns None with the exception still pending, so the caller
+    // carried on to `openInputStream` and aborted there instead.
+    let _exc = ExceptionGuard::new(&*env);
+
     // Create projection array: ["_display_name"]
     let col_name = env.new_string("_display_name").ok()?;
     let string_class = env.find_class("java/lang/String").ok()?;
@@ -431,6 +547,10 @@ fn android_query_mime_extension(
 ) -> Option<String> {
     use jni::objects::{JObject, JValue};
 
+    // Same shape as the display-name query: every exit is an `.ok()?` that
+    // leaves a throw pending for whoever calls JNI next.
+    let _exc = ExceptionGuard::new(&*env);
+
     // resolver.getType(uri) → String (MIME type)
     let mime_obj = env.call_method(
         resolver, "getType",
@@ -478,6 +598,7 @@ fn android_get_intent_data() -> Option<String> {
     let ctx = android_context()?;
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // activity.getIntent()
@@ -524,6 +645,25 @@ fn extract_filename_from_uri(uri: &str) -> String {
 // Instead, we write to the cache directory and present an Android share
 // intent so the user can save to Files, share via any app, etc.
 
+/// Where an export or a print job stages its file before Android takes over.
+///
+/// Not `std::env::temp_dir()`, which is what this used to be: Android sets no
+/// TMPDIR, so that resolves to the `/data/local/tmp` fallback Rust compiles in
+/// — a directory owned by the shell user and closed to every app. Exporting or
+/// printing anything failed on the staging write with "Permission denied (os
+/// error 13)", with no permission available to ask for (issue #125).
+/// MainActivity hands back the app's own cache directory instead, which needs
+/// none.
+#[cfg(target_os = "android")]
+fn android_staging_path(filename: &str) -> Result<std::path::PathBuf, String> {
+    let dir = android_static_call("exportStagingDir", &[])?
+        .ok_or("Could not open a place to write the file")?;
+    // Only the last segment is ours to name: a filename carrying separators
+    // would otherwise land outside the directory we just asked for.
+    let name = filename.rsplit('/').next().unwrap_or(filename);
+    Ok(std::path::Path::new(&dir).join(name))
+}
+
 /// Android export: write file to cache, then present a "Save As" document picker
 /// via ACTION_CREATE_DOCUMENT.  The user picks a location and Android copies the
 /// content from our temp file to the chosen URI via ContentResolver.
@@ -540,6 +680,7 @@ fn android_share_file(file_path: &str, mime_type: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to get JVM: {}", e))?;
     let mut env = vm.attach_current_thread()
         .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // Store the temp file path so onActivityResult can copy it to the user's chosen location
@@ -605,8 +746,7 @@ fn android_share_file(file_path: &str, mime_type: &str) -> Result<(), String> {
 fn android_save_and_share(filename: String, contents: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let cache_dir = std::env::temp_dir();
-        let path = cache_dir.join(&filename);
+        let path = android_staging_path(&filename)?;
         std::fs::write(&path, &contents)
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
         // Use application/octet-stream so Android's save-as dialog
@@ -624,8 +764,7 @@ fn android_save_and_share(filename: String, contents: String) -> Result<(), Stri
 fn android_save_and_share_binary(filename: String, contents: Vec<u8>) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let cache_dir = std::env::temp_dir();
-        let path = cache_dir.join(&filename);
+        let path = android_staging_path(&filename)?;
         std::fs::write(&path, &contents)
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
         let mime = if filename.ends_with(".pdf") { "application/pdf" } else { "application/octet-stream" };
@@ -643,6 +782,44 @@ fn android_save_and_share_binary(filename: String, contents: Vec<u8>) -> Result<
 // The result is captured by MainActivity.onActivityResult() and stored in
 // a static companion field, then retrieved by android_get_picked_file().
 
+/// Android: print the script through the system print dialog.
+///
+/// Android's WebView never implemented `window.print()`, so Print was a menu
+/// item that silently did nothing. PrintManager is the platform's print path
+/// and it takes a document, so the frontend renders the same PDF it would have
+/// exported and sends the bytes here.
+///
+/// The temp file outlives this call deliberately: the spooler reads it while
+/// the writer is still choosing a printer, and it is written into the cache
+/// directory that Android reclaims on its own — the same arrangement export
+/// already relies on.
+#[tauri::command]
+fn android_print_pdf(filename: String, contents: Vec<u8>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let path = android_staging_path(&filename)?;
+        std::fs::write(&path, &contents)
+            .map_err(|e| format!("Failed to write the file to print: {}", e))?;
+
+        // What the writer sees named in the Android print queue.
+        let job_name = filename.rsplit('/').next().unwrap_or(&filename);
+        let job_name = job_name.strip_suffix(".pdf").unwrap_or(job_name);
+        let job_name = if job_name.is_empty() { "OpenDraft" } else { job_name };
+
+        match android_static_call("startPrintJob", &[&path.to_string_lossy(), job_name])? {
+            // startPrintJob reports trouble by returning a message; null is the
+            // print dialog on its way up.
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (filename, contents);
+        Err("This command is only available on Android".to_string())
+    }
+}
+
 #[tauri::command]
 fn android_pick_file() -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -655,6 +832,7 @@ fn android_pick_file() -> Result<(), String> {
             .map_err(|e| format!("Failed to get JVM: {}", e))?;
         let mut env = vm.attach_current_thread()
             .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+        let _exc = ExceptionGuard::new(&env);
         let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
         // Clear any previous picked file URI
@@ -769,6 +947,7 @@ fn android_read_and_clear_companion_field(getter: &str, setter: &str) -> Option<
     let ctx = android_context()?;
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
+    let _exc = ExceptionGuard::new(&env);
 
     let result = env.call_static_method(
         "com/proteus/opendraft/MainActivity",
@@ -1262,13 +1441,14 @@ fn ios_backup_probe(bookmark: String) -> Result<FolderProbe, String> {
 
 // ── Android ───────────────────────────────────────────────────────────────
 
-/// Call one of MainActivity's backup helpers.
+/// Call one of MainActivity's static Kotlin helpers.
 ///
-/// All of them take the Context followed by strings and return a nullable
-/// String, so one helper covers the lot; `None` is the helper's own failure,
-/// which each caller turns into a message in the writer's terms.
+/// They all take the Context followed by strings and return a nullable String,
+/// so one helper covers the lot. What `None` means is the callee's business —
+/// the backup helpers use it for their own failure, `startPrintJob` for
+/// success — so each caller reads it in its own terms.
 #[cfg(target_os = "android")]
-fn android_backup_call(method: &str, args: &[&str]) -> Result<Option<String>, String> {
+fn android_static_call(method: &str, args: &[&str]) -> Result<Option<String>, String> {
     use jni::objects::{JObject, JString, JValue};
     use jni::JavaVM;
 
@@ -1278,6 +1458,7 @@ fn android_backup_call(method: &str, args: &[&str]) -> Result<Option<String>, St
     let mut env = vm
         .attach_current_thread()
         .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+    let _exc = ExceptionGuard::new(&env);
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // Built up front: JValue borrows each string, so they have to outlive the
@@ -1347,6 +1528,7 @@ fn android_pick_backup_folder() -> Result<(), String> {
         let mut env = vm
             .attach_current_thread()
             .map_err(|e| format!("Failed to attach JNI thread: {}", e))?;
+        let _exc = ExceptionGuard::new(&env);
         let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
         // Clear any previous result, so a stale one is never mistaken for this
@@ -1429,7 +1611,7 @@ fn android_backup_write(
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        android_backup_call(
+        android_static_call(
             "backupWriteFile",
             &[&tree_uri, &folder, &filename, &contents],
         )?
@@ -1450,7 +1632,7 @@ fn android_backup_write(
 fn android_backup_list(tree_uri: String) -> Result<Vec<MobileBackupEntry>, String> {
     #[cfg(target_os = "android")]
     {
-        let json = android_backup_call("backupList", &[&tree_uri])?.ok_or_else(|| {
+        let json = android_static_call("backupList", &[&tree_uri])?.ok_or_else(|| {
             "Could not read the backup folder. OpenDraft may have lost permission to it — \
              choose the folder again in Settings."
                 .to_string()
@@ -1468,7 +1650,7 @@ fn android_backup_list(tree_uri: String) -> Result<Vec<MobileBackupEntry>, Strin
 fn android_backup_delete(doc_uri: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        android_backup_call("backupDeleteFile", &[&doc_uri])?
+        android_static_call("backupDeleteFile", &[&doc_uri])?
             .map(|_| ())
             .ok_or_else(|| "Could not delete that backup.".to_string())
     }
@@ -1483,7 +1665,7 @@ fn android_backup_delete(doc_uri: String) -> Result<(), String> {
 fn android_backup_probe(tree_uri: String) -> Result<FolderProbe, String> {
     #[cfg(target_os = "android")]
     {
-        let json = android_backup_call("backupProbeFolder", &[&tree_uri])?
+        let json = android_static_call("backupProbeFolder", &[&tree_uri])?
             .ok_or_else(|| "Could not check the backup folder".to_string())?;
         serde_json::from_str(&json).map_err(|e| format!("Malformed folder probe: {}", e))
     }
@@ -1673,7 +1855,12 @@ struct DirEntryInfo {
 /// mid-listing, a stale handle on a network share) are skipped rather than
 /// failing the whole call — a single bad entry must not make the backup folder
 /// look empty.
-#[tauri::command]
+// The folder commands below run on the async thread pool, not the main thread
+// (`async` in the attribute). They are pointed at network shares — the backup
+// folder, project folders (issue #135) — and a share that has gone away can
+// block a filesystem call for a long time. On the main thread that froze the
+// whole window; off it, the caller's own timeout gets to report the problem.
+#[tauri::command(async)]
 fn list_dir_entries(path: String, extension: Option<String>) -> Result<Vec<DirEntryInfo>, String> {
     let want_ext = extension.map(|e| e.trim_start_matches('.').to_lowercase());
     let read = std::fs::read_dir(&path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
@@ -1711,7 +1898,7 @@ fn list_dir_entries(path: String, extension: Option<String>) -> Result<Vec<DirEn
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ensure_dir(path: String) -> Result<(), String> {
     std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create {}: {}", path, e))
 }
@@ -1719,7 +1906,7 @@ fn ensure_dir(path: String) -> Result<(), String> {
 /// Delete a single file. Refuses directories outright — the pruner runs
 /// unattended against a user-chosen folder, so it must never be able to remove
 /// a directory tree.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_file(path: String) -> Result<(), String> {
     let meta = std::fs::metadata(&path).map_err(|e| format!("Failed to stat {}: {}", path, e))?;
     if meta.is_dir() {
@@ -1736,7 +1923,7 @@ fn delete_file(path: String) -> Result<(), String> {
 /// the rename means a reader sees either the old snapshot or the new one, never
 /// a half-written file. The temp file is created in the same directory so the
 /// rename stays within one filesystem.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_text_atomic(path: String, contents: String) -> Result<(), String> {
     use std::io::Write;
 
@@ -1769,6 +1956,72 @@ fn save_text_atomic(path: String, contents: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a text file off the main thread, for files in a linked project folder.
+/// `read_text_file` stays as it is because of its iOS security-scope fallback.
+#[tauri::command(async)]
+fn read_text_path(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
+}
+
+#[derive(serde::Serialize)]
+struct PathStat {
+    exists: bool,
+    is_dir: bool,
+    size: u64,
+    /// Milliseconds since the Unix epoch; 0 when the platform won't say.
+    modified_ms: u64,
+}
+
+/// Size and modification time of one path, for noticing that a file linked to
+/// a script was changed by something other than OpenDraft (issue #135).
+///
+/// A path that does not exist is data, not an error: a project folder on a
+/// network drive that is offline right now is an everyday state the caller has
+/// to describe, not a failure.
+#[tauri::command(async)]
+fn stat_path(path: String) -> Result<PathStat, String> {
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Ok(PathStat { exists: true, is_dir: meta.is_dir(), size: meta.len(), modified_ms })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PathStat { exists: false, is_dir: false, size: 0, modified_ms: 0 })
+        }
+        Err(e) => Err(format!("Failed to stat {}: {}", path, e)),
+    }
+}
+
+/// Rename a file, used when a script in a folder-linked project is renamed.
+///
+/// Refuses to replace an existing file: the target is in the writer's own
+/// folder, and silently overwriting something of theirs that happens to share
+/// the new name would destroy it. A change of letter case only is allowed,
+/// since on macOS and Windows that "existing file" is the source itself.
+/// Refuses directories for the same reason `delete_file` does.
+#[tauri::command(async)]
+fn rename_path(from: String, to: String) -> Result<(), String> {
+    let src = std::path::Path::new(&from);
+    let dst = std::path::Path::new(&to);
+    let meta = std::fs::metadata(src).map_err(|e| format!("Failed to stat {}: {}", from, e))?;
+    if meta.is_dir() {
+        return Err(format!("Refusing to rename directory {}", from));
+    }
+    let case_only = from != to && from.to_lowercase() == to.to_lowercase();
+    if dst.exists() && !case_only {
+        return Err(format!("A file named {} already exists", to));
+    }
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    }
+    std::fs::rename(src, dst).map_err(|e| format!("Failed to rename {} to {}: {}", from, to, e))
+}
+
 #[derive(serde::Serialize)]
 struct PathProbe {
     exists: bool,
@@ -1784,7 +2037,7 @@ struct PathProbe {
 /// TCC. A missing or unwritable folder is *data*, not an error — the settings
 /// UI needs to describe the problem, so `Err` is reserved for genuinely
 /// unexpected failures.
-#[tauri::command]
+#[tauri::command(async)]
 fn probe_directory(path: String) -> Result<PathProbe, String> {
     let p = std::path::Path::new(&path);
     let meta = match std::fs::metadata(p) {
@@ -1859,10 +2112,40 @@ fn reveal_path(path: String) -> Result<(), String> {
 // The Tauri WebView loads from https://tauri.localhost, so browser fetch() to
 // plain http:// addresses (collab server, local backends) is blocked.
 
+/// Wall-clock budget for a single `http_fetch` call.
+const HTTP_FETCH_TIMEOUT_SECS: u64 = 10;
+
 #[derive(serde::Serialize)]
 struct HttpFetchResponse {
     status: u16,
     body: String,
+}
+
+/// Render a reqwest error with its full `source()` chain.
+///
+/// reqwest's own `Display` stops at the top frame — a DNS failure, a refused
+/// connection, a rejected certificate and a hit timeout all render as the
+/// identical, useless `error sending request for url (...)`. The cause that
+/// actually names the problem lives further down the chain, so walk it.
+fn describe_reqwest_error(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    if err.is_timeout() {
+        parts.push(format!("timed out after {}s", HTTP_FETCH_TIMEOUT_SECS));
+    }
+    if err.is_connect() {
+        parts.push("could not establish a connection".to_string());
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // hyper re-wraps the same string at several levels; skip repeats so the
+        // message stays readable.
+        if !parts.iter().any(|p| p == &text) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
 }
 
 #[tauri::command]
@@ -1872,12 +2155,18 @@ async fn http_fetch(
     body: Option<String>,
     content_type: Option<String>,
     authorization: Option<String>,
+    // Everything other than Content-Type and Authorization. Those two keep
+    // their own parameters so older callers keep working, but anything else the
+    // caller set used to be dropped on the floor here — `X-Device-Id`, which
+    // backend/app/api/auth.py forwards to the collab server so it can name the
+    // device, never arrived from desktop or mobile.
+    headers: Option<std::collections::HashMap<String, String>>,
 ) -> Result<HttpFetchResponse, String> {
     let method_str = method.as_deref().unwrap_or("GET");
     eprintln!("[http_fetch] {} {}", method_str, url);
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(HTTP_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
             eprintln!("[http_fetch] Client build error: {}", e);
@@ -1897,14 +2186,27 @@ async fn http_fetch(
         req = req.header("Authorization", auth.as_str());
     }
 
+    if let Some(extra) = &headers {
+        for (name, value) in extra {
+            // Skip the two that have dedicated parameters so a caller passing
+            // both cannot set a duplicate header.
+            let lower = name.to_ascii_lowercase();
+            if lower == "content-type" || lower == "authorization" {
+                continue;
+            }
+            req = req.header(name.as_str(), value.as_str());
+        }
+    }
+
     if let Some(b) = &body {
         req = req.body(b.clone());
     }
 
     let resp = req.send().await
         .map_err(|e| {
-            eprintln!("[http_fetch] {} {} → FAILED: {}", method_str, url, e);
-            format!("Request to {} failed: {}", url, e)
+            let detail = describe_reqwest_error(&e);
+            eprintln!("[http_fetch] {} {} → FAILED: {}", method_str, url, detail);
+            format!("Request to {} failed: {}", url, detail)
         })?;
 
     let status = resp.status().as_u16();
@@ -2468,8 +2770,68 @@ async fn open_new_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// WebKitGTK renders the window on the GPU, and some Linux drivers can't take it.
+/// Its DMA-BUF renderer leaves a blank window on a range of drivers, and nouveau
+/// (old NVIDIA cards the proprietary driver no longer supports) can lock the GPU
+/// outright, freezing the whole desktop (issue #132). Both are WebKit's own
+/// switches, so a variable the user has already set, `=0` included, is left alone.
+#[cfg(target_os = "linux")]
+fn webkit_env_for_drivers(drivers: &[String]) -> Vec<(&'static str, &'static str)> {
+    let mut vars = vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")];
+    if drivers.iter().any(|d| d == "nouveau") {
+        vars.push(("WEBKIT_DISABLE_COMPOSITING_MODE", "1"));
+    }
+    vars
+}
+
+/// Kernel drivers bound to the machine's DRM cards, e.g. ["nouveau"] or ["i915", "nvidia"].
+#[cfg(target_os = "linux")]
+fn drm_drivers() -> Vec<String> {
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("[gpu] Could not read /sys/class/drm: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut drivers: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            // card0, card1… — not the connectors (card0-HDMI-A-1) or render nodes
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("card") || name.contains('-') {
+                return None;
+            }
+            let target = std::fs::read_link(entry.path().join("device/driver")).ok()?;
+            Some(target.file_name()?.to_string_lossy().into_owned())
+        })
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    drivers
+}
+
+#[cfg(target_os = "linux")]
+fn configure_webkit_rendering() {
+    let drivers = drm_drivers();
+    eprintln!("[gpu] DRM drivers: {:?}", drivers);
+    for (key, value) in webkit_env_for_drivers(&drivers) {
+        match std::env::var_os(key) {
+            Some(existing) => eprintln!("[gpu] {} already set to {:?}, leaving it", key, existing),
+            None => {
+                // Runs first thing in run(), before Tauri or WebKit start any threads.
+                std::env::set_var(key, value);
+                eprintln!("[gpu] Set {}={}", key, value);
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    configure_webkit_rendering();
+
     #[cfg(target_os = "ios")]
     let _ = STARTED_AT.set(std::time::Instant::now());
 
@@ -2481,6 +2843,8 @@ pub fn run() {
         )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         // ── Asset protocol: serve local files for convertFileSrc() URLs ──
         .register_uri_scheme_protocol("asset", |_app, request| {
             let uri = request.uri();
@@ -2520,12 +2884,16 @@ pub fn run() {
             delete_file,
             save_text_atomic,
             probe_directory,
+            stat_path,
+            rename_path,
+            read_text_path,
             reveal_path,
             http_fetch,
             fetch_link_preview,
             get_opened_file,
             read_content_uri,
             read_content_uri_bytes,
+            read_clipboard_html,
             write_content_uri,
             write_content_uri_bytes,
             ios_save_and_share,
@@ -2544,6 +2912,7 @@ pub fn run() {
             ios_backup_probe,
             android_save_and_share,
             android_save_and_share_binary,
+            android_print_pdf,
             android_pick_file,
             android_get_picked_file,
             android_check_new_intent,
@@ -2559,6 +2928,10 @@ pub fn run() {
             focus_window,
             set_window_title,
             open_url,
+            tts::tts_native_voices,
+            tts::tts_native_speak,
+            tts::tts_native_poll,
+            tts::tts_native_stop,
         ]);
 
         // ── Native menu (desktop only) ────────────────────────────────
@@ -2891,4 +3264,32 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod webkit_env_tests {
+    use super::webkit_env_for_drivers;
+
+    fn drivers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dmabuf_renderer_is_always_disabled() {
+        assert_eq!(
+            webkit_env_for_drivers(&drivers(&["i915"])),
+            vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            webkit_env_for_drivers(&[]),
+            vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+    }
+
+    #[test]
+    fn nouveau_also_disables_compositing() {
+        let vars = webkit_env_for_drivers(&drivers(&["i915", "nouveau"]));
+        assert!(vars.contains(&("WEBKIT_DISABLE_COMPOSITING_MODE", "1")));
+        assert!(vars.contains(&("WEBKIT_DISABLE_DMABUF_RENDERER", "1")));
+    }
 }

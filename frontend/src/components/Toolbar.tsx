@@ -22,6 +22,8 @@ import {
   FaHighlighter,
   FaEllipsisV,
   FaHashtag,
+  FaPlus,
+  FaTrashAlt,
 } from 'react-icons/fa';
 import { useEditorStore, NOTE_COLORS } from '../stores/editorStore';
 import type { ElementType } from '../stores/editorStore';
@@ -39,7 +41,11 @@ import type { LockedFormatting } from '../utils/effectiveFormatting';
 import FontPicker from './FontPicker';
 import ColorPicker from './ColorPicker';
 import LanguageSelector from './LanguageSelector';
-import { FONT_REGISTRY, loadFont } from '../utils/fonts';
+import { findFont, loadFontByName } from '../utils/fonts';
+import { isTitlePageRuleId, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
+import { isInAvCell, isInAvRow, avCellSideAt } from '../editor/extensions/AvBlock';
+import { avCellElementRules, scriptBodyElementRules } from '../utils/avCellElements';
+import Select from './Select';
 
 interface ToolbarProps {
   editor: Editor | null;
@@ -116,7 +122,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
       const detectedSize = (attrs.fontSize as string | undefined) || '';
       const effectiveFont = detectedFont || rule?.fontFamily || fontFamily;
       setCursorFont(effectiveFont);
-      if (effectiveFont && !FONT_REGISTRY.find((f) => f.name === effectiveFont)) {
+      if (effectiveFont && !findFont(effectiveFont)) {
         setExtraFonts((prev) => (prev.includes(effectiveFont) ? prev : [...prev, effectiveFont]));
       }
       if (detectedSize) {
@@ -169,7 +175,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
       const single = [...fonts][0] || '';
       const effective = single || rule?.fontFamily || fontFamily;
       setCursorFont(effective);
-      if (effective && !FONT_REGISTRY.find((f) => f.name === effective)) {
+      if (effective && !findFont(effective)) {
         setExtraFonts((prev) => (prev.includes(effective) ? prev : [...prev, effective]));
       }
     }
@@ -209,7 +215,12 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
           for (const mark of node.marks) {
             if (mark.type.name === 'textStyle' && mark.attrs.fontFamily) {
               const f = mark.attrs.fontFamily as string;
-              if (!FONT_REGISTRY.find(r => r.name === f)) {
+              if (findFont(f)) {
+                // A font the app knows: make sure it is actually loaded, so a
+                // script written elsewhere renders in the face it names rather
+                // than only once someone opens the picker.
+                loadFontByName(f);
+              } else {
                 found.add(f);
               }
             }
@@ -236,6 +247,11 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
     //   1. Built-in screenplay element (sceneHeading, action, etc.) — direct setNode
     //   2. Real schema node not in BUILT_IN list (avPara, avShot, avDirection) — also direct setNode
     //   3. Template-declared custom id (sceneCharacters, soundEffect, etc.) — wrap as customElement
+    // "AV Columns" inserts a two-column body rather than restyling the line.
+    if (type === AV_BLOCK_RULE_ID) {
+      editor.chain().focus().insertAvRow('below').run();
+      return;
+    }
     if (BUILT_IN_ELEMENT_IDS.includes(type)) {
       editor.chain().focus().setNode(type).run();
       return;
@@ -254,21 +270,60 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
   };
 
   /** True when the selection is inside an AV cell — used to scope the element dropdown. */
+  const isInTitlePage = isTitlePageRuleId(String(activeElement));
+
+  // The live state, so anything derived from where the caret is re-runs when
+  // the caret (or the document) actually moves. See isInsideAvCell below.
+  const editorState = editor?.state ?? null;
+
+  /**
+   * Keyed on the editor STATE, not on `activeElement`.
+   *
+   * ProseMirror builds a new EditorState for every transaction and reuses it
+   * across plain re-renders, so its identity is exactly the right key: the walk
+   * runs when the document or the selection moved, and not otherwise.
+   *
+   * `activeElement` was the wrong key because it is only ever written from
+   * `onSelectionUpdate`, and a wholesale content replacement — restoring a
+   * session, opening a file — need not fire one: Tiptap raises it only when the
+   * mapped selection differs from the old one. When it did not fire, this memo
+   * held a value computed against a document that no longer existed, and every
+   * control gated on it (the element list, the AV row buttons) was answering
+   * for the wrong place in the wrong script.
+   */
   const isInsideAvCell = React.useMemo(() => {
-    if (!editor) return false;
+    if (!editorState) return false;
     try {
-      const { $from } = editor.state.selection;
-      for (let d = $from.depth; d >= 0; d--) {
-        if ($from.node(d).type.name === 'avCell') return true;
-      }
+      return isInAvCell(editorState);
     } catch { /* ignore */ }
     return false;
-  // Re-evaluate on selection updates
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editor, activeElement]);
+  }, [editorState]);
 
-  /** Element ids valid inside an AV cell (per the avCell schema content rule). */
-  const AV_CELL_ELEMENT_IDS = ['avPara', 'avShot', 'avDirection'];
+  /** Which column the caret is in — the element list differs between them. */
+  const avCellSide = React.useMemo<'video' | 'audio'>(() => {
+    if (!editorState) return 'video';
+    try {
+      return avCellSideAt(editorState) || 'video';
+    } catch { /* ignore */ }
+    return 'video';
+  }, [editorState]);
+
+  /**
+   * The same question one level out, for the row controls.
+   *
+   * A storyboard frame is an atom, so clicking one leaves a NodeSelection on
+   * the frame and no avCell in the ancestry — and the Row buttons disappeared
+   * out from under a writer who had simply clicked the frame in the row they
+   * were working on. The element dropdown above stays on the CELL test, where
+   * it belongs: a selected frame is not text, and has no element type to pick.
+   */
+  const isInsideAvRow = React.useMemo(() => {
+    if (!editorState) return false;
+    try {
+      return isInAvRow(editorState);
+    } catch { /* ignore */ }
+    return false;
+  }, [editorState]);
 
   const isActive = (format: string) => {
     if (!editor) return false;
@@ -315,6 +370,14 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
    * twice.
    */
   const [mobileZoomVisible, setMobileZoomVisible] = useState(false);
+
+  /** Set by the measuring effect below; lets other state changes re-run it. */
+  const remeasureRef = useRef<() => void>(() => {});
+
+  // The AV row group is the one toolbar content that comes and goes with the
+  // cursor rather than with the window, so it is the one the ResizeObserver
+  // below cannot see.
+  useEffect(() => { remeasureRef.current(); }, [isInsideAvRow]);
 
   // Measure toolbar overflow and determine which priority groups to hide
   useEffect(() => {
@@ -379,6 +442,11 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(measure);
     };
+    // The AV row group appears and disappears with the cursor, which changes
+    // the toolbar's contents without changing its width — the ResizeObserver
+    // below would never hear about it, leaving the overflow menu sized for the
+    // other layout.
+    remeasureRef.current = remeasure;
     const ro = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
@@ -395,13 +463,29 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
     // rotating the device, or a Split View divider drag that lands on the same
     // pane width the toolbar already had.  The width-guard above would swallow
     // those, leaving the overflow menu describing the previous layout.
-    const breakpoint = window.matchMedia('(max-width: 768px)');
-    breakpoint.addEventListener('change', remeasure);
+    // Legacy WebKit (Safari < 14, i.e. macOS 10.15 and earlier) ships a
+    // MediaQueryList without addEventListener — only the deprecated
+    // addListener/removeListener pair.  Calling the modern API there throws
+    // during mount and takes the whole app down, so feature-detect both.
+    const breakpoint = window.matchMedia?.('(max-width: 768px)');
+    if (breakpoint) {
+      if (typeof breakpoint.addEventListener === 'function') {
+        breakpoint.addEventListener('change', remeasure);
+      } else if (typeof breakpoint.addListener === 'function') {
+        breakpoint.addListener(remeasure);
+      }
+    }
 
     requestAnimationFrame(measure);
     return () => {
       ro.disconnect();
-      breakpoint.removeEventListener('change', remeasure);
+      if (breakpoint) {
+        if (typeof breakpoint.removeEventListener === 'function') {
+          breakpoint.removeEventListener('change', remeasure);
+        } else if (typeof breakpoint.removeListener === 'function') {
+          breakpoint.removeListener(remeasure);
+        }
+      }
       cancelAnimationFrame(rafId);
     };
   }, []);
@@ -535,10 +619,10 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
         <FontPicker
           value={cursorFont}
           extraFonts={extraFonts}
+          onManageFonts={() => useEditorStore.getState().setFontsDialogOpen(true)}
           onChange={(val) => {
             if (locked.fontFamily) return;
-            const entry = FONT_REGISTRY.find(f => f.name === val);
-            if (entry) loadFont(entry);
+            loadFontByName(val);
             // Picking a font styles the selection — it must not rewrite the
             // document's own font, or every local change would redefine what
             // unstyled text elsewhere renders as (and what this picker reports
@@ -554,7 +638,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
         />
       </div>
       <div className="toolbar-group">
-        <select
+        <Select
           className="font-size-selector"
           value={cursorSize ?? ''}
           disabled={locked.fontSize}
@@ -584,7 +668,7 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
               {s}pt
             </option>
           ))}
-        </select>
+        </Select>
       </div>
     </React.Fragment>
   ), [cursorFont, cursorSize, extraFonts, editor, fontFamily, fontSize, locked]);
@@ -885,7 +969,10 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
   if (toolbarMode === 'hidden') return null;
 
   return (
-    <div className={`toolbar${toolbarMode === 'comfortable' ? ' toolbar-comfortable' : ''}`} ref={toolbarRef}>
+    <div
+      className={`toolbar${toolbarMode === 'comfortable' ? ' toolbar-comfortable' : ''}${isInsideAvRow ? ' toolbar-av' : ''}`}
+      ref={toolbarRef}
+    >
       {/* Undo / Redo — always visible */}
       <div className="toolbar-group">
         <button
@@ -910,23 +997,73 @@ const Toolbar: React.FC<ToolbarProps> = ({ editor }) => {
 
       {/* Element type selector — always visible */}
       <div className="toolbar-group">
-        <select
+        <Select
           className="element-selector"
           value={activeElement}
           onChange={handleElementChange}
+          disabled={isInTitlePage}
+          title={isInTitlePage
+            ? 'Title page elements are set in the Title Page editor; their formatting lives in the template'
+            : 'Element type'}
         >
-          {Object.values(activeTemplate.rules)
-            .filter((r) => r.enabled)
-            // When inside an AV cell, only cell-valid types make sense — selecting
-            // sceneHeading/action/etc. silently fails the schema check anyway.
-            .filter((r) => isInsideAvCell ? AV_CELL_ELEMENT_IDS.includes(r.id) : !AV_CELL_ELEMENT_IDS.includes(r.id))
-            .map((r) => (
-              <option key={r.id} value={r.id} title={ELEMENT_DESCRIPTIONS[r.id]}>
-                {r.label}
-              </option>
-            ))}
-        </select>
+          {/* The title page's fields have template rules but are not things a
+              paragraph converts into, so they never appear here — only as the
+              read-only label below when the cursor is actually in one. */}
+          {isInTitlePage && (
+            <option value={activeElement}>
+              {activeTemplate.rules[activeElement]?.label || 'Title Page'}
+            </option>
+          )}
+          {/*
+            Inside an AV cell the list is resolved by utils/avCellElements.ts:
+            the four AV paragraph types always, plus whatever the template
+            admits to THIS column. The four are unconditional on purpose —
+            `avCell` holds them in every document whatever template is active,
+            and reading the list off the template alone left the dropdown empty
+            (and the body uneditable) for an AV body under a screenplay template
+            and for an AV document whose template did not come back with it,
+            such as a restored session. Outside a cell, the template is the
+            authority as before.
+          */}
+          {(isInsideAvCell
+            ? avCellElementRules(activeTemplate, avCellSide, String(activeElement))
+            : scriptBodyElementRules(activeTemplate, isTitlePageRuleId)
+          ).map((r) => (
+            <option key={r.id} value={r.id} title={ELEMENT_DESCRIPTIONS[r.id]}>
+              {r.label}
+            </option>
+          ))}
+        </Select>
       </div>
+
+      {/* AV row controls — the only route to a new row without a hardware
+          keyboard (issue #116), so they are never collapsed into the overflow
+          menu and never hidden on mobile. Shown only inside an AV cell, where
+          they are the actions the writer actually needs. */}
+      {isInsideAvRow && (
+        <>
+          <div className="toolbar-separator" />
+          <div className="toolbar-group av-row-group">
+            <button
+              className="toolbar-btn av-row-btn av-row-btn-add"
+              title="Add AV Row below (Tab from the audio cell, or ⌘↵)"
+              onClick={() => editor?.chain().focus().insertAvRow('below').run()}
+              disabled={!editor}
+            >
+              <FaPlus />
+              <span className="toolbar-btn-label">Row</span>
+            </button>
+            <button
+              className="toolbar-btn av-row-btn av-row-btn-delete"
+              title="Delete this AV Row"
+              onClick={() => editor?.chain().focus().deleteAvRow().run()}
+              disabled={!editor}
+            >
+              <FaTrashAlt />
+            </button>
+          </div>
+        </>
+      )}
 
       <div className="toolbar-separator" />
 

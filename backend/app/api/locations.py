@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services import location_service, script_service
+from app.services import location_service, project_service, script_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -42,6 +42,8 @@ class LocationUpdate(BaseModel):
 async def list_locations(project_id: str):
     try:
         return {"locations": location_service.list_locations(project_id)}
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -60,6 +62,8 @@ async def create_location(project_id: str, body: LocationCreate):
 async def get_location(project_id: str, loc_id: str):
     try:
         return location_service.get_location(project_id, loc_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -69,6 +73,8 @@ async def update_location(project_id: str, loc_id: str, body: LocationUpdate):
     try:
         payload = {k: v for k, v in body.model_dump().items() if v is not None}
         return location_service.update_location(project_id, loc_id, payload)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -78,6 +84,8 @@ async def delete_location(project_id: str, loc_id: str):
     try:
         location_service.delete_location(project_id, loc_id)
         return {"message": "ok"}
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -95,5 +103,7 @@ async def discover_locations(project_id: str):
             except FileNotFoundError:
                 continue
         return location_service.discover_locations(project_id, contents)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

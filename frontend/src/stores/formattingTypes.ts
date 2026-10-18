@@ -6,6 +6,35 @@ import type { PageLayout } from './editorStore';
 
 
 
+/**
+ * Where an element may be used inside an AV two-column body.
+ *
+ * The schema accepts every screenplay element in either cell — see
+ * `AV_CELL_ELEMENT_IDS` in editor/extensions/AvBlock.ts — so this is a
+ * *template* decision, not a structural one: it says which elements the
+ * writer is OFFERED in a cell, and on which side.
+ *
+ * Splitting by side is how the two-column format is actually written, and how
+ * WriterDuet's A/V template works: shots and staging go in the visual column,
+ * the people talking go in the audio column. A template that wants neither
+ * distinction uses 'both'.
+ *
+ * 'none' is the default, and is what every element in a plain screenplay
+ * template has: an AV body inserted into a screenplay falls back to the four
+ * built-in AV paragraph types, exactly as before this field existed.
+ */
+export type AvCellPlacement = 'none' | 'video' | 'audio' | 'both';
+
+/**
+ * The pseudo-element id for "a two-column AV body".
+ *
+ * It carries a rule like any other element so a template — and the Template
+ * Editor's enable checkbox — decides whether the element menu offers it. It is
+ * NOT a paragraph type: picking it inserts an `avBlock`, and its typography
+ * fields are ignored (an AV body is a table; its cells carry the formatting).
+ */
+export const AV_BLOCK_RULE_ID = 'avBlock';
+
 /** Formatting rules for a single element type within a template. */
 export interface FormattingElementRule {
   /** For built-in: same as ElementType key; for custom: UUID */
@@ -47,6 +76,37 @@ export interface FormattingElementRule {
   /** When true (default), users can override non-template formatting in enforce mode.
    *  When false, ALL formatting is locked for this element type in enforce mode. */
   allowFormatOverride: boolean;
+
+  // ── AV two-column body ──
+  /** Which AV cell (if any) offers this element. Absent is read as 'none'. */
+  avCell?: AvCellPlacement;
+
+  // ── Element numbering ──
+  /** Running numbers printed beside this element (utils/elementNumbers.ts).
+   *  Absent — every template saved before numbering existed — is not numbered. */
+  numbering?: ElementNumbering;
+}
+
+/**
+ * Running numbers on an element other than the scene heading: every line of
+ * dialogue in a podcast, every SFX cue, every shot.
+ *
+ * Each numbered element keeps its own count. `resetOn` names the elements that
+ * start it again — a Scene Heading, a New Act, a custom element — and only
+ * elements: a page break falls in different places on screen, in the PDF and
+ * in Word, so a count reset by one would number the same line differently in
+ * each.
+ */
+export interface ElementNumbering {
+  enabled: boolean;
+  /** Element ids (custom ones included) that restart the count. Empty: it never restarts. */
+  resetOn: string[];
+  /** Printed before the number: "SFX " gives "SFX 4". */
+  prefix?: string;
+  /** The first number after a restart. Default 1. */
+  startAt?: number;
+  /** 'scene' prefixes the scene's number: 12.3. Falls back to plain where there is none. */
+  style?: 'plain' | 'scene';
 }
 
 /** Template category: system templates are read-only, user templates are editable. */
@@ -119,6 +179,13 @@ export const ELEMENT_DESCRIPTIONS: Record<string, string> = {
   parenthetical: 'A short direction to the actor, in brackets inside a dialogue block.',
   transition: 'How the film moves to the next scene — CUT TO:, DISSOLVE TO:.',
   sceneHeading: 'Where and when a scene takes place — INT./EXT., location, time of day.',
+  section:
+    'An outline heading, from Fountain\u2019s # Section. Structure only: it shows in the '
+    + 'navigator but never on the printed page. Use New Act for an act break a reader should see.',
+  note: 'An aside to yourself, kept in the file and left off the printed page.',
+  [AV_BLOCK_RULE_ID]:
+    'A two-column Audio/Video body — Video on the left, Audio on the right, one row per shot. '
+    + 'Used for commercials, corporate video and documentary.',
 };
 
 /** The 13 built-in element type ids (matches ElementType union). */
@@ -136,6 +203,8 @@ export const BUILT_IN_ELEMENT_IDS: readonly string[] = [
   'lyrics',
   'showEpisode',
   'castList',
+  'section',
+  'note',
 ] as const;
 
 /**
@@ -156,6 +225,8 @@ export const ELEMENT_CSS_CLASS: Record<string, string> = {
   lyrics: 'lyrics',
   showEpisode: 'show-episode',
   castList: 'cast-list',
+  section: 'section',
+  note: 'note',
 };
 
 /** Sentinel ID for the industry standard template (never stored in DB). */
@@ -189,5 +260,63 @@ export function createDefaultRule(
     nextOnTab: null,
     placeholder: '',
     allowFormatOverride: true,
+    avCell: 'none',
   };
 }
+
+// ── Title page elements ─────────────────────────────────────────────────────
+
+/**
+ * The title page's own elements, and why they are element types here at all.
+ *
+ * Final Draft does not give them any: inside a `.fdx` every title-page line is
+ * `<Paragraph Type="General">`, positioned by alignment alone, which is why a
+ * title page imported from one arrives as a run of General paragraphs. Fountain
+ * goes the other way and names them — `Title:`, `Credit:`, `Author:`,
+ * `Source:`, `Draft date:`, `Contact:`, `Copyright:`, `Notes:` — but only as
+ * document metadata, with no formatting attached.
+ *
+ * OpenDraft already stores the semantic name on the node (`titlePage` with a
+ * `field` attribute), so it has what Fountain has; what it lacked was any way
+ * to say how each one should look. These ids give every field a template rule
+ * of its own, so a writer can set the title in a display face at 24pt and leave
+ * the contact block in Courier.
+ *
+ * The `titlePage:` prefix keeps them out of the element ids a document node can
+ * take, so they can never be confused with a body element, and makes them easy
+ * to keep out of the "change this paragraph to…" menus — a line of action is
+ * not something you convert into a copyright notice.
+ */
+export const TITLE_PAGE_RULE_PREFIX = 'titlePage:';
+
+/** Rule id for a title-page field, e.g. `title` → `titlePage:title`. */
+export function titlePageRuleId(field: string): string {
+  return `${TITLE_PAGE_RULE_PREFIX}${field}`;
+}
+
+/** The field name back out of a rule id, or null if it isn't one. */
+export function titlePageFieldOf(ruleId: string): string | null {
+  return ruleId.startsWith(TITLE_PAGE_RULE_PREFIX)
+    ? ruleId.slice(TITLE_PAGE_RULE_PREFIX.length)
+    : null;
+}
+
+export function isTitlePageRuleId(ruleId: string): boolean {
+  return ruleId.startsWith(TITLE_PAGE_RULE_PREFIX);
+}
+
+/**
+ * The fields a title page is built from, in the order they appear on the page.
+ *
+ * `date` carries the notes block — the name is what `buildTitlePageBlocks` has
+ * always written, and renaming it would orphan every saved document, so the
+ * label carries the truth instead.
+ */
+export const TITLE_PAGE_ELEMENTS: { field: string; label: string }[] = [
+  { field: 'title', label: 'Title Page — Title' },
+  { field: 'author', label: 'Title Page — Credit & Author' },
+  { field: 'draft', label: 'Title Page — Draft & Date' },
+  { field: 'contact', label: 'Title Page — Contact' },
+  { field: 'copyright', label: 'Title Page — Copyright' },
+  { field: 'date', label: 'Title Page — Notes' },
+];

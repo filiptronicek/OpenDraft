@@ -37,6 +37,7 @@ import type {
   CollabSession,
   LinkPreview,
 } from './api';
+import { looksLikeTreatment, normalizeFormat } from '../utils/scriptFormat';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -109,37 +110,50 @@ function getCollabApiBase(): string {
 }
 
 /**
- * Make an authenticated request to the collab server.
- * Uses platformFetch to bypass WebView mixed-content restrictions on Tauri.
+ * Make an authenticated request to the collab server. authedFetch uses the
+ * Tauri-safe transport, limits credentials to trusted configured origins, and
+ * transparently rotates an expired access token before retrying once.
  */
 async function collabRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const { platformFetch } = await import('./platform');
+  // authedFetch attaches the access token (the collab server requires it for
+  // write operations) and renews it on 401 — access tokens last minutes, so
+  // an expired one is routine and must not sign the user out.
+  const { authedFetch, sessionSurvivesUnauthorized } = await import('./authedFetch');
   const { useSettingsStore } = await import('../stores/settingsStore');
   const base = getCollabApiBase();
   const url = `${base}${path}`;
 
-  // Include auth token if available (collab server requires it for write operations)
-  const { collabAuth } = useSettingsStore.getState();
-  const authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (collabAuth.accessToken) {
-    authHeaders['Authorization'] = `Bearer ${collabAuth.accessToken}`;
-  }
-
   console.log(`[collabRequest] ${options?.method || 'GET'} ${url}`);
-  const res = await platformFetch(url, {
+  const res = await authedFetch(url, {
     ...options,
-    headers: { ...authHeaders, ...options?.headers },
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
     console.error(`[collabRequest] ${url} → ${res.status}: ${detail}`);
-    // Clear stale auth on 401 so the UI prompts for re-login
-    if (res.status === 401) {
+    // Clear stale auth on 401 so the UI prompts for re-login — unless the
+    // refresh failed for a transient reason and the session is still good.
+    if (res.status === 401 && !sessionSurvivesUnauthorized()) {
       useSettingsStore.getState().clearCollabAuth();
     }
     throw new Error(`Collab API error ${res.status}: ${detail}`);
   }
   return res.json();
+}
+
+/**
+ * Run one of the linked-file hooks (issue #135) without letting it fail the
+ * write that triggered it. The library copy is already safe by the time these
+ * run; a file that could not be written is recorded as pending by the hook.
+ */
+async function linkedFileHook(run: (lf: typeof import('./linkedFiles')) => Promise<void>): Promise<void> {
+  try {
+    const lf = await import('./linkedFiles');
+    if (!lf.linkingSupported()) return;
+    await run(lf);
+  } catch (err) {
+    console.error('[local-storage] linked-file update failed:', err);
+  }
 }
 
 // ── Public factory ───────────────────────────────────────────────────────────
@@ -222,6 +236,7 @@ export async function createLocalStorage() {
       await db.execute('DELETE FROM version_commits WHERE project_id = $1', [id]);
       await db.execute('DELETE FROM assets WHERE project_id = $1', [id]);
       await db.execute('DELETE FROM projects WHERE id = $1', [id]);
+      await linkedFileHook((lf) => lf.afterProjectDeleted(id));
       return { message: 'deleted' };
     },
 
@@ -242,7 +257,7 @@ export async function createLocalStorage() {
     async listScripts(projectId: string): Promise<ScriptMeta[]> {
       const rows = await db.select<any[]>(
         `SELECT id, project_id, title, page_count, size_bytes, created_at, updated_at,
-                color, pinned, sort_order
+                color, pinned, sort_order, format
          FROM scripts WHERE project_id = $1 ORDER BY created_at`,
         [projectId],
       );
@@ -251,15 +266,16 @@ export async function createLocalStorage() {
 
     async createScript(
       projectId: string,
-      data: { title: string; content?: any },
+      data: { title: string; content?: Record<string, unknown>; format?: string; skipFileSync?: boolean },
     ): Promise<ScriptResponse> {
       const id = uuid();
       const ts = now();
       const contentStr = data.content ? JSON.stringify(data.content) : null;
       const sizeBytes = contentStr ? new Blob([contentStr]).size : 0;
+      const format = normalizeFormat(data.format);
       await db.execute(
-        'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)',
-        [id, projectId, data.title, sizeBytes, ts, ts],
+        'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at, format) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [id, projectId, data.title, sizeBytes, ts, ts, format],
       );
       if (contentStr) {
         await db.execute(
@@ -268,9 +284,14 @@ export async function createLocalStorage() {
         );
       }
       await db.execute('UPDATE projects SET updated_at = $1 WHERE id = $2', [ts, projectId]);
+      if (!data.skipFileSync) {
+        await linkedFileHook((lf) => lf.afterScriptCreated(projectId, {
+          id, title: data.title, format, content: data.content ?? null,
+        }));
+      }
       return {
         meta: {
-          id, title: data.title, author: '', format: 'screenplay',
+          id, title: data.title, author: '', format,
           created_at: ts, updated_at: ts, page_count: 0, size_bytes: sizeBytes,
           color: '', pinned: false, sort_order: 0, preview: '',
         },
@@ -297,7 +318,7 @@ export async function createLocalStorage() {
     async saveScript(
       projectId: string,
       scriptId: string,
-      data: { title?: string; content?: Record<string, unknown>; color?: string; pinned?: boolean; sort_order?: number; allowEmptyBody?: boolean },
+      data: { title?: string; content?: Record<string, unknown>; color?: string; pinned?: boolean; sort_order?: number; allowEmptyBody?: boolean; skipFileSync?: boolean },
     ): Promise<ScriptResponse> {
       const existing = await storage.getScript(projectId, scriptId);
       const title = data.title ?? existing.meta.title;
@@ -366,10 +387,20 @@ export async function createLocalStorage() {
 
       await db.execute('UPDATE projects SET updated_at = $1 WHERE id = $2', [ts, projectId]);
 
-      return {
-        meta: { ...existing.meta, title, size_bytes: sizeBytes, updated_at: ts, color, pinned, sort_order },
-        content,
-      };
+      const meta = { ...existing.meta, title, size_bytes: sizeBytes, updated_at: ts, color, pinned, sort_order };
+      // A pin or a colour is library-only; the file hears about the text and
+      // the title (which names the file in a project folder).
+      if (!data.skipFileSync && (data.content !== undefined || title !== existing.meta.title)) {
+        await linkedFileHook((lf) => lf.afterScriptSaved(projectId, scriptId, {
+          title,
+          titleChanged: title !== existing.meta.title,
+          contentChanged: data.content !== undefined,
+          content: content as Record<string, unknown> | null,
+          meta,
+        }));
+      }
+
+      return { meta, content };
     },
 
     async deleteScript(
@@ -379,6 +410,7 @@ export async function createLocalStorage() {
       await db.execute('DELETE FROM script_content WHERE script_id = $1', [scriptId]);
       await db.execute('DELETE FROM scripts WHERE id = $1 AND project_id = $2', [scriptId, projectId]);
       await db.execute('UPDATE projects SET updated_at = $1 WHERE id = $2', [now(), projectId]);
+      await linkedFileHook((lf) => lf.afterScriptDeleted(projectId, scriptId));
       return { message: 'deleted' };
     },
 
@@ -407,8 +439,8 @@ export async function createLocalStorage() {
       const title = `${original.meta.title} (Copy)`;
 
       await db.execute(
-        'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)',
-        [id, projectId, title, sizeBytes, ts, ts],
+        'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at, format) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [id, projectId, title, sizeBytes, ts, ts, normalizeFormat(original.meta.format)],
       );
       if (contentStr) {
         await db.execute(
@@ -417,6 +449,10 @@ export async function createLocalStorage() {
         );
       }
       await db.execute('UPDATE projects SET updated_at = $1 WHERE id = $2', [ts, projectId]);
+      await linkedFileHook((lf) => lf.afterScriptCreated(projectId, {
+        id, title, format: normalizeFormat(original.meta.format),
+        content: (original.content as Record<string, unknown> | null) ?? null,
+      }));
 
       return {
         meta: {
@@ -573,7 +609,8 @@ export async function createLocalStorage() {
 
       return {
         meta: {
-          id: found.script_id, title: found.title, author: '', format: 'screenplay',
+          id: found.script_id, title: found.title, author: '',
+          format: looksLikeTreatment(content) ? 'treatment' : 'screenplay',
           created_at: '', updated_at: '', page_count: 0, size_bytes: 0,
           color: '', pinned: false, sort_order: 0, preview: '',
         },
@@ -596,6 +633,13 @@ export async function createLocalStorage() {
       const versionScripts = await storage._resolveVersionScripts(hash);
       const ts = now();
 
+      // Versions record no format; keep each script's own across the restore.
+      const formatRows = await db.select<Array<{ id: string; format: string | null }>>(
+        'SELECT id, format FROM scripts WHERE project_id = $1',
+        [projectId],
+      );
+      const formats = new Map(formatRows.map((r) => [r.id, r.format]));
+
       // Delete current scripts and content
       await db.execute(
         'DELETE FROM script_content WHERE script_id IN (SELECT id FROM scripts WHERE project_id = $1)',
@@ -606,9 +650,13 @@ export async function createLocalStorage() {
       // Re-insert from version
       for (const s of versionScripts) {
         const sizeBytes = s.content ? new Blob([s.content]).size : 0;
+        let format = formats.get(s.script_id);
+        if (!format && s.content) {
+          try { format = looksLikeTreatment(JSON.parse(s.content)) ? 'treatment' : null; } catch { /* keep default */ }
+        }
         await db.execute(
-          'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)',
-          [s.script_id, projectId, s.title, sizeBytes, ts, ts],
+          'INSERT INTO scripts (id, project_id, title, size_bytes, created_at, updated_at, format) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [s.script_id, projectId, s.title, sizeBytes, ts, ts, normalizeFormat(format)],
         );
         if (s.content) {
           await db.execute(
@@ -619,6 +667,7 @@ export async function createLocalStorage() {
       }
 
       await db.execute('UPDATE projects SET updated_at = $1 WHERE id = $2', [ts, projectId]);
+      await linkedFileHook((lf) => lf.afterVersionRestored(projectId));
 
       return {
         hash,
@@ -707,7 +756,6 @@ export async function createLocalStorage() {
       collaboratorName: string,
       role: string = 'editor',
       expiresInHours: number = 1,
-      sessionNonce: string = '',
     ): Promise<CollabSession> {
       return collabRequest<CollabSession>('/api/collab/invite', {
         method: 'POST',
@@ -717,13 +765,15 @@ export async function createLocalStorage() {
           collaborator_name: collaboratorName,
           role,
           expires_in_hours: expiresInHours,
-          session_nonce: sessionNonce,
         }),
       });
     },
 
     async validateCollabSession(token: string): Promise<CollabSession> {
-      return collabRequest<CollabSession>(`/api/collab/session/${token}`);
+      return collabRequest<CollabSession>('/api/collab/session/validate', {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      });
     },
 
     async listCollabSessions(projectId: string, scriptId: string): Promise<CollabSession[]> {
@@ -731,7 +781,10 @@ export async function createLocalStorage() {
     },
 
     async revokeCollabSession(token: string): Promise<{ message: string }> {
-      return collabRequest<{ message: string }>(`/api/collab/session/${token}`, { method: 'DELETE' });
+      return collabRequest<{ message: string }>('/api/collab/session', {
+        method: 'DELETE',
+        body: JSON.stringify({ token }),
+      });
     },
 
     async revokeAllCollabSessions(projectId: string, scriptId: string): Promise<{ message: string }> {
@@ -991,7 +1044,7 @@ function rowToScriptMeta(r: any): ScriptMeta {
     id: r.id,
     title: r.title,
     author: '',
-    format: 'screenplay',
+    format: normalizeFormat(r.format),
     created_at: r.created_at,
     updated_at: r.updated_at,
     page_count: r.page_count ?? 0,

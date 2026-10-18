@@ -3,8 +3,13 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App.tsx';
 import { initStorage } from './services/api';
+import { initScratchAssets } from './services/scratchAssets';
+import { scheduleScratchSweep } from './services/scratchSweep';
 import { initDemoInfo } from './services/demoInfo';
 import { getOS, isTauri } from './services/platform';
+import { initCustomFonts } from './services/customFonts';
+import { detectDeviceFonts } from './utils/deviceFonts';
+import { applyAppearance, applyNativeTheme, readAppearance } from './utils/appearance';
 
 /**
  * Keep the `ios-windowed` class in sync with whether the app is running in an
@@ -18,21 +23,44 @@ import { getOS, isTauri } from './services/platform';
  * only where it is needed.
  *
  * iPadOS exposes no "am I in a window" API, so infer it from geometry: a
- * full-screen app spans the screen in one axis or the other, while Split View,
- * Slide Over and a free-floating window never do.
+ * full-screen app fills the screen in BOTH axes, while Split View, Slide Over
+ * and a free-floating window never do.
+ *
+ * Matching on width alone was not enough. A window dragged out to the full
+ * width of the screen but left short of its height is still a window, still
+ * carries the pill, and was being read as full-screen — so the gutter
+ * collapsed and the control landed on top of the File menu. Both axes have to
+ * span before the app can conclude there is no window frame around it.
+ *
+ * iPhone never has a window frame, so it is excluded outright: a hair of
+ * measurement noise there would otherwise indent the menu bar for a control
+ * that does not exist.
  */
 function trackIpadWindowMode(): void {
   const TOLERANCE_PX = 2;
 
   const isWindowed = (): boolean => {
+    // iPadOS reports a desktop-class UA, so an iPad is told from a Mac by its
+    // touch points, and from an iPhone by name.
+    const ua = navigator.userAgent || '';
+    const isIpad = /ipad/i.test(ua)
+      || (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+    if (!isIpad) return false;
+
     const screenW = window.screen?.width || 0;
     const screenH = window.screen?.height || 0;
     // No screen metrics to compare against — assume full-screen rather than
-    // indenting the menu bar on every iPhone for a control that is not there.
+    // indenting the menu bar for a control that may not be there.
     if (!screenW || !screenH) return false;
+
+    const near = (a: number, b: number) => Math.abs(a - b) <= TOLERANCE_PX;
+    const long = Math.max(screenW, screenH);
+    const short = Math.min(screenW, screenH);
     const w = window.innerWidth;
-    const spansScreen =
-      Math.abs(w - screenW) <= TOLERANCE_PX || Math.abs(w - screenH) <= TOLERANCE_PX;
+    const h = window.innerHeight;
+    // Either orientation, but the window has to fill the screen in both axes.
+    const spansScreen = (near(w, long) && near(h, short))
+      || (near(w, short) && near(h, long));
     return !spansScreen;
   };
 
@@ -46,9 +74,10 @@ function trackIpadWindowMode(): void {
 }
 
 async function init() {
-  // Apply saved theme before first render to avoid flash
-  const savedTheme = localStorage.getItem('opendraft:theme') || 'dark';
-  document.documentElement.setAttribute('data-theme', savedTheme);
+  // Apply the remembered appearance before first render to avoid a flash.
+  applyAppearance(readAppearance());
+  // Not awaited: the native popups only need it by the time one is opened.
+  void applyNativeTheme(readAppearance());
 
   // Platform class for the safe-area rules in screenplay.css.  viewport-fit
   // now lives in the static meta tag in index.html — patching it here ran too
@@ -83,9 +112,39 @@ async function init() {
   // no additional wrapping needed here.
   await initStorage();
 
+  // Where images go for a document that has no project yet, so the bytes never
+  // sit inside the document (and never inside a recovery snapshot). Awaited:
+  // once it resolves, image URLs resolve synchronously on Tauri.
+  await initScratchAssets();
+  // Housekeeping for images left behind by abandoned documents. Deliberately
+  // late and idle — a delayed sweep costs disk, a hasty one costs a picture.
+  scheduleScratchSweep();
+
+  // Bring back the writer's own TTF/OTF fonts, and work out which of the
+  // registry's system faces this machine actually has, before the first
+  // document renders — otherwise a script written in an installed font shows
+  // Courier for a frame. Neither can stop the app starting.
+  initCustomFonts().catch((err) => console.warn('[fonts] custom fonts unavailable:', err));
+
+  // Measuring a few hundred families is a few hundred canvas calls on the main
+  // thread — nothing next to a document, but no reason to make first paint wait
+  // for it either.
+  const findDeviceFonts = () => {
+    try {
+      detectDeviceFonts();
+    } catch (err) {
+      console.warn('[fonts] device font detection failed:', err);
+    }
+  };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(findDeviceFonts, { timeout: 4000 });
+  else setTimeout(findDeviceFonts, 1200);
+
   // Fetch the backend's demo-mode flag once so CollabLoginDialog/SettingsPage
   // can decide whether to show demo warnings. Non-blocking best-effort.
-  initDemoInfo().catch(() => {});
+  // Browser only: the apps keep scripts in local SQLite and need no server at
+  // launch, so this would be a request to open-draft.com on every start (and a
+  // 10 s timeout offline). Both dialogs fetch the flag themselves when opened.
+  if (!isTauri()) initDemoInfo().catch(() => {});
 
   // Set initial native window title on desktop (for macOS Window menu)
   import('./services/platform').then(({ isDesktopTauri }) => {
@@ -99,6 +158,13 @@ async function init() {
   if ((window as any)._renderTimeout) clearTimeout((window as any)._renderTimeout);
   const fatalOverlay = document.getElementById('_fatal');
   if (fatalOverlay) fatalOverlay.remove();
+
+  // Retire the "OpenDraft failed to start" overlay for the rest of the
+  // session: from here on a stray error or rejection is a fault inside a
+  // running app, and a full-screen overlay with no way out of it would strand
+  // the writer in their document (issue #97). See the flag's note in
+  // index.html.
+  (window as any).__odBooted = true;
 
   createRoot(document.getElementById('root')!).render(
     <StrictMode>

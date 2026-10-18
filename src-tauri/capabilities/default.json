@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "core:window:allow-destroy",
+    "core:window:allow-set-theme",
+    "core:webview:allow-print",
     "sql:default",
     "sql:allow-load",
     "sql:allow-execute",
@@ -28,6 +30,13 @@
     },
     "dialog:default",
     "dialog:allow-confirm",
-    "dialog:allow-ask"
+    "dialog:allow-ask",
+    "opener:allow-open-url",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$APPDATA/**" }]
+    },
+    "opener:allow-default-urls",
+    "clipboard-manager:allow-read-text"
   ]
 }

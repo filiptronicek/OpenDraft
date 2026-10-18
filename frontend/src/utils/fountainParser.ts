@@ -1,6 +1,10 @@
 // Fountain markup format parser
 // Spec: https://fountain.io/syntax
 import { buildTitlePageBlocks, type TitlePageFields } from './titlePageBlocks';
+import { clampSectionLevel } from '../editor/extensions/Section';
+import { isNonPrintingType } from './nonPrinting';
+import { parseFountainRevisionNote } from './revisionExport';
+import { REVISABLE_BLOCK_TYPES } from '../editor/extensions/RevisionMark';
 
 interface TipTapMark {
   type: string;
@@ -26,15 +30,26 @@ interface TipTapNode {
  */
 const TITLE_PAGE_KEYS: Record<string, string> = {
   title: 'tpTitle',
-  credit: 'tpBasedOn',
+  // `Credit:` is the label above the author — "Written by", "Screenplay by".
+  // It was mapped to "based on", which put it on the line *below* the author
+  // and left the hard-coded "Written by" above it, so `Credit: Written by` plus
+  // `Author: Alex Example` came out as "Written by Alex Example / Written by"
+  // (issue #87). `Source:` is the field that means "based on".
+  credit: 'tpCredit',
   author: 'tpWrittenBy',
   authors: 'tpWrittenBy',
   'written by': 'tpWrittenBy',
   source: 'tpBasedOn',
   'draft date': 'tpDraftDate',
+  // Fountain writers use `Date:` for the draft date as often as `Draft date:`.
+  date: 'tpDraftDate',
+  draft: 'tpDraft',
   contact: 'tpContact',
   copyright: 'tpCopyright',
   notes: 'tpNotes',
+  // Not a key in the spec's list, but the format is open key/value and this is
+  // what `exportFountain` writes, so OpenDraft can read its own file back.
+  'wga registration': 'tpWgaRegistration',
 };
 
 /**
@@ -87,8 +102,200 @@ function parseTitlePage(lines: string[]): { next: number; nodes: TipTapNode[] } 
   return { next: i, nodes: blocks };
 }
 
+/**
+ * Every separator a line of text can arrive with, other than the plain `\n`
+ * this parser works in.
+ *
+ * Splitting on `\n` alone is only safe for text that was written to a file by
+ * something that agrees on newlines. Text off a clipboard is not: pasting from
+ * an iPad (and from older editors on any platform) can arrive with lone
+ * carriage returns, and rich text converted to plain text carries Unicode's
+ * own line (U+2028) and paragraph (U+2029) separators. None of those split,
+ * so the whole paste stayed one line — and one line of a screenplay, whatever
+ * it says, parses as a single Action block. That is what "Paste as Fountain
+ * inserts everything as Action" looked like from the outside.
+ */
+const LINE_SEPARATORS = /\r\n?|\u2028|\u2029|\u0085/g;
+
+/**
+ * Split text into lines, whichever separator convention it arrived with.
+ *
+ * The commented-out boneyard goes first and multi-line notes are folded onto a
+ * single line, both before anything is split — each can span lines, and every
+ * other rule in this parser reads one line at a time.
+ */
+function splitLines(text: string): string[] {
+  const normalised = text.replace(/^\uFEFF/, '').replace(LINE_SEPARATORS, '\n');
+  return foldNotes(stripBoneyard(normalised)).split('\n');
+}
+
+/**
+ * Remove the boneyard: everything between a `/*` marker and its closing
+ * counterpart, which the spec defines as text that is commented out and "will
+ * not be included" in the script.
+ *
+ * The newlines the comment spanned are kept. Deleting them outright would pull
+ * whatever followed the closing marker up onto the line before it, so a
+ * boneyard placed between a scene heading and its action would silently weld
+ * the two into one line. What is commented out disappears; what is not keeps
+ * its own line.
+ *
+ * An unterminated `/*` matches nothing and is left as literal text, rather than
+ * swallowing the rest of the script.
+ */
+function stripBoneyard(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ''));
+}
+
+/**
+ * A Fountain note: `[[ … ]]`, which the spec says stays in the file but not in
+ * the printed script.
+ */
+const NOTE_PATTERN = /\[\[([\s\S]*?)\]\]/g;
+
+/**
+ * Fold a note that runs over several lines onto one.
+ *
+ * The spec allows a note to span lines, but every other rule here reads one
+ * line at a time — so an unfolded note left its opening `[[` on a line of its
+ * own, which then parsed as Action, and its closing `]]` on another. Only the
+ * newlines *inside* the brackets are collapsed; the line the note sits on is
+ * otherwise untouched.
+ */
+function foldNotes(text: string): string {
+  return text.replace(NOTE_PATTERN, (note) => note.replace(/\s*\n\s*/g, ' '));
+}
+
+/**
+ * Split a line into the text that remains once its notes are removed, and the
+ * notes themselves.
+ *
+ * Notes are not printed, so they cannot stay in the line — left in place the
+ * brackets came through as literal characters in the middle of a scene. They
+ * are not thrown away either: each becomes a `note` block of its own, emitted
+ * straight after the element it annotated, which is where the writer put it.
+ */
+function extractNotes(line: string): { text: string; notes: string[] } {
+  const notes: string[] = [];
+  const text = line.replace(NOTE_PATTERN, (_, body: string) => {
+    const note = body.trim();
+    if (note !== '') notes.push(note);
+    return '';
+  });
+  return { text, notes };
+}
+
+/** Section heading: one or more leading hashes, e.g. `# ACT ONE`, `## Sequence`. */
+const SECTION_PATTERN = /^(#+)\s*(.*)$/;
+
+/**
+ * A synopsis line: a leading `=` that is not the start of a `===` page break.
+ *
+ * Two equals signs are neither, and stay Action rather than becoming a synopsis
+ * whose text is a stray `=`.
+ */
+const SYNOPSIS_PATTERN = /^=(?!=)\s*(.*)$/;
+
+/** The elements a synopsis can be filed under. */
+const SYNOPSIS_TARGETS = new Set(['sceneHeading', 'section']);
+
+/**
+ * Lines with their notes lifted out, and the notes keyed by the line they came
+ * from. `-1` holds any note that appeared before the first line of content.
+ */
+interface PreparedLines {
+  lines: string[];
+  notes: Map<number, string[]>;
+}
+
+/**
+ * Lift every note out of the text before parsing begins.
+ *
+ * A line that held nothing but a note is *removed*, not blanked. Fountain reads
+ * a blank line as structure — it ends a dialogue block and it is half the test
+ * for a character cue — so leaving one behind where a note used to be would
+ * change how the lines around it parse. A note parked between a cue and its
+ * first line of dialogue would have cut the block in two and dropped the
+ * dialogue out as Action.
+ *
+ * The notes from a removed line are filed against the line above, so they are
+ * emitted after the element they were written next to.
+ */
+function prepareLines(text: string): PreparedLines {
+  const lines: string[] = [];
+  const notes = new Map<number, string[]>();
+
+  const file = (index: number, found: string[]) => {
+    const existing = notes.get(index);
+    if (existing) existing.push(...found);
+    else notes.set(index, [...found]);
+  };
+
+  for (const raw of splitLines(text)) {
+    const { text: stripped, notes: found } = extractNotes(raw);
+    if (found.length > 0 && stripped.trim() === '') {
+      file(lines.length - 1, found);
+      continue;
+    }
+    lines.push(stripped);
+    if (found.length > 0) file(lines.length - 1, found);
+  }
+
+  return { lines, notes };
+}
+
+/**
+ * The nearest scene heading or section already parsed, or null.
+ *
+ * The spec puts synopses "anywhere within the screenplay", so one does not have
+ * to sit directly under the heading it describes. OpenDraft stores a synopsis
+ * on the element it belongs to, which makes the nearest heading or section
+ * above it the right home.
+ */
+function lastSynopsisTarget(nodes: TipTapNode[]): TipTapNode | null {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    if (SYNOPSIS_TARGETS.has(nodes[i].type)) return nodes[i];
+  }
+  return null;
+}
+
+/**
+ * Is this text single-spaced — no blank line anywhere between its lines?
+ *
+ * Fountain marks a character cue with the blank line before it. Text that has
+ * no blank lines anywhere never lost them in transit — it never had them: rich
+ * text converted to plain text, and a script copied out of an app that lays
+ * cues out by indentation rather than by spacing, both arrive single-spaced.
+ * Read cues by their shape there, or every cue, parenthetical and line of
+ * dialogue in the paste comes through as Action.
+ *
+ * Blank lines at the ends do not count. `split` leaves an empty last element
+ * for the trailing newline that clipboard text almost always carries, and
+ * counting that as a blank line turned this off for the most ordinary paste
+ * there is — the whole point of the rule, defeated by one invisible character.
+ */
+function isSingleSpaced(lines: string[]): boolean {
+  let first = 0;
+  let last = lines.length - 1;
+  while (first <= last && lines[first].trim() === '') first++;
+  while (last >= first && lines[last].trim() === '') last--;
+  if (last - first < 1) return false;
+  return !lines.slice(first, last + 1).some((line) => line.trim() === '');
+}
+
+/** Scene heading by its opening: `INT.`, `EXT.`, `EST.`, `INT./EXT.`, `I/E.` */
+function isSceneHeadingLine(trimmed: string): boolean {
+  return /^(INT\.|EXT\.|EST\.|INT\.\/EXT\.|I\/E\.)/.test(trimmed.toUpperCase());
+}
+
+/** Transition by its shape: all caps, ending in `TO:`. */
+function isTransitionLine(trimmed: string): boolean {
+  return /^[A-Z\s]+TO:$/.test(trimmed);
+}
+
 export function parseFountain(text: string): TipTapNode {
-  const lines = text.split('\n');
+  const { lines, notes: noteLines } = prepareLines(text);
+  const singleSpaced = isSingleSpaced(lines);
   const nodes: TipTapNode[] = [];
   let i = 0;
 
@@ -101,14 +308,45 @@ export function parseFountain(text: string): TipTapNode {
   let pendingPageBreak = false;
 
   const push = (node: TipTapNode) => {
-    if (pendingPageBreak) {
+    // Never onto a section or a note: neither is printed, so starting a page at
+    // one would move the break somewhere the reader cannot see it. The break
+    // stays pending and lands on the next element that does reach the page.
+    if (pendingPageBreak && !isNonPrintingType(node.type)) {
       node.attrs = { ...node.attrs, startsNewPage: true };
       pendingPageBreak = false;
     }
     nodes.push(node);
   };
 
+  // Notes are emitted once the line they were lifted from has been parsed, so
+  // each lands after the element it annotated whichever rule claimed the line —
+  // including the multi-line ones, where a dialogue block consumes several at
+  // once. Pushed straight onto `nodes`: a pending page break belongs to the
+  // next printed element, not to a note that happens to precede it.
+  let flushedThrough = -2;
+  const flushNotesBefore = (limit: number) => {
+    while (flushedThrough < limit) {
+      flushedThrough++;
+      for (const note of noteLines.get(flushedThrough) ?? []) {
+        // `[[* Blue]]` is a revision mark OpenDraft wrote, not a note: it goes
+        // back onto the element it marked (see utils/revisionExport).
+        const revision = parseFountainRevisionNote(note);
+        if (revision) {
+          const target = [...nodes].reverse().find((n) => !isNonPrintingType(n.type) && n.type !== 'titlePage');
+          // Only onto an element that can carry a revision; anything else
+          // keeps the note rather than losing it.
+          if (target && REVISABLE_BLOCK_TYPES.includes(target.type)) {
+            target.attrs = { ...target.attrs, revised: revision };
+            continue;
+          }
+        }
+        nodes.push(makeNode('note', note));
+      }
+    }
+  };
+
   while (i < lines.length) {
+    flushNotesBefore(i - 1);
     const line = lines[i];
     const trimmed = line.trim();
 
@@ -125,11 +363,36 @@ export function parseFountain(text: string): TipTapNode {
       continue;
     }
 
-    // Synopsis line: starts with = (must follow a scene heading)
-    if (trimmed.startsWith('= ') && nodes.length > 0 && nodes[nodes.length - 1].type === 'sceneHeading') {
-      const prev = nodes[nodes.length - 1];
-      if (!prev.attrs) prev.attrs = {};
-      prev.attrs.synopsis = trimmed.substring(2).trim();
+    // Section: one or more leading hashes. Fountain's outlining marker, and
+    // structure rather than script — it is not printed. Nothing else can claim
+    // a line that opens with `#`, so this can be settled before the forcing
+    // rules below.
+    const section = SECTION_PATTERN.exec(trimmed);
+    if (section) {
+      const node = makeNode('section', section[2].trim());
+      node.attrs = { ...node.attrs, level: clampSectionLevel(section[1].length) };
+      push(node);
+      i++;
+      continue;
+    }
+
+    // Synopsis: filed on the nearest scene heading or section above it, since
+    // the spec allows one anywhere. With neither above it there is nothing to
+    // file it on, and it becomes a note — still off the page, still in the file,
+    // rather than printed as a line of Action.
+    const synopsis = SYNOPSIS_PATTERN.exec(trimmed);
+    if (synopsis) {
+      const body = synopsis[1].trim();
+      const target = lastSynopsisTarget(nodes);
+      if (target) {
+        const existing = typeof target.attrs?.synopsis === 'string' ? target.attrs.synopsis : '';
+        target.attrs = {
+          ...target.attrs,
+          synopsis: existing === '' ? body : `${existing}\n${body}`,
+        };
+      } else if (body !== '') {
+        nodes.push(makeNode('note', body));
+      }
       i++;
       continue;
     }
@@ -159,7 +422,7 @@ export function parseFountain(text: string): TipTapNode {
     }
 
     // Scene heading: starts with INT., EXT., EST., INT/EXT., I/E.
-    if (/^(INT\.|EXT\.|EST\.|INT\.\/EXT\.|I\/E\.)/.test(trimmed.toUpperCase())) {
+    if (isSceneHeadingLine(trimmed)) {
       push(makeSceneHeading(trimmed));
       i++;
       continue;
@@ -182,7 +445,7 @@ export function parseFountain(text: string): TipTapNode {
     }
 
     // Transition: all caps ending with TO:
-    if (/^[A-Z\s]+TO:$/.test(trimmed)) {
+    if (isTransitionLine(trimmed)) {
       push(makeNode('transition', trimmed));
       i++;
       continue;
@@ -198,15 +461,21 @@ export function parseFountain(text: string): TipTapNode {
       if (isDual) charNode.attrs = { ...charNode.attrs, dualDialogue: true };
       push(charNode);
       i++;
-      i = collectDialogueBlock(lines, i, push);
+      i = collectDialogueBlock(lines, i, push, singleSpaced);
       continue;
     }
 
     // Character: all uppercase, preceded by an empty line, and followed by the
     // dialogue it introduces.
     if (isCharacterLine(trimmed.replace(/\s*\^$/, ''))
-      && isPrecededByEmptyLine(lines, i)
-      && isFollowedByText(lines, i)) {
+      // Single-spaced text has no blank line to go on, so shape is the whole
+      // test — and it has to replace the blank-line rule rather than fall back
+      // to it, because `isPrecededByEmptyLine` is true at the first line. That
+      // exempted the opening line from the shape test, and most pasted scripts
+      // open with `FADE IN:` — which became a cue with the scene heading under
+      // it as its dialogue.
+      && (singleSpaced ? looksLikeCue(trimmed) : isPrecededByEmptyLine(lines, i))
+      && isFollowedByDialogue(lines, i, singleSpaced)) {
       let charName = trimmed;
       const isDual = charName.endsWith('^');
       if (isDual) charName = charName.replace(/\s*\^$/, '').trim();
@@ -214,7 +483,7 @@ export function parseFountain(text: string): TipTapNode {
       if (isDual) charNode.attrs = { ...charNode.attrs, dualDialogue: true };
       push(charNode);
       i++;
-      i = collectDialogueBlock(lines, i, push);
+      i = collectDialogueBlock(lines, i, push, singleSpaced);
       continue;
     }
 
@@ -222,6 +491,9 @@ export function parseFountain(text: string): TipTapNode {
     push(makeNode('action', actionIndent(line)));
     i++;
   }
+
+  // Anything filed against the last lines of the document.
+  flushNotesBefore(lines.length);
 
   // Post-process: merge dual dialogue pairs
   const merged = mergeDualDialogue(nodes);
@@ -396,6 +668,56 @@ function isCharacterLine(line: string): boolean {
   return cleaned.length > 0 && cleaned === cleaned.toUpperCase() && /[A-Z]/.test(cleaned);
 }
 
+/**
+ * Does an all-caps line look like a character cue rather than a line of
+ * shouted Action?
+ *
+ * Only consulted for single-spaced text, where the blank line the spec uses to
+ * tell the two apart is not available. A cue is a name: short, and not a
+ * sentence, so the length cap and the trailing punctuation are what separate
+ * `SAM` from `THE DOOR SLAMS SHUT.`
+ */
+const CUE_MAX_LENGTH = 45;
+
+function looksLikeCue(line: string): boolean {
+  const cleaned = line.replace(/\(.*\)/, '').replace(/\s*\^$/, '').trim();
+  if (cleaned.length === 0 || cleaned.length > CUE_MAX_LENGTH) return false;
+  return !/[.,!?;:—-]$/.test(cleaned);
+}
+
+/**
+ * Does this line say outright that it is not dialogue?
+ *
+ * A scene heading, a transition or a forced element is unambiguous wherever it
+ * lands: whatever came before it, it ends the block.
+ */
+function opensHardElement(trimmed: string): boolean {
+  if (trimmed === '') return true;
+  // Forced action, character, transition/centred text, page break, synopsis,
+  // and a section heading. `~` (lyrics) is deliberately absent: lyrics belong
+  // inside a dialogue block.
+  if (/^[!@>=#]/.test(trimmed)) return true;
+  // Forced scene heading — `.INT` and not an ellipsis.
+  if (/^\.[^.]/.test(trimmed)) return true;
+  return isSceneHeadingLine(trimmed) || isTransitionLine(trimmed);
+}
+
+/**
+ * Does this line open an element of its own?
+ *
+ * The end of a dialogue block is normally the next blank line. Single-spaced
+ * text has none, so the block has to end where the next element begins —
+ * without this the first cue in a paste swallowed everything after it as
+ * dialogue.
+ */
+function opensNewElement(lines: string[], index: number): boolean {
+  const trimmed = (lines[index] ?? '').trim();
+  if (opensHardElement(trimmed)) return true;
+  return isCharacterLine(trimmed.replace(/\s*\^$/, ''))
+    && looksLikeCue(trimmed)
+    && isFollowedByText(lines, index);
+}
+
 function isPrecededByEmptyLine(lines: string[], index: number): boolean {
   if (index === 0) return true;
   return lines[index - 1].trim() === '';
@@ -413,6 +735,20 @@ function isPrecededByEmptyLine(lines: string[], index: number): boolean {
 function isFollowedByText(lines: string[], index: number): boolean {
   const next = lines[index + 1];
   return next !== undefined && next.trim() !== '';
+}
+
+/**
+ * The cue's other half, for single-spaced text: is the line under it something
+ * that can actually be its dialogue?
+ *
+ * A blank line answers this in ordinary Fountain. Single-spaced there is none,
+ * so a scene heading under an all-caps line has to be what rules the line out
+ * — otherwise a cue is emitted with a scene heading as its dialogue, or worse,
+ * with nothing under it at all.
+ */
+function isFollowedByDialogue(lines: string[], index: number, singleSpaced: boolean): boolean {
+  if (!isFollowedByText(lines, index)) return false;
+  return !singleSpaced || !opensHardElement((lines[index + 1] ?? '').trim());
 }
 
 const DIALOGUE_TYPES = new Set(['character', 'dialogue', 'parenthetical']);
@@ -479,12 +815,37 @@ function collectDialogueBlock(
   lines: string[],
   i: number,
   push: (node: TipTapNode) => void,
+  singleSpaced = false,
 ): number {
+  const first = i;
   while (i < lines.length) {
     const line = lines[i];
     const trimmed = line.trim();
 
     if (trimmed === '') {
+      // Two or more spaces on an otherwise blank line is the spec's way of
+      // saying the blank line is deliberate and the block carries on. It is
+      // also exactly what this app's own exporter writes for a paragraph break
+      // inside dialogue — so without this, a `.fountain` saved by OpenDraft and
+      // reopened lost every line of a speech after its first break, as Action.
+      if (/^[ \t]{2,}$/.test(line)) {
+        push(makeNode('dialogue', ''));
+        i++;
+        continue;
+      }
+      break;
+    }
+
+    // A section heading is structure, not speech: it ends the block wherever it
+    // lands, blank line above it or not.
+    if (SECTION_PATTERN.test(trimmed)) {
+      break;
+    }
+
+    // The line straight after a cue is always its dialogue — a cue with
+    // nothing under it was never treated as a cue. Past that, single-spaced
+    // text ends the block at the next element rather than at a blank line.
+    if (singleSpaced && i > first && opensNewElement(lines, i)) {
       break;
     }
 

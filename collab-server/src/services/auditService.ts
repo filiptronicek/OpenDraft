@@ -12,6 +12,8 @@ export type AuditAction =
   | 'token_refresh'
   | 'email_verified'
   | 'google_login'
+  | 'oidc_login'
+  | 'oidc_link'
   | 'new_device_challenge'
   | 'new_device_challenge_resend'
   | 'new_device_verified'

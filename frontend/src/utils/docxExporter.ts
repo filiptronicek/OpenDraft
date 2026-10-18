@@ -23,17 +23,33 @@ import {
   PageNumber,
   TabStopType,
   ImageRun,
+  FootnoteReferenceRun,
+  EndnoteReferenceRun,
+  Table,
+  Tab,
 } from 'docx';
 import type { ISectionOptions } from 'docx';
+import { noteBlockText, type NoteBlock as NoteBlockLike } from './noteContent';
+import type { FootnotePlan, FootnoteRef } from './footnotes';
 import { resolveImageUrl, loadImageBytes } from './imageAsset';
 import { jsonBlockRuns, jsonBlockText, type Run } from './nodeText';
 import type { JSONContent } from '@tiptap/react';
+import { blockRevision } from './revisionExport';
+import { revisionMarkXPt } from './revisionPdf';
+import { DEFAULT_REVISION_SETTINGS, revisionMarkFor, type RevisionSettings } from '../editor/revisionColors';
 import { resolveHeaderFooter, printedPageNumber } from '../stores/editorStore';
 import type { PageLayout, HeaderFooterContent } from '../stores/editorStore';
 import { getForceBreakIds, jsonStartsOwnPage } from './pageBreaks';
 import { getSpaceBefore, DEFAULT_SPACE_BEFORE } from './elementSpacing';
 import { sanitizeExportFilename } from './exportFilename';
 import { findTitlePageRegion, titlePageAttrsCarryData } from './titlePageRegion';
+import { extractAvBodies } from './avDocument';
+import { buildAvTable, buildAvTotalParagraph, type AvDocxImage } from './avDocxTable';
+import { avRowNodes, avFrameKey } from './avPdfTable';
+import { readColumnConfig } from '../editor/extensions/AvBlock';
+import { isNonPrintingType } from './nonPrinting';
+import { runFont } from './docxScriptFonts';
+import { withElementNumbers, elementNumberOf } from './elementNumbers';
 
 // --- Layout constants (mirror pdfExporter.ts) ---
 
@@ -122,7 +138,20 @@ function applyTypeStyles(runs: RunStyle[], typeName: string): RunStyle[] {
  *
  * Exported for tests.
  */
-export function buildTextRuns(runs: RunStyle[], docFont: string = FONT_FAMILY): TextRun[] {
+export function buildTextRuns(
+  runs: RunStyle[],
+  docFont: string = FONT_FAMILY,
+  /**
+   * Footnote references anchored in this block. Word owns the numbering and the
+   * layout of a real footnote, so all that is placed here is the reference
+   * itself, split into the run stream at the character the note is anchored to.
+   */
+  refs: readonly FootnoteRef[] = [],
+  isEndnote: (noteId: string) => boolean = () => false,
+): (TextRun | FootnoteReferenceRun | EndnoteReferenceRun)[] {
+  if (refs.length > 0) {
+    return buildRunsWithReferences(runs, docFont, refs, isEndnote);
+  }
   if (runs.length === 0 || (runs.length === 1 && runs[0].text === '' && !runs[0].isBreak)) {
     return [new TextRun({ text: '', font: docFont, size: FONT_SIZE_HALFPT })];
   }
@@ -134,8 +163,10 @@ export function buildTextRuns(runs: RunStyle[], docFont: string = FONT_FAMILY): 
         : new TextRun({
             text: r.text,
             // A run styled with its own face keeps it; everything else follows
-            // the document.
-            font: r.fontFamily || docFont,
+            // the document.  Either way the face is named per script, so the
+            // Hindi in the run is not drawn in a Latin one — see
+            // utils/docxScriptFonts.
+            font: runFont(r.text, r.fontFamily || docFont),
             size: FONT_SIZE_HALFPT,
             bold: r.bold || undefined,
             italics: r.italic || undefined,
@@ -197,7 +228,7 @@ function templateToChildren(
 
   const pushText = (txt: string) => {
     if (txt.length === 0) return;
-    out.push(new TextRun({ text: txt, font: docFont, size: FONT_SIZE_HALFPT }));
+    out.push(new TextRun({ text: txt, font: runFont(txt, docFont), size: FONT_SIZE_HALFPT }));
   };
 
   while ((m = tokenRe.exec(template)) !== null) {
@@ -318,13 +349,16 @@ function buildTitlePageFlow(
         : AlignmentType.CENTER;
     const size = isTitle ? (Number(node.attrs?.tpTitleFontSize) || 12) * 2 : FONT_SIZE_HALFPT;
     const lines = nodeText(node).split('\n');
-    const children = lines.map((line, idx) => new TextRun({
-      text: isTitle ? line.toUpperCase() : line,
-      font: docFont,
-      size,
-      bold: isTitle || undefined,
-      break: idx > 0 ? 1 : undefined,
-    }));
+    const children = lines.map((line, idx) => {
+      const txt = isTitle ? line.toUpperCase() : line;
+      return new TextRun({
+        text: txt,
+        font: runFont(txt, docFont),
+        size,
+        bold: isTitle || undefined,
+        break: idx > 0 ? 1 : undefined,
+      });
+    });
     paras.push(new Paragraph({
       alignment: align,
       spacing: { line: size * 10, lineRule: LineRuleType.EXACT },
@@ -343,20 +377,85 @@ function buildElementParagraph(
   pageBreakBefore = false,
   docFont: string = FONT_FAMILY,
   spaceBeforeLines: Record<string, number> = DEFAULT_SPACE_BEFORE,
+  /** References anchored in this block, with the note number each carries. */
+  refs: readonly FootnoteRef[] = [],
+  isEndnote: (noteId: string) => boolean = () => false,
+  /** How revised paragraphs are marked; null writes no marks. */
+  revisionMarks: RevisionSettings | null = null,
 ): Paragraph {
   const typeName = node.type || 'general';
   const indent = indentForType(typeName, layout);
-  const alignment = alignmentForType(typeName);
+  let alignment = alignmentForType(typeName);
   const sb = isFirst ? 0 : (spaceBeforeLines[typeName] ?? 0) * LINE_HEIGHT_PT;
   const styledRuns = applyTypeStyles(extractRuns(node), typeName);
-  const children = buildTextRuns(styledRuns, docFont);
+  let children: (TextRun | FootnoteReferenceRun | EndnoteReferenceRun)[] = buildTextRuns(styledRuns, docFont, refs, isEndnote);
+
+  // A revised paragraph's mark, in the right margin where the PDF prints it.
+  // Word wraps the text itself, so it is one mark on the paragraph's last
+  // line: a tab to a stop past the right indent, which Word lets the text run
+  // out to. A right-aligned or centred line would carry the tab off with it,
+  // so a single-line one is laid out with tab stops instead — the same place
+  // on the page, and room for the mark after it.
+  const revision = revisionMarks ? blockRevision(node) : null;
+  let tabStops: { type: (typeof TabStopType)[keyof typeof TabStopType]; position: number }[] | undefined;
+  if (revision !== null) {
+    const markX = Math.round((revisionMarkXPt(layout.pageWidth * 72) / 72 - layout.leftMargin) * TWIPS_PER_INCH);
+    tabStops = [{ type: TabStopType.LEFT, position: markX }];
+    const singleLine = !styledRuns.some((r) => r.isBreak);
+    const textRight = Math.round((layout.pageWidth - layout.leftMargin - layout.rightMargin) * TWIPS_PER_INCH) - indent.right;
+    if (singleLine && alignment !== AlignmentType.LEFT) {
+      const lead = alignment === AlignmentType.RIGHT
+        ? { type: TabStopType.RIGHT, position: textRight }
+        : { type: TabStopType.CENTER, position: Math.round((indent.left + textRight) / 2) };
+      tabStops = [lead, ...tabStops];
+      children = [new TextRun({ children: [new Tab()], font: docFont, size: FONT_SIZE_HALFPT }), ...children];
+      alignment = AlignmentType.LEFT;
+    }
+    children = [
+      ...children,
+      // A real <w:tab/>: a tab character inside the text is not one to Word.
+      new TextRun({
+        children: [new Tab(), revisionMarkFor(revisionMarks, revision)],
+        font: docFont, size: FONT_SIZE_HALFPT, bold: true,
+      }),
+    ];
+  }
+
+  // An element number (utils/elementNumbers) hangs in the margin left of the
+  // text: the first line starts an inch early, a right tab puts the number's
+  // end 0.15" before the text, and a left tab at the indent brings the text
+  // back to where it always starts. Every line wraps at the width it had.
+  // A centred or right-aligned element has no left edge to hang it from, so
+  // there the number simply leads the line.
+  let hanging: number | undefined;
+  const number = elementNumberOf(node);
+  if (number) {
+    const numberRun = new TextRun({
+      text: number, font: runFont(number, docFont), size: FONT_SIZE_HALFPT,
+      bold: false, italics: false, allCaps: false,
+    });
+    if (alignmentForType(typeName) === AlignmentType.LEFT && alignment === AlignmentType.LEFT) {
+      hanging = TWIPS_PER_INCH;
+      tabStops = [
+        { type: TabStopType.RIGHT, position: indent.left - Math.round(0.15 * TWIPS_PER_INCH) },
+        { type: TabStopType.LEFT, position: indent.left },
+        ...(tabStops ?? []),
+      ];
+      const tab = () => new TextRun({ children: [new Tab()], font: docFont, size: FONT_SIZE_HALFPT });
+      children = [tab(), numberRun, tab(), ...children];
+    } else {
+      children = [numberRun, new TextRun({ text: ' ', font: docFont, size: FONT_SIZE_HALFPT }), ...children];
+    }
+  }
 
   return new Paragraph({
     alignment,
+    ...(tabStops ? { tabStops } : {}),
     style: STYLE_NAMES[typeName] ? typeName : undefined,
     indent: {
       left: indent.left,
       right: indent.right,
+      ...(hanging !== undefined ? { hanging } : {}),
     },
     pageBreakBefore: pageBreakBefore || undefined,
     spacing: {
@@ -368,9 +467,74 @@ function buildElementParagraph(
   });
 }
 
+/**
+ * The same run stream, with a footnote reference dropped in at each anchor.
+ *
+ * Word draws the superscript, numbers it, lays the note out at the foot of the
+ * page and reflows it as the document changes — so nothing here writes a
+ * number. The reference is placed after the last character of the annotated
+ * phrase, which is where the plan recorded it.
+ */
+function buildRunsWithReferences(
+  runs: RunStyle[],
+  docFont: string,
+  refs: readonly FootnoteRef[],
+  isEndnote: (noteId: string) => boolean,
+): (TextRun | FootnoteReferenceRun | EndnoteReferenceRun)[] {
+  const sorted = [...refs].sort((a, b) => a.charOffset - b.charOffset);
+  const out: (TextRun | FootnoteReferenceRun | EndnoteReferenceRun)[] = [];
+  // Each note chooses for itself, so the kind of reference is decided per ref
+  // rather than per paragraph.
+  const reference = (ref: FootnoteRef) =>
+    isEndnote(ref.noteId) ? new EndnoteReferenceRun(ref.number) : new FootnoteReferenceRun(ref.number);
+
+  const styled = (r: RunStyle, text: string) => new TextRun({
+    text,
+    font: runFont(text, r.fontFamily || docFont),
+    size: FONT_SIZE_HALFPT,
+    bold: r.bold || undefined,
+    italics: r.italic || undefined,
+    underline: r.underline ? {} : undefined,
+    strike: r.strike || undefined,
+  });
+
+  let pos = 0;
+  let ri = 0;
+  for (const r of runs) {
+    if (r.isBreak) {
+      out.push(new TextRun({ text: '', break: 1, font: docFont, size: FONT_SIZE_HALFPT }));
+      pos += 1;
+      continue;
+    }
+    const len = r.text.length;
+    let cursor = 0;
+    while (ri < sorted.length && sorted[ri].charOffset > pos && sorted[ri].charOffset <= pos + len) {
+      const at = sorted[ri].charOffset - pos;
+      const head = r.text.slice(cursor, at);
+      if (head.length > 0) out.push(styled(r, head));
+      out.push(reference(sorted[ri]));
+      cursor = at;
+      ri++;
+    }
+    const tail = r.text.slice(cursor);
+    if (tail.length > 0) out.push(styled(r, tail));
+    pos += len;
+  }
+
+  return out.length > 0
+    ? out
+    : [new TextRun({ text: '', font: docFont, size: FONT_SIZE_HALFPT })];
+}
+
 // --- Main export ---
 
 export interface DocxExportOptions {
+  /**
+   * Printing script notes. Word gets real footnotes or endnotes from these and
+   * lays them out itself. Absent — the usual case — and the output is what it
+   * always was.
+   */
+  footnotes?: FootnotePlan | null;
   documentTitle?: string;
   revisionColor?: string;
   /** The document's typeface; defaults to the screenplay Courier. */
@@ -379,6 +543,20 @@ export interface DocxExportOptions {
    *  `{pages}` be written as a literal instead of Word's NUMPAGES, which counts
    *  the title page and so is always one too high for a script that has one. */
   scriptPageCount?: number;
+  /** Whether the title page is written at all. Absent or true keeps it. The
+   *  writer's preference, shared with print and PDF — see `PDFExportOptions`. */
+  includeTitlePage?: boolean;
+  /** Revised paragraphs get a mark in the right margin, in these characters.
+   *  Absent: an asterisk. `showRevisionMarks: false` writes none. */
+  revisionSettings?: RevisionSettings | null;
+  showRevisionMarks?: boolean;
+  /** Print the numbers the active format puts on elements other than scene
+   *  headings (utils/elementNumbers), in the left margin. Absent or false
+   *  writes none. */
+  elementNumbersVisible?: boolean;
+  /** Scene numbers are shown — only for the 12.3 element-number style; Word
+   *  export writes no scene numbers of its own. */
+  sceneNumbersVisible?: boolean;
 }
 
 export async function exportDocx(
@@ -389,6 +567,11 @@ export async function exportDocx(
 ): Promise<void> {
   const { saveFile } = await import('./fileOps');
   const filename = `${sanitizeExportFilename(title)}.docx`;
+  // Labels for numbered elements, on a copy; the same document when none are.
+  doc = withElementNumbers(doc, {
+    visible: options?.elementNumbersVisible === true,
+    sceneNumbersVisible: options?.sceneNumbersVisible === true,
+  });
 
   // Separate the title-page region (the leading run of titlePage + image nodes)
   // from the body. The title page renders its nodes in DOCUMENT ORDER (free-flow),
@@ -397,6 +580,8 @@ export async function exportDocx(
   // the Title Page dialog so all four agree even when something stray sits above
   // the title (issue #52) — see utils/titlePageRegion.
   const bodyNodes: JSONContent[] = [];
+  /** Index in the original document, per body node — the footnote plan's key. */
+  const bodySrcIndex: number[] = [];
   const titleRegionNodes: JSONContent[] = [];
   const docNodes = doc?.content ?? [];
   const region = findTitlePageRegion(
@@ -406,8 +591,16 @@ export async function exportDocx(
       hasTitleData: titlePageAttrsCarryData(node.attrs as Record<string, unknown> | undefined),
     })),
   );
-  const hasTitlePage = region.isReal;
+  // Excluded by the writer: drop the region outright rather than letting it fall
+  // through to the body, which is the path for a region that was never a title
+  // page and so keeps whatever carries text.
+  const excludeTitlePage = options?.includeTitlePage === false;
+  const hasTitlePage = region.isReal && !excludeTitlePage;
+  const dropTitleRegion = region.isReal && excludeTitlePage;
   docNodes.forEach((node, index) => {
+    // Sections and Notes never reach the page — see utils/nonPrinting.ts.
+    if (isNonPrintingType(node.type)) return;
+    if (dropTitleRegion && index < region.length) return;
     if (hasTitlePage && index < region.length) {
       titleRegionNodes.push(node);
       return;
@@ -418,6 +611,7 @@ export async function exportDocx(
     // the whole region.
     if (!hasTitlePage && node.type === 'titlePage' && nodeText(node).trim() === '') return;
     bodyNodes.push(node);
+    bodySrcIndex.push(index);
   });
 
   // Page geometry in twips
@@ -433,7 +627,52 @@ export async function exportDocx(
 
   const docTitle = options?.documentTitle || title;
   const revColor = options?.revisionColor || '';
+  const revisionMarks = options?.showRevisionMarks === false
+    ? null
+    : (options?.revisionSettings ?? DEFAULT_REVISION_SETTINGS);
   const docFont = options?.documentFont || FONT_FAMILY;
+
+  // Printing notes reach a file only when the writer asked them to.
+  const plan = options?.footnotes && options.footnotes.settings.includeInExports
+    ? options.footnotes
+    : null;
+
+  /**
+   * The notes themselves, keyed by the number their reference carries.
+   *
+   * These become real Word footnotes (or endnotes): Word numbers them, places
+   * them, draws the separator and reflows them as the document is edited. The
+   * one thing it will not take from us is the numbering FORMAT — the library
+   * writes no `w:footnotePr` — so a script set to roman numerals here still
+   * reads 1, 2, 3 in Word. That is worth saying in the manual rather than
+   * pretending otherwise.
+   */
+  const noteParagraphs = (entry: { blocks: readonly { kind: string }[] }): Paragraph[] => {
+    const paragraphs: Paragraph[] = [];
+    for (const b of entry.blocks as NoteBlockLike[]) {
+      if (b.kind === 'image') continue;
+      paragraphs.push(new Paragraph({
+        children: [new TextRun({ text: noteBlockText(b), font: runFont(noteBlockText(b), docFont), size: FONT_SIZE_HALFPT })],
+      }));
+    }
+    if (paragraphs.length === 0) {
+      paragraphs.push(new Paragraph({
+        children: [new TextRun({ text: '', font: docFont, size: FONT_SIZE_HALFPT })],
+      }));
+    }
+    return paragraphs;
+  };
+
+  // Only an ANCHORED note can become a real Word footnote or endnote: Word's
+  // note exists because a reference points at it. Each one chooses its own
+  // kind, so both maps can be populated at once. General notes have nothing to
+  // point from and are appended as ordinary paragraphs further down.
+  const footnotesMap: Record<string, { children: Paragraph[] }> = {};
+  const endnotesMap: Record<string, { children: Paragraph[] }> = {};
+  if (plan) {
+    for (const entry of plan.entries) footnotesMap[String(entry.number)] = { children: noteParagraphs(entry) };
+    for (const entry of plan.anchoredEndnotes) endnotesMap[String(entry.number)] = { children: noteParagraphs(entry) };
+  }
   const hf = resolveHeaderFooter(layout);
   const headerContent = hf.headerContent;
   const footerContent = hf.footerContent;
@@ -495,13 +734,36 @@ export async function exportDocx(
     titleImageMap.set(i, { data: b.data, w, h, align: (attrs.align as string) || 'center' });
   }
 
+  // Storyboard frames for AV bodies, loaded up front like the inserted images.
+  const avImageMap = new Map<string, AvDocxImage>();
+  for (const node of bodyNodes) {
+    if (node.type !== 'avBlock') continue;
+    for (const rn of avRowNodes(node)) {
+      if (!rn.image) continue;
+      const attrs = (rn.image.attrs || {}) as Record<string, unknown>;
+      const key = avFrameKey(attrs as { src?: string | null; assetId?: string | null; scratchId?: string | null });
+      if (!key || avImageMap.has(key)) continue;
+      const url = resolveImageUrl(attrs);
+      if (!url) continue;
+      try {
+        const b = await loadImageBytes(url);
+        if (b) avImageMap.set(key, { data: b.data, width: b.width, height: b.height, type: 'png' });
+      } catch (err) {
+        // A frame that will not load must not fail the whole export.
+        console.warn('[docx] could not load storyboard frame', err);
+      }
+    }
+  }
+
   // Element ids the active template requires to start a new page (e.g. TV newAct).
   const forceBreakIds = getForceBreakIds();
   // Blank lines before each element, from the same template the editor
   // paginates with — resolved once so the whole document uses one answer.
   const spaceBeforeLines = getSpaceBefore();
 
-  const bodyParagraphs: Paragraph[] = [];
+  // Tables live alongside paragraphs: an AV body is written as a real Word
+  // table so Word repeats its header row and keeps each shot whole.
+  const bodyParagraphs: (Paragraph | Table)[] = [];
   for (let i = 0; i < bodyNodes.length; i++) {
     // The title page lives in its own section, and a section break already
     // starts a new page — adding `pageBreakBefore` to the body's first
@@ -509,6 +771,33 @@ export async function exportDocx(
     // The template's forced-break elements and the per-element "start on new
     // page" flag still each open a page of their own.
     const forcePageBreak = i > 0 && jsonStartsOwnPage(bodyNodes[i], forceBreakIds);
+    if (bodyNodes[i].type === 'avBlock') {
+      const node = bodyNodes[i];
+      const body = extractAvBodies({ type: 'doc', content: [node] })[0];
+      if (body) {
+        const cfg = readColumnConfig(node.attrs);
+        const repeatHeaders = (node.attrs as { repeatHeaders?: boolean } | undefined)?.repeatHeaders !== false;
+        // A forced break before a table goes on an empty paragraph — a Table
+        // has no pageBreakBefore of its own.
+        if (forcePageBreak) {
+          bodyParagraphs.push(new Paragraph({ pageBreakBefore: true, children: [] }));
+        }
+        bodyParagraphs.push(buildAvTable(body, node, {
+          widths: cfg.widths,
+          repeatHeaders,
+          contentWidthTw,
+          font: docFont,
+          sizeHalfPt: FONT_SIZE_HALFPT,
+          images: avImageMap,
+        }));
+        const total = buildAvTotalParagraph(body, docFont, FONT_SIZE_HALFPT);
+        if (total) bodyParagraphs.push(total);
+        // Word merges two adjacent tables into one; a trailing empty paragraph
+        // keeps two AV bodies separate.
+        bodyParagraphs.push(new Paragraph({ children: [] }));
+      }
+      continue;
+    }
     const img = imageMap.get(i);
     if (img) {
       bodyParagraphs.push(new Paragraph({
@@ -519,9 +808,40 @@ export async function exportDocx(
       continue;
     }
     bodyParagraphs.push(
-      buildElementParagraph(bodyNodes[i], layout, i === 0, forcePageBreak, docFont, spaceBeforeLines),
+      buildElementParagraph(
+        bodyNodes[i], layout, i === 0, forcePageBreak, docFont, spaceBeforeLines,
+        plan?.refsByNode.get(bodySrcIndex[i]) ?? [],
+        (noteId) => !!plan && !plan.footnoteIds.has(noteId),
+        revisionMarks,
+      ),
     );
   }
+  // General notes close the document under a NOTES heading. They cannot be Word
+  // footnotes — nothing references them — so they are written as ordinary
+  // paragraphs, which is what they are.
+  if (plan && plan.generalEntries.length > 0) {
+    bodyParagraphs.push(new Paragraph({
+      alignment: AlignmentType.CENTER,
+      pageBreakBefore: true,
+      spacing: { line: LINE_HEIGHT_PT * TWIPS_PER_POINT, lineRule: LineRuleType.EXACT },
+      children: [new TextRun({ text: 'NOTES', font: docFont, size: FONT_SIZE_HALFPT })],
+    }));
+    for (const entry of plan.generalEntries) {
+      const head = entry.title ? `${entry.entryLabel} ${entry.title}` : entry.entryLabel;
+      bodyParagraphs.push(new Paragraph({
+        spacing: { before: LINE_HEIGHT_PT * TWIPS_PER_POINT, line: LINE_HEIGHT_PT * TWIPS_PER_POINT, lineRule: LineRuleType.EXACT },
+        children: [new TextRun({ text: head, font: runFont(head, docFont), size: FONT_SIZE_HALFPT, bold: !!entry.title })],
+      }));
+      for (const b of entry.blocks) {
+        if (b.kind === 'image') continue;
+        bodyParagraphs.push(new Paragraph({
+          spacing: { line: LINE_HEIGHT_PT * TWIPS_PER_POINT, lineRule: LineRuleType.EXACT },
+          children: [new TextRun({ text: noteBlockText(b), font: runFont(noteBlockText(b), docFont), size: FONT_SIZE_HALFPT })],
+        }));
+      }
+    }
+  }
+
   if (bodyParagraphs.length === 0) {
     bodyParagraphs.push(
       new Paragraph({
@@ -630,6 +950,8 @@ export async function exportDocx(
   const document = new Document({
     creator: 'OpenDraft',
     title: docTitle,
+    ...(Object.keys(footnotesMap).length > 0 ? { footnotes: footnotesMap } : {}),
+    ...(Object.keys(endnotesMap).length > 0 ? { endnotes: endnotesMap } : {}),
     styles: {
       default: {
         document: {

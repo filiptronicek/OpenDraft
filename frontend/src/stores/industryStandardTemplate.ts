@@ -7,6 +7,7 @@
 
 import type { FormattingTemplate, FormattingElementRule } from './formattingTypes';
 import { INDUSTRY_STANDARD_ID } from './formattingTypes';
+import { outlineRules, titlePageRules, avBlockRule } from './templates/_helpers';
 
 function rule(
   id: string,
@@ -35,6 +36,7 @@ function rule(
     nextOnTab: null,
     placeholder: '',
     allowFormatOverride: true,
+    avCell: 'none',
     ...overrides,
   };
 }
@@ -145,5 +147,15 @@ export const INDUSTRY_STANDARD_TEMPLATE: FormattingTemplate = {
       nextOnEnter: 'castList',
       placeholder: 'Cast...',
     }),
+    ...outlineRules(),
+    // A two-column AV body. On in a screenplay because a screenplay genuinely
+    // has them — a commercial inside a feature, a documentary insert, a music
+    // video sequence — and because `Insert AV Columns` has always worked here;
+    // this is what puts it in the element menu beside every other element,
+    // rather than only in the Format menu.
+    ...avBlockRule(true),
+    // The title page's own elements, so its typography is part of the template
+    // rather than fixed in the stylesheet.
+    ...titlePageRules(),
   },
 };

@@ -3,6 +3,7 @@ import { uuid } from './uuid';
 import { isDocumentFont, isDocumentSize } from './fonts';
 import { buildTitlePageBlocks, type TitlePageFields } from './titlePageBlocks';
 import { DEFAULT_PAGE_LAYOUT } from '../stores/editorStore';
+import { parseFDXRevisions, type FDXRevisionImport } from './fdxRevisions';
 
 interface TipTapMark {
   type: string;
@@ -233,6 +234,8 @@ export interface FDXParseResult {
   tagItems: FDXTagItem[];
   beats: FDXBeat[];
   beatColumns: FDXBeatColumn[];
+  /** The file's revisions, mapped to OpenDraft's colours; null when it has none. */
+  revisions: FDXRevisionImport | null;
 }
 
 export function parseFDX(xmlString: string): TipTapNode {
@@ -257,6 +260,14 @@ export function parseFDXFull(xmlString: string): FDXParseResult {
     family: fontSpec?.getAttribute('Font') || '',
     size: fontSpec?.getAttribute('Size') || '',
   };
+
+  // Read before the paragraphs: every revised run points into this list.
+  let revisions: FDXRevisionImport | null = null;
+  try {
+    revisions = parseFDXRevisions(xmlDoc);
+  } catch (err) {
+    console.warn('[fdx] could not read the revisions; the script opens without revision marks', err);
+  }
 
   let pageLayout: FDXPageLayout | null = null;
   const layoutEl = xmlDoc.querySelector('PageLayout');
@@ -302,8 +313,10 @@ export function parseFDXFull(xmlString: string): FDXParseResult {
     const tpParagraphs = titlePageEl.querySelectorAll('Paragraph');
     const tpTexts: string[] = [];
     for (const p of Array.from(tpParagraphs)) {
-      const textEl = p.querySelector('Text');
-      if (textEl?.textContent) tpTexts.push(textEl.textContent);
+      // Trimmed before the test: a `<Text> </Text>` is a spacer, not a title,
+      // and untrimmed it became a title page whose title was a single space.
+      const text = p.querySelector('Text')?.textContent?.trim();
+      if (text) tpTexts.push(text);
     }
     // Heuristic: first line is title, look for "Written by" / "by" pattern for author
     const tpAttrs: Record<string, string> = { field: 'title', tpTitle: '', tpWrittenBy: '', tpBasedOn: '', tpDraft: '', tpDraftDate: '', tpContact: '', tpCopyright: '', tpWgaRegistration: '', tpNotes: '' };
@@ -339,7 +352,7 @@ export function parseFDXFull(xmlString: string): FDXParseResult {
   // Use 'FinalDraft > Content' to skip the TitlePage > Content element
   const contentEl = xmlDoc.querySelector('FinalDraft > Content');
   if (!contentEl) {
-    return { doc: { type: 'doc', content: [{ type: 'action', content: [] }] }, pageLayout, documentFont, castList: [], characterHighlighting: [], tagCategories: [], tagItems: [], beats: [], beatColumns: [] };
+    return { doc: { type: 'doc', content: [{ type: 'action', content: [] }] }, pageLayout, documentFont, castList: [], characterHighlighting: [], tagCategories: [], tagItems: [], beats: [], beatColumns: [], revisions };
   }
 
   // Iterate direct children (Paragraph and DualDialogue elements)
@@ -488,11 +501,17 @@ export function parseFDXFull(xmlString: string): FDXParseResult {
       const isDefaultSize = isDocumentSize(fontSizeVal, documentFont.size);
       const hasColor = fontColor && normalizeColor(fontColor) !== '#000000';
 
-      if ((!isDefaultFont) || (!isDefaultSize) || hasColor) {
+      // A revised run: its revision rides on textStyle, as Revision Mode
+      // writes it (editor/revisionMarks.ts).
+      const revisionId = textEl.getAttribute('RevisionID');
+      const revision = revisionId ? revisions?.colorById.get(revisionId) : undefined;
+
+      if ((!isDefaultFont) || (!isDefaultSize) || hasColor || revision) {
         const styleAttrs: Record<string, string> = {};
         if (!isDefaultFont && fontName) styleAttrs.fontFamily = fontName;
         if (!isDefaultSize && fontSizeVal) styleAttrs.fontSize = `${fontSizeVal}pt`;
         if (hasColor && fontColor) styleAttrs.color = normalizeColor(fontColor);
+        if (revision) styleAttrs.revision = revision;
         if (Object.keys(styleAttrs).length > 0) {
           marks.push({ type: 'textStyle', attrs: styleAttrs });
         }
@@ -637,6 +656,7 @@ export function parseFDXFull(xmlString: string): FDXParseResult {
     tagItems: parsedTagItems,
     beats,
     beatColumns,
+    revisions,
   };
 }
 

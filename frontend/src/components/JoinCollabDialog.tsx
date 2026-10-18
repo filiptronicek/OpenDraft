@@ -1,45 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { api } from '../services/api';
 import type { CollabSession } from '../services/api';
-import { getCollabWsUrl } from '../config';
+import { getApiBase, getCollabWsUrl } from '../config';
 import { platformFetch } from '../services/platform';
+import { parseCollabInvite } from '../services/collabInvite';
 import { showToast } from './Toast';
 
 interface JoinCollabDialogProps {
   onJoin: (session: CollabSession, token: string, collabServerUrl?: string) => void;
   onClose: () => void;
-}
-
-/**
- * Extract the collab token and collab server URL from a pasted invite link.
- * Supports formats:
- *   - Full URL: http://192.168.1.102:4000/collab/TOKEN
- *   - Full URL: https://collab.example.com/collab/TOKEN
- *   - Path only: /collab/TOKEN
- *   - Raw token: TOKEN
- *
- * Returns { token, collabServerUrl } where collabServerUrl is the WebSocket URL
- * of the collab server (e.g. "ws://192.168.1.102:4000") or null for raw tokens.
- */
-function extractTokenAndServer(input: string): { token: string; collabServerUrl: string | null } {
-  const trimmed = input.trim();
-  // Try to match /collab/<token> in a URL or path
-  const match = trimmed.match(/\/collab\/([A-Za-z0-9_-]+)/);
-  if (match) {
-    // Try to extract the collab server URL from the full URL
-    try {
-      const url = new URL(trimmed);
-      // Convert http(s) origin to ws(s) URL for the collab server
-      const wsUrl = url.origin.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
-      return { token: match[1], collabServerUrl: wsUrl };
-    } catch {
-      // Path only — no origin available
-      return { token: match[1], collabServerUrl: null };
-    }
-  }
-  // If no slashes, treat the whole thing as a raw token
-  if (!trimmed.includes('/') && trimmed.length > 10) return { token: trimmed, collabServerUrl: null };
-  return { token: trimmed, collabServerUrl: null };
 }
 
 const JoinCollabDialog: React.FC<JoinCollabDialogProps> = ({ onJoin, onClose }) => {
@@ -52,8 +21,12 @@ const JoinCollabDialog: React.FC<JoinCollabDialogProps> = ({ onJoin, onClose }) 
   }, []);
 
   const handleJoin = async () => {
-    const { token, collabServerUrl } = extractTokenAndServer(linkInput);
-    console.log('[JoinCollab] Extracted:', { token: token?.slice(0, 8) + '...', collabServerUrl });
+    const configuredCollabUrl = getCollabWsUrl();
+    const { token, collabServerUrl } = parseCollabInvite(linkInput, {
+      configuredCollabUrl,
+      frontendBaseUrls: [window.location.origin, getApiBase()],
+    });
+    console.log('[JoinCollab] Parsed invite transport:', collabServerUrl || 'configured');
     if (!token) {
       showToast('Please paste a collaboration link or token', 'error');
       return;
@@ -65,11 +38,15 @@ const JoinCollabDialog: React.FC<JoinCollabDialogProps> = ({ onJoin, onClose }) 
 
       // Use the collab server URL extracted from the invite link if available,
       // otherwise fall back to the local setting.
-      const wsUrl = collabServerUrl || getCollabWsUrl();
+      const wsUrl = collabServerUrl || configuredCollabUrl;
       const collabHttpUrl = wsUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
       console.log('[JoinCollab] Step 1: trying collab server at', collabHttpUrl);
       try {
-        const res = await platformFetch(`${collabHttpUrl}/api/collab/session/${token}`);
+        const res = await platformFetch(`${collabHttpUrl}/api/collab/session/validate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token }),
+        });
         console.log('[JoinCollab] Step 1 response:', res.status);
         if (res.ok) {
           session = await res.json();

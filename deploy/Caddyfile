@@ -4,7 +4,16 @@
 
 {$DEMO_HOST} {
 	encode gzip zstd
-	reverse_proxy demo:8080
+	# Browser builds use a same-origin collaboration endpoint by default.
+	# Keep the separate COLLAB_HOST below for desktop/mobile clients.
+	@collab_server path /collab-server /collab-server/*
+	handle @collab_server {
+		uri strip_prefix /collab-server
+		reverse_proxy collab:8080
+	}
+	handle {
+		reverse_proxy demo:8080
+	}
 }
 
 {$COLLAB_HOST} {

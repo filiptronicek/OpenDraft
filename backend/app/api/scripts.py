@@ -40,6 +40,8 @@ async def get_script(script_id: str):
     project_id = _default_project_id()
     try:
         return script_service.get_script(project_id, script_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -52,6 +54,8 @@ async def update_script(script_id: str, body: ScriptUpdate):
             project_id, script_id, body.title, body.content,
             allow_empty_body=body.allow_empty_body,
         )
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except script_service.EmptyOverwriteError as exc:
@@ -64,5 +68,7 @@ async def delete_script(script_id: str):
     try:
         script_service.delete_script(project_id, script_id)
         return {"message": f"Script '{script_id}' deleted"}
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

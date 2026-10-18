@@ -1,19 +1,38 @@
 import * as jwt from 'jsonwebtoken';
 import * as crypto from 'crypto';
-import * as bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { getDB } from '../db';
 import { config } from '../config';
+import { secretDigest } from './secretDigest';
 
-interface AccessTokenPayload {
+export interface AccessTokenPayload {
   sub: string;
   email: string;
+  name: string;
+  email_verified: boolean;
   type: 'access';
 }
 
-export function generateAccessToken(userId: string, email: string): string {
-  const payload: AccessTokenPayload = { sub: userId, email, type: 'access' };
-  return jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtAccessExpiry as any });
+export function generateAccessToken(
+  userId: string,
+  email: string,
+  name: string,
+  emailVerified: boolean,
+): string {
+  const payload: AccessTokenPayload = {
+    sub: userId,
+    email,
+    name,
+    email_verified: emailVerified,
+    type: 'access',
+  };
+  return jwt.sign(payload, config.jwtSecret, {
+    algorithm: 'HS256',
+    issuer: config.jwtIssuer,
+    audience: config.jwtAudience,
+    expiresIn: config.jwtAccessExpiry as any,
+    jwtid: uuidv4(),
+  });
 }
 
 export async function generateRefreshToken(
@@ -22,7 +41,7 @@ export async function generateRefreshToken(
 ): Promise<{ token: string; expiresAt: string }> {
   const db = getDB();
   const token = crypto.randomBytes(48).toString('base64url');
-  const tokenHash = bcrypt.hashSync(token, 10);
+  const tokenHash = secretDigest(token);
   const id = uuidv4();
   const now = new Date();
 
@@ -47,11 +66,26 @@ export async function generateRefreshToken(
   return { token, expiresAt };
 }
 
-export function verifyAccessToken(token: string): { sub: string; email: string } | null {
+export function verifyAccessToken(token: string): AccessTokenPayload | null {
   try {
-    const payload = jwt.verify(token, config.jwtSecret) as AccessTokenPayload;
-    if (payload.type !== 'access') return null;
-    return { sub: payload.sub, email: payload.email };
+    const payload = jwt.verify(token, config.jwtSecret, {
+      algorithms: ['HS256'],
+      issuer: config.jwtIssuer,
+      audience: config.jwtAudience,
+    }) as AccessTokenPayload;
+    if (
+      payload.type !== 'access'
+      || typeof payload.sub !== 'string'
+      || !payload.sub
+      || typeof payload.email !== 'string'
+      || !payload.email
+      || typeof payload.name !== 'string'
+      || !payload.name
+      || typeof payload.email_verified !== 'boolean'
+    ) {
+      return null;
+    }
+    return payload;
   } catch {
     return null;
   }
@@ -61,33 +95,41 @@ export async function rotateRefreshToken(oldToken: string): Promise<{ accessToke
   const db = getDB();
   const now = new Date().toISOString();
 
-  // Find all non-revoked, non-expired refresh tokens
-  const rows = await db.all<{ id: string; user_id: string; token_hash: string; device_id: string | null }>(
-    'SELECT * FROM refresh_tokens WHERE revoked = 0 AND expires_at > ?',
-    [now],
+  const matchedRow = await db.get<{ id: string; user_id: string; device_id: string | null }>(
+    `SELECT id, user_id, device_id FROM refresh_tokens
+     WHERE token_hash = ? AND revoked = 0 AND expires_at > ?`,
+    [secretDigest(oldToken), now],
   );
-
-  // Find matching token
-  let matchedRow: { id: string; user_id: string; device_id: string | null } | null = null;
-  for (const row of rows) {
-    if (bcrypt.compareSync(oldToken, row.token_hash)) {
-      matchedRow = row;
-      break;
-    }
-  }
 
   if (!matchedRow) return null;
 
-  // Revoke old token
-  await db.run('UPDATE refresh_tokens SET revoked = 1 WHERE id = ?', [matchedRow.id]);
-
   // Look up user for new access token
-  const user = await db.get<{ email: string }>('SELECT email FROM users WHERE id = ?', [matchedRow.user_id]);
+  const user = await db.get<{
+    email: string;
+    display_name: string;
+    email_verified: number;
+  }>(
+    'SELECT email, display_name, email_verified FROM users WHERE id = ?',
+    [matchedRow.user_id],
+  );
   if (!user) return null;
+
+  // Claim the old credential exactly once. Two concurrent requests may both
+  // compare its hash, but only one is allowed to complete the rotation.
+  const revoked = await db.run(
+    'UPDATE refresh_tokens SET revoked = 1 WHERE id = ? AND revoked = 0',
+    [matchedRow.id],
+  );
+  if (revoked.changes !== 1) return null;
 
   // Issue new pair, preserving the device binding so the new refresh token
   // is still attributable to the same device for the devices list / revoke.
-  const accessToken = generateAccessToken(matchedRow.user_id, user.email);
+  const accessToken = generateAccessToken(
+    matchedRow.user_id,
+    user.email,
+    user.display_name,
+    Boolean(user.email_verified),
+  );
   const { token: refreshToken } = await generateRefreshToken(matchedRow.user_id, matchedRow.device_id);
 
   return { accessToken, refreshToken, userId: matchedRow.user_id };
@@ -101,16 +143,10 @@ export async function revokeAllRefreshTokens(userId: string): Promise<void> {
 export async function revokeRefreshToken(token: string): Promise<boolean> {
   const db = getDB();
   const now = new Date().toISOString();
-  const rows = await db.all<{ id: string; token_hash: string }>(
-    'SELECT * FROM refresh_tokens WHERE revoked = 0 AND expires_at > ?',
-    [now],
+  const result = await db.run(
+    `UPDATE refresh_tokens SET revoked = 1
+     WHERE token_hash = ? AND revoked = 0 AND expires_at > ?`,
+    [secretDigest(token), now],
   );
-
-  for (const row of rows) {
-    if (bcrypt.compareSync(token, row.token_hash)) {
-      await db.run('UPDATE refresh_tokens SET revoked = 1 WHERE id = ?', [row.id]);
-      return true;
-    }
-  }
-  return false;
+  return result.changes === 1;
 }

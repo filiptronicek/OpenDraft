@@ -1,13 +1,30 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useGoBack } from '../hooks/useGoBack';
 import { useSettingsStore } from '../stores/settingsStore';
-import { collabAuthApi, handleAuthResponse, performLogout, isDeviceChallenge } from '../services/collabAuth';
+import {
+  collabAuthApi,
+  handleAuthResponse,
+  handleEmailVerificationResponse,
+  hasLocalPassword,
+  isDeviceChallenge,
+  isLocalLoginEnabled,
+  isOidcUser,
+  performLogout,
+} from '../services/collabAuth';
 import type { CollabServerConfig, DeviceRecord } from '../services/collabAuth';
 import { initDemoInfo, isDemoMode } from '../services/demoInfo';
 import { showToast } from './Toast';
 import { getApiBase } from '../config';
 import { getDeviceId } from '../services/deviceId';
 import BackupSettingsSection from './BackupSettingsSection';
+import OidcLoginButton from './OidcLoginButton';
+import { rememberOidcReturnTo, safeOidcAuthorizationUrl } from '../services/oidcAuth';
+import { isWeb } from '../services/platform';
+import SaveSettingsSection from './SaveSettingsSection';
+import VoiceProviderSettings from './VoiceProviderSettings';
+import { formatShortcut, isMacPlatform, shortcutFromEvent } from '../utils/shortcuts';
+import { printRoute, isTauri as isTauriApp } from '../services/platform';
+import Select from './Select';
 
 const EXPIRY_OPTIONS = [
   { label: '30 minutes', hours: 0.5 },
@@ -20,11 +37,74 @@ const EXPIRY_OPTIONS = [
   { label: '30 days', hours: 720 },
 ];
 
+/**
+ * Records a keyboard shortcut by listening for one.
+ *
+ * Click it, press the keys, done — the same gesture every application uses for
+ * this, and the only one that does not ask a writer to know that Option is
+ * spelled `Alt` in the file. What it shows back is the platform's own
+ * spelling: ⌥↩ on a Mac, Alt+Enter elsewhere.
+ */
+const ShortcutField: React.FC<{
+  id: string;
+  value: string;
+  onChange: (spec: string) => void;
+}> = ({ id, value, onChange }) => {
+  const [listening, setListening] = useState(false);
+
+  useEffect(() => {
+    if (!listening) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setListening(false); return; }
+      // Swallow everything while listening, so a half-pressed combination
+      // cannot trigger whatever it would normally do.
+      e.preventDefault();
+      e.stopPropagation();
+      const spec = shortcutFromEvent(e);
+      // A bare modifier on the way to a combination: keep waiting for the rest.
+      if (!spec) return;
+      onChange(spec);
+      setListening(false);
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, [listening, onChange]);
+
+  const label = listening
+    ? 'Press the keys\u2026'
+    : (formatShortcut(value) || 'None');
+
+  return (
+    <span className="shortcut-field">
+      <button
+        id={id}
+        type="button"
+        className={`dialog-input shortcut-capture${listening ? ' is-listening' : ''}`}
+        onClick={() => setListening((on) => !on)}
+        aria-live="polite"
+      >
+        {label}
+      </button>
+      <button
+        type="button"
+        className="shortcut-clear"
+        onClick={() => { setListening(false); onChange(''); }}
+        disabled={!value && !listening}
+      >
+        Clear
+      </button>
+    </span>
+  );
+};
+
 const SettingsPage: React.FC = () => {
   const goBack = useGoBack();
   const {
     collabServerUrl, setCollabServerUrl,
     collabAuth, defaultInviteExpiry, setDefaultInviteExpiry,
+    elementMenuOnEnter, setElementMenuOnEnter,
+    printViaPdf, setPrintViaPdf,
+    elementMenuShortcut, setElementMenuShortcut,
   } = useSettingsStore();
 
   // ── Local form state ──
@@ -41,8 +121,11 @@ const SettingsPage: React.FC = () => {
       if (stored) return stored;
     } catch { /* ignore */ }
     // No stored value — pre-fill with the live default so users see the actual
-    // URL the app will hit, not just a faded placeholder.
-    return getApiBase();
+    // server the app will hit, not just a faded placeholder. Show it as the
+    // bare server root: `/api` is appended automatically (normalizeApiBase), so
+    // both forms resolve to the same base, and the placeholder, the help text
+    // above and this value should not disagree about which one to show.
+    return getApiBase().replace(/\/api$/, '');
   });
   const [cloudApiStatus, setCloudApiStatus] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
 
@@ -99,6 +182,7 @@ const SettingsPage: React.FC = () => {
   // Google OAuth
   const [serverConfig, setServerConfig] = useState<CollabServerConfig | null>(null);
   const [googleLoading, setGoogleLoading] = useState(false);
+  const [oidcLinkLoading, setOidcLinkLoading] = useState(false);
 
   // Load server config when URL is saved
   useEffect(() => {
@@ -108,6 +192,14 @@ const SettingsPage: React.FC = () => {
   }, [collabServerUrl]);
 
   const isLoggedIn = Boolean(collabAuth.accessToken && collabAuth.user);
+  const localLoginEnabled = isLocalLoginEnabled(serverConfig);
+  const registrationEnabled = localLoginEnabled
+    && serverConfig?.localRegistrationEnabled !== false;
+  const webOidcEnabled = Boolean(serverConfig?.oidcEnabled && isWeb());
+  const accountHasLocalPassword = hasLocalPassword(collabAuth.user);
+  const localAccountControlsEnabled = accountHasLocalPassword && localLoginEnabled;
+  const accountUsesOidc = isOidcUser(collabAuth.user);
+  const oidcDisplayName = serverConfig?.oidcDisplayName || 'Single sign-on';
   // Demo flag comes from the backend's DEMO_MODE env var (see /api/demo-info).
   const [isDemoServer, setIsDemoServer] = useState<boolean>(isDemoMode());
   useEffect(() => {
@@ -255,6 +347,7 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleRegister = async () => {
+    if (!registrationEnabled) return;
     if (!regEmail || !regPassword || !regName) return;
     if (regPassword !== regConfirm) {
       showToast('Passwords do not match', 'error');
@@ -310,17 +403,27 @@ const SettingsPage: React.FC = () => {
     }
   };
 
+  const handleLinkOidc = async () => {
+    if (!webOidcEnabled || !accountHasLocalPassword || accountUsesOidc) return;
+    setOidcLinkLoading(true);
+    try {
+      rememberOidcReturnTo('/settings');
+      const { authorizationUrl } = await collabAuthApi.startOidcLink();
+      const safeUrl = safeOidcAuthorizationUrl(authorizationUrl);
+      if (!safeUrl) throw new Error('The identity provider returned an invalid authorization URL.');
+      window.location.assign(safeUrl);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not link single sign-on', 'error');
+      setOidcLinkLoading(false);
+    }
+  };
+
   const handleVerifyEmail = async () => {
     if (verifyCode.length !== 6) return;
     setVerifying(true);
     try {
-      await collabAuthApi.verifyEmail(verifyCode);
-      // Update local user state
-      const user = await collabAuthApi.getMe();
-      useSettingsStore.getState().setCollabAuth({
-        ...collabAuth,
-        user: user,
-      });
+      const response = await collabAuthApi.verifyEmail(verifyCode);
+      handleEmailVerificationResponse(response);
       showToast('Email verified!', 'success');
       setVerifyCode('');
     } catch (err: any) {
@@ -481,9 +584,9 @@ const SettingsPage: React.FC = () => {
     }
     setDeleting(true);
     try {
-      // Always send both fields when present — the server picks the right one
-      // based on whether the account has a password set. We can't tell from
-      // the client because /auth/me doesn't expose that detail.
+      // The server picks the required proof based on the account's linked
+      // methods. External-only accounts confirm with the explicit DELETE text
+      // and never receive a local-password field in the UI.
       const opts: { password?: string; confirmation?: string } = {
         confirmation: deleteConfirmation,
       };
@@ -606,6 +709,8 @@ const SettingsPage: React.FC = () => {
           </div>
         </section>
 
+        <SaveSettingsSection />
+
         <BackupSettingsSection />
 
         {/* ── Collab Account ── */}
@@ -633,7 +738,10 @@ const SettingsPage: React.FC = () => {
                 <div className="settings-user-details">
                   <div className="settings-user-name">{collabAuth.user!.displayName}</div>
                   <div className="settings-user-email">{collabAuth.user!.email}</div>
-                  {!collabAuth.user!.emailVerified && (
+                  {accountUsesOidc && (
+                    <div className="settings-user-provider">Signed in with {oidcDisplayName}</div>
+                  )}
+                  {localAccountControlsEnabled && !collabAuth.user!.emailVerified && (
                     <div className="settings-email-unverified">Email not verified</div>
                   )}
                 </div>
@@ -643,7 +751,7 @@ const SettingsPage: React.FC = () => {
               </div>
 
               {/* Email verification form */}
-              {!collabAuth.user!.emailVerified && (
+              {localAccountControlsEnabled && !collabAuth.user!.emailVerified && (
                 <div className="settings-verify-section">
                   <p className="settings-verify-text">
                     Enter the 6-digit code sent to your email to verify your account.
@@ -673,22 +781,26 @@ const SettingsPage: React.FC = () => {
             </div>
           ) : (
             <div className="settings-auth-card">
-              <div className="settings-auth-tabs">
-                <button
-                  className={`settings-auth-tab ${authTab === 'login' ? 'active' : ''}`}
-                  onClick={() => setAuthTab('login')}
-                >
-                  Sign In
-                </button>
-                <button
-                  className={`settings-auth-tab ${authTab === 'register' ? 'active' : ''}`}
-                  onClick={() => setAuthTab('register')}
-                >
-                  Create Account
-                </button>
-              </div>
+              {localLoginEnabled && (
+                <div className="settings-auth-tabs">
+                  <button
+                    className={`settings-auth-tab ${authTab === 'login' ? 'active' : ''}`}
+                    onClick={() => setAuthTab('login')}
+                  >
+                    Sign In
+                  </button>
+                  {registrationEnabled && (
+                    <button
+                      className={`settings-auth-tab ${authTab === 'register' ? 'active' : ''}`}
+                      onClick={() => setAuthTab('register')}
+                    >
+                      Create Account
+                    </button>
+                  )}
+                </div>
+              )}
 
-              {authTab === 'login' ? (
+              {localLoginEnabled && (authTab === 'login' || !registrationEnabled ? (
                 pendingChallenge ? (
                   <div className="settings-auth-form">
                     <div className="settings-verify-text">
@@ -815,8 +927,9 @@ const SettingsPage: React.FC = () => {
                     {authLoading ? 'Creating account...' : 'Create Account'}
                   </button>
                 </div>
-              )}
+              ))}
 
+              {localLoginEnabled && (
               <div className="collab-remember-section">
                 <label className="collab-remember-label">
                   <input
@@ -836,26 +949,36 @@ const SettingsPage: React.FC = () => {
                   no password is stored on this device.
                 </p>
               </div>
+              )}
 
-              {/* Google sign-in */}
-              {serverConfig?.googleEnabled && (
-                <div className="settings-google-section">
-                  <div className="settings-divider">
-                    <span>or</span>
-                  </div>
-                  <button
-                    className="dialog-btn settings-google-btn"
-                    onClick={handleGoogleLogin}
-                    disabled={googleLoading}
-                  >
-                    <svg viewBox="0 0 24 24" width="18" height="18" style={{ marginRight: 8 }}>
-                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
-                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-                    </svg>
-                    {googleLoading ? 'Signing in...' : 'Sign in with Google'}
-                  </button>
+              {(webOidcEnabled || serverConfig?.googleEnabled) && (
+                <div className="settings-sso-section">
+                  {localLoginEnabled && (
+                    <div className="settings-divider">
+                      <span>or</span>
+                    </div>
+                  )}
+                  {webOidcEnabled && (
+                    <OidcLoginButton
+                      displayName={serverConfig?.oidcDisplayName}
+                      disabled={authLoading || googleLoading}
+                    />
+                  )}
+                  {serverConfig?.googleEnabled && (
+                    <button
+                      className="dialog-btn settings-sso-btn"
+                      onClick={handleGoogleLogin}
+                      disabled={googleLoading || authLoading}
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" style={{ marginRight: 8 }}>
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                      </svg>
+                      {googleLoading ? 'Signing in...' : 'Sign in with Google'}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -867,7 +990,11 @@ const SettingsPage: React.FC = () => {
           <section className="settings-section">
             <h2 className="settings-section-title">Account &amp; Security</h2>
             <p className="settings-section-desc">
-              Manage your password, devices, two-factor verification, and account deletion.
+              {localAccountControlsEnabled
+                ? 'Manage your sign-in methods, password, devices, and account deletion.'
+                : !localLoginEnabled
+                  ? 'Local password sign-in is disabled on this server. Manage linked sign-in, active devices, and account deletion here.'
+                  : `Sign-in security for this account is managed by ${accountUsesOidc ? oidcDisplayName : 'your identity provider'}. Manage active devices and account deletion here.`}
             </p>
 
             {!showAccount ? (
@@ -876,90 +1003,121 @@ const SettingsPage: React.FC = () => {
               </button>
             ) : (
               <div className="settings-auth-card">
-                {/* Two-factor toggle */}
-                <div className="settings-account-block">
-                  <div className="settings-account-row">
-                    <div>
-                      <div className="settings-account-title">Two-factor verification</div>
-                      <div className="settings-account-hint">
-                        When on, signing in from a new device requires a 6-digit code emailed to
-                        you. When off, you'll only get a heads-up email so you can spot
-                        unauthorized sign-ins.
-                      </div>
-                      {serverConfig && serverConfig.smtpConfigured === false && (
-                        <div
-                          className="settings-account-hint"
-                          style={{ color: 'var(--fd-warning, #b85c00)', marginTop: 4 }}
-                        >
-                          Email is not configured on this server, so verification codes can't be
-                          sent. Two-factor verification is unavailable until SMTP is set up.
-                        </div>
-                      )}
+                {serverConfig?.oidcEnabled && (
+                  <div className="settings-account-block">
+                    <div className="settings-account-title">{oidcDisplayName}</div>
+                    <div className="settings-account-hint">
+                      {accountUsesOidc
+                        ? `This account is linked to ${oidcDisplayName}. Passwords, MFA, and recovery for single sign-on are managed there.`
+                        : accountHasLocalPassword
+                          ? webOidcEnabled
+                            ? `Link this account to ${oidcDisplayName} without changing its projects or ownership.`
+                            : `Open the OpenDraft web app to link this account to ${oidcDisplayName}.`
+                          : `This account uses an external identity provider and cannot be linked here.`}
                     </div>
-                    <label className="settings-switch">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(collabAuth.user?.twoFactorEnabled)}
-                        disabled={
-                          twoFactorBusy ||
-                          (serverConfig?.smtpConfigured === false &&
-                            !collabAuth.user?.twoFactorEnabled)
-                        }
-                        onChange={(e) => handleToggleTwoFactor(e.target.checked)}
-                      />
-                      <span>{collabAuth.user?.twoFactorEnabled ? 'On' : 'Off'}</span>
-                    </label>
+                    {accountUsesOidc ? (
+                      <span className="settings-provider-status">Linked</span>
+                    ) : accountHasLocalPassword && webOidcEnabled ? (
+                      <button
+                        type="button"
+                        className="dialog-btn"
+                        onClick={handleLinkOidc}
+                        disabled={oidcLinkLoading}
+                      >
+                        {oidcLinkLoading ? 'Redirecting…' : `Link ${oidcDisplayName}`}
+                      </button>
+                    ) : null}
                   </div>
-                </div>
+                )}
 
-                {/* Change password */}
-                <div className="settings-account-block">
-                  <div className="settings-account-title">Change password</div>
-                  <div className="settings-account-hint">
-                    Updating your password will sign you out everywhere. You'll need to sign in
-                    again with the new password on each device.
-                  </div>
-                  <div className="settings-field">
-                    <label>Current Password</label>
-                    <input
-                      className="dialog-input"
-                      type="password"
-                      value={currentPassword}
-                      onChange={(e) => setCurrentPassword(e.target.value)}
-                      placeholder="Current password"
-                      autoComplete="current-password"
-                    />
-                  </div>
-                  <div className="settings-field">
-                    <label>New Password</label>
-                    <input
-                      className="dialog-input"
-                      type="password"
-                      value={newPassword}
-                      onChange={(e) => setNewPassword(e.target.value)}
-                      placeholder="At least 8 characters"
-                      autoComplete="new-password"
-                    />
-                  </div>
-                  <div className="settings-field">
-                    <label>Confirm New Password</label>
-                    <input
-                      className="dialog-input"
-                      type="password"
-                      value={newPasswordConfirm}
-                      onChange={(e) => setNewPasswordConfirm(e.target.value)}
-                      placeholder="Repeat new password"
-                      autoComplete="new-password"
-                    />
-                  </div>
-                  <button
-                    className="dialog-btn dialog-btn-primary"
-                    onClick={handleChangePassword}
-                    disabled={!currentPassword || !newPassword || !newPasswordConfirm || changingPassword}
-                  >
-                    {changingPassword ? 'Updating...' : 'Update Password'}
-                  </button>
-                </div>
+                {localAccountControlsEnabled && (
+                  <>
+                    {/* Two-factor toggle for local-password sign-in only. */}
+                    <div className="settings-account-block">
+                      <div className="settings-account-row">
+                        <div>
+                          <div className="settings-account-title">Two-factor verification</div>
+                          <div className="settings-account-hint">
+                            When on, signing in from a new device requires a 6-digit code emailed to
+                            you. When off, you'll only get a heads-up email so you can spot
+                            unauthorized sign-ins.
+                          </div>
+                          {serverConfig && serverConfig.smtpConfigured === false && (
+                            <div
+                              className="settings-account-hint"
+                              style={{ color: 'var(--fd-warning, #b85c00)', marginTop: 4 }}
+                            >
+                              Email is not configured on this server, so verification codes can't be
+                              sent. Two-factor verification is unavailable until SMTP is set up.
+                            </div>
+                          )}
+                        </div>
+                        <label className="settings-switch">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(collabAuth.user?.twoFactorEnabled)}
+                            disabled={
+                              twoFactorBusy ||
+                              (serverConfig?.smtpConfigured === false &&
+                                !collabAuth.user?.twoFactorEnabled)
+                            }
+                            onChange={(e) => handleToggleTwoFactor(e.target.checked)}
+                          />
+                          <span>{collabAuth.user?.twoFactorEnabled ? 'On' : 'Off'}</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Change password */}
+                    <div className="settings-account-block">
+                      <div className="settings-account-title">Change password</div>
+                      <div className="settings-account-hint">
+                        Updating your password will sign you out everywhere. You'll need to sign in
+                        again with the new password on each device.
+                      </div>
+                      <div className="settings-field">
+                        <label>Current Password</label>
+                        <input
+                          className="dialog-input"
+                          type="password"
+                          value={currentPassword}
+                          onChange={(e) => setCurrentPassword(e.target.value)}
+                          placeholder="Current password"
+                          autoComplete="current-password"
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label>New Password</label>
+                        <input
+                          className="dialog-input"
+                          type="password"
+                          value={newPassword}
+                          onChange={(e) => setNewPassword(e.target.value)}
+                          placeholder="At least 8 characters"
+                          autoComplete="new-password"
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label>Confirm New Password</label>
+                        <input
+                          className="dialog-input"
+                          type="password"
+                          value={newPasswordConfirm}
+                          onChange={(e) => setNewPasswordConfirm(e.target.value)}
+                          placeholder="Repeat new password"
+                          autoComplete="new-password"
+                        />
+                      </div>
+                      <button
+                        className="dialog-btn dialog-btn-primary"
+                        onClick={handleChangePassword}
+                        disabled={!currentPassword || !newPassword || !newPasswordConfirm || changingPassword}
+                      >
+                        {changingPassword ? 'Updating...' : 'Update Password'}
+                      </button>
+                    </div>
+                  </>
+                )}
 
                 {/* Devices */}
                 <div className="settings-account-block">
@@ -1014,8 +1172,10 @@ const SettingsPage: React.FC = () => {
                 <div className="settings-account-block settings-account-danger">
                   <div className="settings-account-title">Delete account</div>
                   <div className="settings-account-hint">
-                    Permanently deletes your account, password, devices, and any cloud
-                    screenplays stored under your account. This cannot be undone.
+                    Permanently deletes your active account, credentials, and devices, and
+                    attempts to remove cloud screenplays stored under your account. Git
+                    mirrors, filesystem snapshots, and other administrator-managed backups
+                    follow the server administrator&apos;s retention policy.
                   </div>
                   {!deleteOpen ? (
                     <button
@@ -1040,16 +1200,18 @@ const SettingsPage: React.FC = () => {
                                 screenplay{cloudInventory.scripts === 1 ? '' : 's'}
                               </>
                             )}{' '}
-                            stored in OpenDraft Cloud. They will be permanently deleted along
-                            with this account and cannot be recovered. Please open each one in
-                            OpenDraft and use <em>File → Save As / Export</em> to download a
-                            local copy before continuing.
+                            stored in OpenDraft Cloud. Account deletion attempts to remove them
+                            from active storage. Administrator-managed backups can persist until
+                            their retention period ends or an administrator removes them. Please
+                            open each screenplay in OpenDraft and use <em>File → Save As / Export</em>{' '}
+                            to download a local copy before continuing.
                           </>
                         ) : (
                           <>
-                            any screenplays stored in OpenDraft Cloud under this account will be
-                            deleted along with the account and cannot be recovered. Please make
-                            sure you have downloaded them first.
+                            account deletion attempts to remove screenplays stored in active
+                            OpenDraft Cloud storage. Administrator-managed backups can persist
+                            until their retention period ends or an administrator removes them.
+                            Please make sure you have downloaded your screenplays first.
                           </>
                         )}
                         {cloudPortalLink && (
@@ -1062,17 +1224,19 @@ const SettingsPage: React.FC = () => {
                         )}
                       </div>
 
-                      <div className="settings-field">
-                        <label>Current password (leave blank for Google-only accounts)</label>
-                        <input
-                          className="dialog-input"
-                          type="password"
-                          value={deletePassword}
-                          onChange={(e) => setDeletePassword(e.target.value)}
-                          placeholder="Your password"
-                          autoComplete="current-password"
-                        />
-                      </div>
+                      {accountHasLocalPassword && (
+                        <div className="settings-field">
+                          <label>Current password</label>
+                          <input
+                            className="dialog-input"
+                            type="password"
+                            value={deletePassword}
+                            onChange={(e) => setDeletePassword(e.target.value)}
+                            placeholder="Your password"
+                            autoComplete="current-password"
+                          />
+                        </div>
+                      )}
 
                       <div className="settings-field">
                         <label>Type <strong>DELETE</strong> to confirm</label>
@@ -1112,6 +1276,91 @@ const SettingsPage: React.FC = () => {
           </section>
         )}
 
+        {/* ── Printing ──
+            Only where there is a choice to make. iPad, iPhone and Android have
+            no print dialog of their own — printRoute() explains why — so they
+            print the PDF whatever this says, and a switch that changed nothing
+            would be worse than no switch at all. */}
+        {printRoute() === 'dialog' && (
+        <section className="settings-section">
+          <h2 className="settings-section-title">Printing</h2>
+          <p className="settings-section-desc">
+            What File &rarr; Print sends to the printer.
+          </p>
+
+          <div className="settings-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={printViaPdf}
+                onChange={(e) => setPrintViaPdf(e.target.checked)}
+              />{' '}
+              Print the PDF, so the pages match the ones on screen
+            </label>
+            <div className="settings-hint">
+              The editor draws its page turns rather than making them, so
+              printing the page asks the browser to lay the script out a second
+              time &mdash; and it can end its pages somewhere else. Printing the
+              PDF gives the pages you have been looking at, and the same
+              document anyone you send the export to would read. Turn this off
+              to use the browser's own print dialog instead, which is quicker on
+              a long script and is what its margin and scaling controls apply
+              to.
+            </div>
+          </div>
+        </section>
+        )}
+
+        {/* ── Table Read (issue #131) ── */}
+        <section className="settings-section">
+          <h2 className="settings-section-title">Table Read Voices</h2>
+          <p className="settings-section-desc">
+            The voices Tools &rarr; Table Read uses to read the script aloud: the ones
+            installed on this {isTauriApp() ? 'device' : 'computer'}, or an AI voice provider.
+            Each character&rsquo;s voice is chosen on their profile in the Characters panel.
+          </p>
+          <VoiceProviderSettings />
+        </section>
+
+        {/* ── Editing ── */}
+        <section className="settings-section">
+          <h2 className="settings-section-title">Editing</h2>
+          <p className="settings-section-desc">
+            How the editor responds while you write.
+          </p>
+
+          <div className="settings-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={elementMenuOnEnter}
+                onChange={(e) => setElementMenuOnEnter(e.target.checked)}
+              />{' '}
+              Offer the element menu when I press Enter on a blank line
+            </label>
+            <div className="settings-hint">
+              On a blank line, Enter opens a menu of element types. Press Enter
+              again — or choose Blank Line — to keep the blank line instead.
+              Turn this off to make Enter always insert a plain line.
+            </div>
+          </div>
+
+          <div className="settings-row">
+            <label htmlFor="element-menu-shortcut">Element menu shortcut</label>
+            <ShortcutField
+              id="element-menu-shortcut"
+              value={elementMenuShortcut}
+              onChange={setElementMenuShortcut}
+            />
+            <div className="settings-hint">
+              Opens the element menu wherever the cursor is, on a blank line or
+              a line with text. This is the way to it if you turn the setting
+              above off. Click the box and press the keys you want; the
+              combination needs at least one of {isMacPlatform() ? '⌘, ⌥ or ⌃' : 'Ctrl or Alt'}.
+            </div>
+          </div>
+        </section>
+
         {/* ── Invite Defaults ── */}
         <section className="settings-section">
           <h2 className="settings-section-title">Invite Defaults</h2>
@@ -1121,7 +1370,7 @@ const SettingsPage: React.FC = () => {
 
           <div className="settings-row">
             <label>Default Token Expiry</label>
-            <select
+            <Select
               className="dialog-input settings-select"
               value={defaultInviteExpiry}
               onChange={(e) => setDefaultInviteExpiry(Number(e.target.value))}
@@ -1131,7 +1380,7 @@ const SettingsPage: React.FC = () => {
                   {opt.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         </section>
       </div>

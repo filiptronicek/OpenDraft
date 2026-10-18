@@ -38,6 +38,8 @@ async def list_projects():
 async def get_project(project_id: str):
     try:
         return project_service.get_project(project_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -45,6 +47,12 @@ async def get_project(project_id: str):
 @router.put("/reorder")
 async def reorder_projects(body: ReorderRequest):
     """Batch-update sort_order for multiple projects."""
+    try:
+        for item in body.items:
+            project_service.validate_resource_id(item.id, "Project")
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     for item in body.items:
         try:
             project_service.update_project(item.id, sort_order=item.sort_order)
@@ -61,6 +69,8 @@ async def update_project(project_id: str, body: ProjectUpdate):
             project_id, body.name, props,
             color=body.color, pinned=body.pinned, sort_order=body.sort_order,
         )
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -71,6 +81,8 @@ async def delete_project(project_id: str):
         project_service.delete_project(project_id)
         await run_hooks("project:deleted", project_id=project_id)
         return {"message": f"Project '{project_id}' deleted"}
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -89,6 +101,8 @@ async def create_script(
         return script_service.create_script(
             project_id, body.title, body.content, body.format
         )
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -97,6 +111,8 @@ async def create_script(
 async def list_scripts(project_id: str, include_preview: bool = False):
     try:
         return script_service.list_scripts(project_id, include_preview=include_preview)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -105,6 +121,8 @@ async def list_scripts(project_id: str, include_preview: bool = False):
 async def get_script(project_id: str, script_id: str):
     try:
         return script_service.get_script(project_id, script_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -119,6 +137,8 @@ async def duplicate_script(
     await run_gate_hooks(QUOTA_CHECK_CREATE_SCRIPT, user=user)
     try:
         return script_service.duplicate_script(project_id, script_id)
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -126,6 +146,14 @@ async def duplicate_script(
 @router.put("/{project_id}/scripts/reorder")
 async def reorder_scripts(project_id: str, body: ReorderRequest):
     """Batch-update sort_order for scripts in a project."""
+    try:
+        project_service.validate_resource_id(project_id, "Project")
+        for item in body.items:
+            project_service.validate_resource_id(item.id, "Script")
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
     for item in body.items:
         try:
             script_service.update_script(project_id, item.id, sort_order=item.sort_order)
@@ -154,6 +182,8 @@ async def update_script(project_id: str, script_id: str, body: ScriptUpdate):
             await run_hooks("script:after_save", project_id=project_id,
                             script_id=script_id, content=body.content)
         return result
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except script_service.EmptyOverwriteError as exc:
@@ -165,5 +195,7 @@ async def delete_script(project_id: str, script_id: str):
     try:
         script_service.delete_script(project_id, script_id)
         return {"message": f"Script '{script_id}' deleted"}
+    except project_service.InvalidResourceIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

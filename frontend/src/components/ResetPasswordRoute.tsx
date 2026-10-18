@@ -1,5 +1,5 @@
 /**
- * /reset-password?token=… landing page.
+ * /reset-password#token=… landing page (query form remains compatible).
  *
  * The forgot-password email carries a link here with an opaque token. The
  * user picks a new password; we POST {token, newPassword} to /reset-password.
@@ -7,18 +7,22 @@
  * the user to the app and let the normal sign-in flow take over.
  */
 
-import React, { useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { FaEye, FaEyeSlash } from 'react-icons/fa';
 import { collabAuthApi } from '../services/collabAuth';
 import { showToast } from './Toast';
+import { captureCapabilityParams, scrubCapabilityUrl } from '../services/capabilityUrl';
 
 type Status = 'idle' | 'submitting' | 'success' | 'error';
 
 const ResetPasswordRoute: React.FC = () => {
-  const [params] = useSearchParams();
   const navigate = useNavigate();
-  const token = params.get('token') || '';
+  const [{ token }] = useState(() => captureCapabilityParams(
+    ['token'] as const,
+    window.location.hash,
+    window.location.search,
+  ));
 
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -26,6 +30,10 @@ const ResetPasswordRoute: React.FC = () => {
   const [showConfirm, setShowConfirm] = useState(false);
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    scrubCapabilityUrl(window.location.pathname);
+  }, []);
 
   // Missing token = the user got here via something other than the email link.
   // We still render the form so the user can read why it's broken.

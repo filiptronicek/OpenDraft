@@ -5,7 +5,7 @@
  */
 
 import React, { useState } from 'react';
-import { collabAuthApi, handleAuthResponse } from '../services/collabAuth';
+import { collabAuthApi, handleAuthResponse, handleEmailVerificationResponse } from '../services/collabAuth';
 import { useSettingsStore } from '../stores/settingsStore';
 import { showToast } from './Toast';
 
@@ -31,11 +31,8 @@ const VerifyEmailDialog: React.FC<VerifyEmailDialogProps> = ({ onClose, onSucces
       // otherwise fall back to the unauthenticated /verify-email-link with
       // the user's email from local state.
       if (useSettingsStore.getState().collabAuth.accessToken) {
-        await collabAuthApi.verifyEmail(code.trim());
-        // Refresh cached user so emailVerified flips to true.
-        const refreshed = await collabAuthApi.getMe();
-        const current = useSettingsStore.getState().collabAuth;
-        useSettingsStore.getState().setCollabAuth({ ...current, user: refreshed });
+        const resp = await collabAuthApi.verifyEmail(code.trim());
+        handleEmailVerificationResponse(resp);
       } else {
         if (!user?.email) {
           showToast('No account in progress. Please sign up again.', 'error');

@@ -2,7 +2,7 @@ import { getApiBase } from '../config';
 import { useSettingsStore } from '../stores/settingsStore';
 import type { CollabAuth, CollabUser } from '../stores/settingsStore';
 import { platformFetch } from './platform';
-import { authedFetch } from './authedFetch';
+import { authedFetch, accessTokenExpired, refreshAccessToken } from './authedFetch';
 import { getDeviceInfo, getDeviceId } from './deviceId';
 
 // ── URL helpers ──
@@ -24,15 +24,25 @@ function wrapNetworkError(err: unknown, where: string): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
-async function parseError(res: Response, fallbackLabel: string): Promise<Error> {
+/** An error the server answered with — `status` tells a refused refresh
+ *  token (401) apart from a busy or broken server (429, 5xx). */
+export class AuthHttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function parseError(res: Response, fallbackLabel: string): Promise<AuthHttpError> {
   try {
     const body = await res.json();
     const msg = body?.error || body?.detail?.error || body?.detail?.message
       || body?.detail || body?.message;
-    if (typeof msg === 'string') return new Error(msg);
-    return new Error(`${fallbackLabel} error ${res.status}`);
+    if (typeof msg === 'string') return new AuthHttpError(msg, res.status);
+    return new AuthHttpError(`${fallbackLabel} error ${res.status}`, res.status);
   } catch {
-    return new Error(`${fallbackLabel} error ${res.status}`);
+    return new AuthHttpError(`${fallbackLabel} error ${res.status}`, res.status);
   }
 }
 
@@ -68,25 +78,6 @@ async function backendAuthRequest<T>(path: string, options?: RequestInit): Promi
   return res.json();
 }
 
-async function backendAuthRequestRaw(path: string, options?: RequestInit): Promise<Response> {
-  const base = getApiBase();
-  if (!base) {
-    throw new Error('OpenDraft Cloud is not configured for this app. Open Settings → System Settings to set the OpenDraft server URL.');
-  }
-  const url = `${base}/auth${path}`;
-  try {
-    return await platformFetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Device-Id': getDeviceId(),
-        ...options?.headers,
-      },
-    });
-  } catch (err) {
-    throw wrapNetworkError(err, 'the OpenDraft backend');
-  }
-}
 
 /** Same as backendAuthRequest but attaches the bearer token and refreshes on 401. */
 async function backendAuthedRequest<T>(path: string, options?: RequestInit): Promise<T> {
@@ -112,25 +103,6 @@ async function backendAuthedRequest<T>(path: string, options?: RequestInit): Pro
   return res.json();
 }
 
-/**
- * Collab-server HTTP — used ONLY for endpoints that live on the collab
- * server itself (reset-document, close-document, revoke-my-sessions). Auth
- * endpoints go through backendAuthRequest above.
- */
-async function collabRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const base = getCollabHttpBase();
-  let res: Response;
-  try {
-    res = await platformFetch(`${base}${path}`, {
-      ...options,
-      headers: { 'Content-Type': 'application/json', ...options?.headers },
-    });
-  } catch (err) {
-    throw wrapNetworkError(err, 'the collaboration server');
-  }
-  if (!res.ok) throw await parseError(res, 'Collab');
-  return res.json();
-}
 
 async function collabAuthedRequest<T>(path: string, options?: RequestInit): Promise<T> {
   const base = getCollabHttpBase();
@@ -148,6 +120,12 @@ async function collabAuthedRequest<T>(path: string, options?: RequestInit): Prom
 }
 
 // ── API types ──
+
+export interface EmailVerificationResponse {
+  message: string;
+  user: CollabUser;
+  accessToken: string;
+}
 
 export interface AuthResponse {
   user: CollabUser;
@@ -170,7 +148,12 @@ export function isDeviceChallenge(r: LoginResponse): r is DeviceChallengeRespons
 }
 
 export interface CollabServerConfig {
+  /** Missing on older servers and therefore treated as enabled by clients. */
+  localLoginEnabled?: boolean;
+  localRegistrationEnabled: boolean;
   googleEnabled: boolean;
+  oidcEnabled: boolean;
+  oidcDisplayName: string;
   emailVerificationRequired: boolean;
   /** Whether outbound SMTP is configured. When false, 2FA cannot be enabled. */
   smtpConfigured?: boolean;
@@ -186,6 +169,11 @@ export interface DeviceRecord {
   firstSeenAt: string;
   lastSeenAt: string;
   current: boolean;
+}
+
+/** Backward compatible: local login existed before the config flag did. */
+export function isLocalLoginEnabled(config: CollabServerConfig | null | undefined): boolean {
+  return config?.localLoginEnabled !== false;
 }
 
 // ── API methods ──
@@ -231,7 +219,7 @@ export const collabAuthApi = {
     }),
 
   verifyEmail: (code: string) =>
-    backendAuthedRequest<{ message: string }>('/verify-email', {
+    backendAuthedRequest<EmailVerificationResponse>('/verify-email', {
       method: 'POST',
       body: JSON.stringify({ code }),
     }),
@@ -254,6 +242,22 @@ export const collabAuthApi = {
     backendAuthRequest<AuthResponse>('/google', {
       method: 'POST',
       body: JSON.stringify({ idToken, device: getDeviceInfo() }),
+    }),
+
+  /** Exchange the short-lived, one-use browser handoff for normal app tokens. */
+  exchangeOidcCode: (code: string) =>
+    backendAuthRequest<AuthResponse>('/oidc/exchange', {
+      method: 'POST',
+      credentials: 'include',
+      body: JSON.stringify({ code, device: getDeviceInfo() }),
+    }),
+
+  /** Begin explicit linking for an already-authenticated local account. */
+  startOidcLink: () =>
+    backendAuthedRequest<{ authorizationUrl: string }>('/oidc/link/start', {
+      method: 'POST',
+      credentials: 'include',
+      body: JSON.stringify({ device: getDeviceInfo() }),
     }),
 
   /** Change the password for the authenticated user. Server also revokes
@@ -303,15 +307,11 @@ export const collabAuthApi = {
    *  accounts, supply confirmation: 'DELETE'. After this returns 200 the
    *  caller MUST clear local auth state — the access token still references
    *  a user that no longer exists. */
-  deleteAccount: async (opts: { password?: string; confirmation?: string }) => {
-    const res = await backendAuthRequestRaw('/account', {
+  deleteAccount: (opts: { password?: string; confirmation?: string }) =>
+    backendAuthedRequest<{ message: string }>('/account', {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${useSettingsStore.getState().collabAuth.accessToken ?? ''}` },
       body: JSON.stringify(opts),
-    });
-    if (!res.ok) throw await parseError(res, 'Auth');
-    return res.json() as Promise<{ message: string }>;
-  },
+    }),
 
   getMe: () =>
     backendAuthedRequest<CollabUser>('/me'),
@@ -334,14 +334,14 @@ export const collabAuthApi = {
 
   /** Reset a document's persisted Yjs state on the collab server (called by host before starting a new session) */
   resetDocument: (documentName: string, token: string) =>
-    collabRequest<{ status: string }>('/api/reset-document', {
+    collabAuthedRequest<{ status: string }>('/api/reset-document', {
       method: 'POST',
       body: JSON.stringify({ documentName, token }),
     }),
 
   /** Close all connections for a document (called by host after ending a session) */
   closeDocument: (documentName: string) =>
-    collabRequest<{ status: string }>('/api/close-document', {
+    collabAuthedRequest<{ status: string }>('/api/close-document', {
       method: 'POST',
       body: JSON.stringify({ documentName }),
     }),
@@ -351,25 +351,67 @@ export const collabAuthApi = {
     collabAuthedRequest<{ message: string }>('/api/collab/my-sessions', { method: 'DELETE' }),
 };
 
-// ── Helper: check if current auth is valid (token present and not expired) ──
-
-export function isCollabAuthenticated(): boolean {
-  const { collabAuth } = useSettingsStore.getState();
-  if (!collabAuth.accessToken) return false;
-  try {
-    const payload = JSON.parse(atob(collabAuth.accessToken.split('.')[1]));
-    if (payload.exp && payload.exp * 1000 < Date.now()) {
-      // Token expired — clear it
-      console.log('[collabAuth] Access token expired, clearing auth');
-      useSettingsStore.getState().clearCollabAuth();
-      return false;
-    }
-  } catch {
-    // Malformed token
-    useSettingsStore.getState().clearCollabAuth();
-    return false;
+/**
+ * Older server responses predate auth-method metadata, so absence must retain
+ * the legacy local-account UI. New external-only accounts explicitly return
+ * `hasPassword: false` or an authMethods list without a local method.
+ */
+export function hasLocalPassword(user: CollabUser | null | undefined): boolean {
+  if (!user) return false;
+  if (typeof user.hasPassword === 'boolean') return user.hasPassword;
+  if (Array.isArray(user.authMethods)) {
+    return user.authMethods.some((method) => {
+      const normalized = method.toLowerCase();
+      return normalized === 'password' || normalized === 'local';
+    });
   }
   return true;
+}
+
+export function isOidcUser(user: CollabUser | null | undefined): boolean {
+  return Boolean(user?.authMethods?.some((method) => method.toLowerCase() === 'oidc'));
+}
+
+// ── Helper: make sure we hold a usable access token ──
+
+/**
+ * `ok`          — signed in with an access token that is good to use.
+ * `signed-out`  — no session; ask the user to sign in.
+ * `unavailable` — still signed in, but the token could not be renewed just
+ *                 now (rate limit, server down, offline). Asking for a
+ *                 password here would look like being signed out; say
+ *                 "try again" instead.
+ */
+export type CollabAuthStatus = 'ok' | 'signed-out' | 'unavailable';
+
+/** Shown when the session is fine but could not be renewed right now. */
+export const COLLAB_AUTH_UNAVAILABLE_MESSAGE =
+  'Could not reach the OpenDraft server to renew your sign-in. Please try again in a moment.';
+
+/**
+ * Check the user is signed in, renewing an expired access token first.
+ * Access tokens last minutes; the refresh token lasts days — an expired
+ * access token is routine, not a reason to sign out. Only a refresh token
+ * the server refuses ends the session. Never throws.
+ */
+export async function ensureCollabAuthenticated(): Promise<CollabAuthStatus> {
+  try {
+    const { collabAuth } = useSettingsStore.getState();
+    if (!collabAuth.accessToken && !collabAuth.refreshToken) return 'signed-out';
+    if (collabAuth.accessToken && !accessTokenExpired(collabAuth.accessToken)) return 'ok';
+    if (!collabAuth.refreshToken) {
+      console.log('[collabAuth] Access token expired and no refresh token, clearing auth');
+      useSettingsStore.getState().clearCollabAuth();
+      return 'signed-out';
+    }
+    if (await refreshAccessToken()) return 'ok';
+    // A refused refresh token is cleared; one that survived just could not
+    // be renewed right now.
+    return useSettingsStore.getState().collabAuth.refreshToken ? 'unavailable' : 'signed-out';
+  } catch (err) {
+    console.error('[collabAuth] could not check the session:', err);
+    return useSettingsStore.getState().collabAuth.refreshToken ? 'unavailable' : 'signed-out';
+  }
 }
 
 // ── Helper: handle auth response and store tokens ──
@@ -381,6 +423,19 @@ export function handleAuthResponse(response: AuthResponse): CollabAuth {
     user: response.user,
   };
   console.log('[collabAuth] Authenticated as', auth.user?.displayName);
+  useSettingsStore.getState().setCollabAuth(auth);
+  return auth;
+}
+
+export function handleEmailVerificationResponse(
+  response: EmailVerificationResponse,
+): CollabAuth {
+  const current = useSettingsStore.getState().collabAuth;
+  const auth: CollabAuth = {
+    accessToken: response.accessToken,
+    refreshToken: current.refreshToken,
+    user: response.user,
+  };
   useSettingsStore.getState().setCollabAuth(auth);
   return auth;
 }
@@ -409,7 +464,7 @@ export function setLogoutEditorReset(fn: (() => Promise<void>) | null): void {
 }
 
 export async function performLogout(): Promise<void> {
-  const { collabAuth, clearCollabAuth } = useSettingsStore.getState();
+  const { clearCollabAuth } = useSettingsStore.getState();
 
   // 1. End any active collab session in the editor
   if (_onLogoutCollabTeardown) {
@@ -423,13 +478,15 @@ export async function performLogout(): Promise<void> {
   }
 
   // 3. Revoke all collab invite links this user created on the server
-  if (collabAuth.accessToken) {
+  if (useSettingsStore.getState().collabAuth.accessToken) {
     try { await collabAuthApi.revokeMyCollabSessions(); } catch { /* best-effort */ }
   }
 
-  // 4. Revoke the refresh token on the server
-  if (collabAuth.refreshToken) {
-    try { await collabAuthApi.logout(collabAuth.refreshToken); } catch { /* best-effort */ }
+  // 4. Re-read and revoke the latest refresh token. Earlier teardown/save
+  //    requests may have rotated it through authedFetch.
+  const currentRefreshToken = useSettingsStore.getState().collabAuth.refreshToken;
+  if (currentRefreshToken) {
+    try { await collabAuthApi.logout(currentRefreshToken); } catch { /* best-effort */ }
   }
 
   // 5. Clear local auth state

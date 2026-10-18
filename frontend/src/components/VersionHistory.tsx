@@ -166,7 +166,7 @@ const VersionHistory: React.FC = () => {
       const version = restoreConfirm;
       setRestoreConfirm(null);
       try {
-        await api.restoreVersion(currentProject.id, version.hash);
+        const restored = await api.restoreVersion(currentProject.id, version.hash);
         await loadVersions();
         setSelectedVersion(null);
         setDiffText(null);
@@ -187,7 +187,14 @@ const VersionHistory: React.FC = () => {
         } else {
           triggerScriptReload();
         }
-        showToast(`Restored to version ${version.short_hash}`, 'success');
+        if (restored.backup?.status === 'failed') {
+          showToast(
+            'Restored ' + version.short_hash + ' locally, but the Git backup failed',
+            'error',
+          );
+        } else {
+          showToast('Restored to version ' + version.short_hash, 'success');
+        }
       } catch (err) {
         showToast(`Restore failed: ${err instanceof Error ? err.message : 'unknown error'}`, 'error');
       }
@@ -286,7 +293,13 @@ const VersionHistory: React.FC = () => {
                         setVersionHistoryOpen(false);
                         setSelectedVersion(null);
                         setDiffText(null);
-                        navigate(`/project/${currentProject.id}/history/${currentScriptId}/${v.hash}`);
+                        // Record where read-only history mode was entered from
+                        // so its "Back to Current Version" can unwind rather
+                        // than push another editor entry (issue #66).
+                        navigate(
+                          `/project/${currentProject.id}/history/${currentScriptId}/${v.hash}`,
+                          { state: { from: `/project/${currentProject.id}/edit/${currentScriptId}` } },
+                        );
                       }
                     }}
                     title="View this version in the editor (read-only)"

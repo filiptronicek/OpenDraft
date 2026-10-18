@@ -1,19 +1,34 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Editor } from '@tiptap/react';
-import { useEditorStore, DEFAULT_PAGE_LAYOUT } from '../stores/editorStore';
+import type { JSONContent } from '@tiptap/core';
+import { useEditorStore, DEFAULT_PAGE_LAYOUT, printedPageNumber, resolveHeaderFooter } from '../stores/editorStore';
+import type { DocumentOrigin } from '../stores/editorStore';
 import { useProjectStore } from '../stores/projectStore';
 import { useAssetStore } from '../stores/assetStore';
 import { api } from '../services/api';
+import { requestHandwriting } from '../utils/handwriting';
+import { requestElementMenu } from '../utils/elementMenu';
+import { isInAvRow, isInAvCell, avCellSideAt, avRowContext, readColumnConfig, avColumnDataCount, avBlockAtSelection, AV_DEFAULT_COLUMNS, AV_ASPECT_RATIOS, AV_BLANK_FRAME } from '../editor/extensions/AvBlock';
+import { avCellElementRules, scriptBodyElementRules } from '../utils/avCellElements';
+import { chooseAvFrameImage } from '../utils/avFrame';
+import { formatShortcut } from '../utils/shortcuts';
 import { showToast } from './Toast';
-import { downloadFDX, exportFDX } from '../utils/fdxExporter';
-import { downloadFountain, exportFountain } from '../utils/fountainExporter';
-import { exportFadeIn, exportOSF } from '../utils/osfExporter';
-import { exportPDF } from '../utils/pdfExporter';
+import { downloadFDX } from '../utils/fdxExporter';
+import { downloadFountain } from '../utils/fountainExporter';
+import { exportFadeIn } from '../utils/osfExporter';
+import {
+  serializeContentForFormat, extensionOfPath, isLinkableExtension, normalizeLinkedFormat, linkedFileName,
+} from '../utils/linkedFileFormat';
+import { useLinkedFileStore, autoSaveAppliesToOpenDocument } from '../stores/linkedFileStore';
+import { exportPDF, renderPDF, type PDFExportOptions } from '../utils/pdfExporter';
+import { buildExportFootnotePlan } from '../utils/exportFootnotes';
 import { downloadDocx } from '../utils/docxExporter';
 import { parseDocx } from '../utils/docxImporter';
-import { serializeOdraft, downloadOdraft } from '../utils/odraftFormat';
+import { downloadOdraft } from '../utils/odraftFormat';
+import { packScratchAssets } from '../services/snapshotAssets';
 import { pasteAsFountain } from '../utils/pasteFountain';
+import { copySelection, cutSelection, pasteIntoEditor } from '../utils/clipboardCommands';
 import {
   parseScreenplayImport,
   resetStoresForImport,
@@ -25,14 +40,20 @@ import PageSetupDialog from './PageSetupDialog';
 import TemplateSelectDialog from './TemplateSelectDialog';
 import ScriptFormatPreferencesDialog from './ScriptFormatPreferencesDialog';
 import ScriptFormatPickerDialog from './ScriptFormatPickerDialog';
-import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
+import { useFormattingTemplateStore, ensureTemplatesLoaded } from '../stores/formattingTemplateStore';
+import { hasNumbering, numberingRulesOf } from '../utils/elementNumbers';
 import { applyScriptFormat } from '../utils/applyScriptFormat';
+import { isTitlePageRuleId, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
 import { INDUSTRY_STANDARD_ID, ELEMENT_DESCRIPTIONS } from '../stores/formattingTypes';
 import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFormatting';
 import { selectionStartsNewPage } from '../editor/extensions';
 import { pluginRegistry } from '../plugins/registry';
+import { useTableReadStore } from '../stores/tableReadStore';
+import { isAiProviderConfigured, useVoiceSettingsStore } from '../stores/voiceSettingsStore';
+import { activeEngineKind } from '../services/tts/engines';
 import AuthIndicator from './AuthIndicator';
 import { useNavigate } from 'react-router-dom';
+import { flushPendingSave, setLeaveGuard, leaveEditor as leaveEditorScreen } from '../services/pendingSave';
 import { scriptApi } from '../services/scriptApi';
 import { useSettingsStore } from '../stores/settingsStore';
 import { clearEditorHistory } from '../editor/clearHistory';
@@ -72,6 +93,8 @@ import {
 } from '../services/backupService';
 import { useBackupStatusStore, describeBackupError } from '../stores/backupStatusStore';
 import RecoverBackupDialog from './RecoverBackupDialog';
+import BackupFolderPrompt from './BackupFolderPrompt';
+import UserManualDialog from './UserManualDialog';
 import {
   openBinaryFile,
   openTextOrBinaryFile,
@@ -80,7 +103,8 @@ import {
   supportsOpenInPlace,
   type InPlaceDocument,
 } from '../utils/fileOps';
-import { isDesktopTauri, supportsMultipleWindows } from '../services/platform';
+import { isDesktopTauri, isWeb, printRoute, supportsApplePencil, supportsMultipleWindows } from '../services/platform';
+import { checkForUpdate } from '../services/updateCheck';
 import { getCompatEntries } from '../services/compat';
 import { reportSaveError } from '../stores/saveErrorStore';
 import type { MenuSection as PluginMenuSection } from '../plugins/registry';
@@ -92,12 +116,14 @@ import {
   FaPalette,
   FaEye,
   FaWrench,
-  FaEllipsisH,
+  FaQuestionCircle,
   FaFileImport,
   FaFolderOpen,
   FaArchive,
   FaSave,
   FaFileExport,
+  FaFileExcel,
+  FaFileCsv,
   FaFileCode,
   FaFilePdf,
   FaFileWord,
@@ -129,6 +155,7 @@ import {
   FaCommentDots,
   FaHeading,
   FaImage,
+  FaClock,
   FaCompass,
   FaTh,
   FaStream,
@@ -139,14 +166,16 @@ import {
   FaAdjust,
   FaToolbox,
   FaUserFriends,
+  FaMicrophoneAlt,
   FaSignInAlt,
   FaProjectDiagram,
   FaFilm,
   FaBoxes,
   FaBars,
   FaInfoCircle,
-  FaKeyboard,
+  FaBook,
   FaStethoscope,
+  FaCloudDownloadAlt,
   FaSearchPlus,
   FaSearchMinus,
   FaUpload,
@@ -159,7 +188,31 @@ import {
   FaToggleOn,
   FaLock,
   FaFileSignature,
+  FaFont,
+  FaSun,
+  FaMoon,
+  FaRegFileAlt,
+  FaStepForward,
+  FaEraser,
+  FaUnlock,
+  FaSlidersH,
+  FaBan,
 } from 'react-icons/fa';
+import { REVISION_COLORS, nextRevisionColor } from '../editor/revisionColors';
+import RevisionSettingsDialog from './RevisionSettingsDialog';
+import ScriptProfileDialog from './ScriptProfileDialog';
+import { DEFAULT_SCRIPT_PROFILE } from '../utils/scriptProfile';
+import { pagesLocked } from '../editor/extensions/LockedPages';
+import { omitSceneTransaction, sceneOmittedAt } from '../editor/omitScene';
+
+/** What Fade In carries beyond the text: Revision Mode's colour and marks,
+ *  and how scenes are numbered. */
+function osfExtras(s: ReturnType<typeof useEditorStore.getState>) {
+  return {
+    revisions: { color: s.revisionMode ? s.revisionColor : '', settings: s.revisionSettings },
+    sceneNumbers: { visible: s.sceneNumbersVisible, locked: s.sceneNumbersLocked },
+  };
+}
 
 interface MenuBarProps {
   editor: Editor | null;
@@ -223,6 +276,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
   const menuRef = useRef<HTMLDivElement>(null);
   // Platform-aware modifier key symbol for shortcut labels
   const mod = /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl+';
+  // Written the way this platform writes it, from whatever the writer set.
+  const elementMenuShortcut = useSettingsStore((s) => s.elementMenuShortcut);
+  const printViaPdf = useSettingsStore((s) => s.printViaPdf);
+  const tableReadOpen = useTableReadStore((s) => s.open);
   const {
     navigatorOpen,
     toggleNavigator,
@@ -244,6 +301,11 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setTagsVisible,
     revisionMode,
     setRevisionMode,
+    revisionColor,
+    setRevisionColor,
+    advanceRevisionColor,
+    showRevisionColors,
+    setShowRevisionColors,
     documentTitle,
     pageLayout,
     setSearchOpen,
@@ -258,8 +320,8 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setOpenFileOpen,
     setPostSaveAction,
     setSaveAsOpen,
-    theme,
-    setTheme,
+    appearance,
+    setAppearance,
     toolbarMode,
     setToolbarMode,
     zoomLevel,
@@ -273,6 +335,9 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setSceneNumbersVisible,
     sceneNumbersLocked,
     setSceneNumbersLocked,
+    elementNumbersVisible,
+    setElementNumbersVisible,
+    pageLabels,
   } = useEditorStore();
 
   const {
@@ -305,42 +370,71 @@ const MenuBar: React.FC<MenuBarProps> = ({
   const serializeForOrigin = useCallback(
     async (format: string): Promise<string | Uint8Array> => {
       if (!editor) throw new Error('No document is open.');
-      const doc = editor.getJSON();
       const s = useEditorStore.getState();
-
-      if (format === 'fdx') {
-        return exportFDX(doc, s.documentTitle, s.characterProfiles, s.tagCategories, s.tags,
-          s.beats, s.beatColumns, s.pageLayout, { family: s.fontFamily, size: s.fontSize });
-      }
-      if (format === 'fountain' || format === 'txt') {
-        return exportFountain(doc);
-      }
-      const font = { family: s.fontFamily, size: String(s.fontSize) };
+      // Fade In's archive is the one binary format; it stays here because
+      // only a file opened in place is ever written in it.
       if (format === 'fadein') {
-        return exportFadeIn(doc, { font });
+        return exportFadeIn(editor.getJSON(), { font: { family: s.fontFamily, size: String(s.fontSize) }, ...osfExtras(s) });
       }
-      if (format === 'osf') {
-        return exportOSF(doc, { font });
-      }
-      if (format === 'odraft') {
-        // The native format, and the only one that carries everything: the
-        // notes, tags, beats and profiles the others have nowhere to put. It
-        // therefore saves the whole payload, not the bare editor JSON.
-        const content = buildSaveContent();
-        if (!content) throw new Error('No document is open.');
-        return serializeOdraft(
-          {
-            id: '', title: s.documentTitle, author: '', format: 'json',
-            created_at: '', updated_at: '', page_count: s.pageCount,
-            size_bytes: 0, color: '', pinned: false, sort_order: 0, preview: '',
-          },
-          content,
-        );
-      }
-      throw new Error(`OpenDraft cannot write .${format} files.`);
+      // Everything else goes through the same serializer as files linked to
+      // library scripts (issue #135), so the two can never write a format
+      // differently. It works from the saved payload, which carries the
+      // notes, beats and profiles .odraft keeps and .fdx partly does.
+      const content = buildSaveContent();
+      if (!content) throw new Error('No document is open.');
+      return serializeContentForFormat(format, content, s.documentTitle, {
+        font: { family: s.fontFamily, size: s.fontSize },
+        meta: { page_count: s.pageCount },
+      });
     },
     [editor, buildSaveContent],
   );
+
+  /**
+   * Write the open document back over the file it was opened from.
+   *
+   * Shared by Save and the file auto-save. Returns whether the file now holds
+   * the document. An auto-save that keeps failing — a network drive that has
+   * gone away — reports it once, when it starts failing, rather than on every
+   * tick; the status bar carries the error in between.
+   */
+  const saveInPlace = useCallback(async (origin: DocumentOrigin, auto: boolean): Promise<boolean> => {
+    const { setSaveStatus, saveStatus: before } = useEditorStore.getState();
+    // ProseMirror documents are immutable, so a different object afterwards
+    // means the writer kept typing while the file was written — and those
+    // edits are not in it. Edits made during 'saving' do not mark the document
+    // unsaved on their own, so this is the only thing that would notice.
+    const docBefore = editor?.state.doc;
+    setSaveStatus('saving');
+    try {
+      await saveDocumentInPlace(origin.bookmark, await serializeForOrigin(origin.format));
+      // The writer may have opened something else while the write was in
+      // flight; the status now belongs to that document, not this one.
+      if (useEditorStore.getState().documentOrigin?.bookmark !== origin.bookmark) return true;
+      if (editor && !editor.isDestroyed && editor.state.doc !== docBefore) {
+        setSaveStatus('unsaved');
+        return true;
+      }
+      setSaveStatus('saved');
+      // The file now holds this document, so the editor's library bookkeeping
+      // and the recovery snapshot must both stop treating it as unsaved work.
+      const savedPayload = buildSaveContent();
+      if (savedPayload) onDocumentSaved?.(JSON.stringify(savedPayload));
+      clearRecoverySnapshot();
+      return true;
+    } catch (err) {
+      console.error(auto ? 'Auto-save in place failed:' : 'Save in place failed:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      // Left in the error state on purpose: the file did NOT receive this
+      // text, and showing "saved" would be telling the writer their work is
+      // safe somewhere it is not.
+      setSaveStatus('error', msg);
+      if (!auto || before !== 'error') {
+        showToast(`Could not save to ${origin.name}: ${msg}`, 'error');
+      }
+      return false;
+    }
+  }, [editor, serializeForOrigin, buildSaveContent, onDocumentSaved]);
 
   // ── Save current editor content to backend ──
   const handleSave = useCallback(async () => {
@@ -352,26 +446,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
     // is the whole point of opening in place.
     const origin = useEditorStore.getState().documentOrigin;
     if (origin) {
-      const { setSaveStatus } = useEditorStore.getState();
-      setSaveStatus('saving');
-      try {
-        await saveDocumentInPlace(origin.bookmark, await serializeForOrigin(origin.format));
-        setSaveStatus('saved');
-        // The file now holds this document, so the editor's auto-save and the
-        // recovery snapshot must both stop treating it as unsaved work. An
-        // in-place document has no auto-save tick to correct them later.
-        const savedPayload = buildSaveContent();
-        if (savedPayload) onDocumentSaved?.(JSON.stringify(savedPayload));
-        clearRecoverySnapshot();
-      } catch (err) {
-        console.error('Save in place failed:', err);
-        const msg = err instanceof Error ? err.message : String(err);
-        // Left in the error state on purpose: the file did NOT receive this
-        // text, and showing "saved" would be telling the writer their work is
-        // safe somewhere it is not.
-        setSaveStatus('error', msg);
-        showToast(`Could not save to ${origin.name}: ${msg}`, 'error');
-      }
+      await saveInPlace(origin, false);
       return;
     }
 
@@ -386,6 +461,13 @@ const MenuBar: React.FC<MenuBarProps> = ({
       const content = buildSaveContent();
       await scriptApi.saveScript(currentProject.id, currentScriptId, { content });
       setSaveStatus('saved');
+      // A script linked to a file on disk is safe in the library either way,
+      // but the writer pressed Save expecting their file to have it too.
+      const fileStatus = useLinkedFileStore.getState().byScript[currentScriptId];
+      if (fileStatus?.state === 'pending' && fileStatus.error) {
+        const name = fileStatus.path.split(/[/\\]/).pop() || fileStatus.path;
+        showToast(`Saved in OpenDraft, but not to ${name}: ${fileStatus.error}. OpenDraft will keep trying.`, 'error');
+      }
       // The user's real copy now holds this text, so there is nothing left to
       // recover. Done here as well as in the snapshot hook because an explicit
       // save goes through this path without touching the auto-save bookkeeping
@@ -400,7 +482,38 @@ const MenuBar: React.FC<MenuBarProps> = ({
       // get the blocking modal so the user can't miss them.
       reportSaveError(err, 'manual-save');
     }
-  }, [editor, currentProject, currentScriptId, buildSaveContent, setSaveAsOpen, serializeForOrigin, onDocumentSaved]);
+  }, [editor, currentProject, currentScriptId, buildSaveContent, setSaveAsOpen, saveInPlace]);
+
+  /**
+   * Leave the editor for another screen of the app.
+   *
+   * Router navigation, not `window.location`: a full page load tore the whole
+   * app down and rebuilt it, and it reset the history stack, so the Projects
+   * screen's back arrow had nothing to return to and fell back to reloading
+   * the editor from scratch instead of returning to the script the user left
+   * (issues #65, #66).
+   *
+   * The catch is that a router navigation fires neither `beforeunload` nor
+   * Tauri's close handler, which are what used to flush unsaved text on the
+   * way out, and the editor's auto-save tick is 30 seconds wide. So flush
+   * first — awaited, which is more than the unload handler could promise in a
+   * WebView. flushPendingSave is a no-op when there is nothing outstanding, or
+   * no document with somewhere to save to.
+   */
+  const leaveEditor = useCallback(async (go: () => void) => {
+    // Through the shared guard registered below, so the account menu leaves
+    // the editor the same way this menu does.
+    await leaveEditorScreen(go);
+  }, []);
+
+  const goToProjects = useCallback(
+    () => { void leaveEditor(() => navigate('/projects')); },
+    [leaveEditor, navigate],
+  );
+  const goToSettings = useCallback(
+    () => { void leaveEditor(() => navigate('/settings')); },
+    [leaveEditor, navigate],
+  );
 
   /** Save As: always opens the destination/project/filename picker, even when
    *  the current document is already saved. Use this to fork a local script
@@ -410,12 +523,160 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setSaveAsOpen(true);
   }, [editor, setSaveAsOpen]);
 
+  /**
+   * Save to File As… (desktop, issue #135).
+   *
+   * For a library script: write it to a file the writer picks and keep it
+   * linked, so every later save updates that file too. For a file opened from
+   * disk or a document not in the library: write it there and carry on
+   * editing that file, as Open File from Disk would.
+   */
+  const handleSaveToFileAs = useCallback(async () => {
+    if (!editor) return;
+    const s = useEditorStore.getState();
+    try {
+      const lf = await import('../services/linkedFiles');
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const origin = s.documentOrigin;
+      const ps = useProjectStore.getState();
+      if (!origin && currentProject && currentScriptId && ps.isCloudScript(currentProject.id, currentScriptId)) {
+        showToast('A cloud script cannot be linked to a file on this computer. Use File ▸ Export to save a copy.', 'error');
+        return;
+      }
+      const library = !origin && currentProject && currentScriptId
+        ? { projectId: currentProject.id, scriptId: currentScriptId }
+        : null;
+
+      let defaultDir: string | null = origin ? lf.dirnameOf(origin.bookmark) : null;
+      if (!defaultDir && library) {
+        const link = await lf.getLink(library.scriptId);
+        defaultDir = link ? lf.dirnameOf(link.path) : lf.projectFolder(currentProject);
+      }
+      if (!defaultDir) {
+        const { documentDir } = await import('@tauri-apps/api/path');
+        defaultDir = await documentDir();
+      }
+      const preferred = origin && isLinkableExtension(origin.format)
+        ? origin.format
+        : normalizeLinkedFormat(useSettingsStore.getState().defaultFileFormat);
+
+      const picked = await save({
+        title: 'Save to File',
+        defaultPath: lf.joinPath(defaultDir, linkedFileName(s.documentTitle || 'Untitled', preferred)),
+        filters: [
+          { name: 'OpenDraft', extensions: ['odraft'] },
+          { name: 'Fountain', extensions: ['fountain'] },
+          { name: 'Final Draft', extensions: ['fdx'] },
+        ],
+      });
+      if (!picked) return;
+      let path = picked;
+      let ext = extensionOfPath(path);
+      if (!isLinkableExtension(ext)) {
+        path = `${path}.${preferred}`;
+        ext = preferred;
+      }
+      const name = lf.basenameOf(path);
+
+      // One file, one script: two scripts saving to one file would overwrite
+      // each other on every save.
+      const taken = await lf.findLinkByPath(path);
+      if (taken && taken.scriptId !== library?.scriptId) {
+        showToast(`${name} is already where another script is saved. Choose a different name.`, 'error');
+        return;
+      }
+
+      if (library) {
+        const content = buildSaveContent();
+        if (!content) throw new Error('No document is open.');
+        s.setSaveStatus('saving');
+        // The library first, so the file gets exactly what is on screen.
+        await scriptApi.saveScript(library.projectId, library.scriptId, { content });
+        const outcome = await lf.linkScriptToFile(library.projectId, library.scriptId, path);
+        useLinkedFileStore.getState().setOpenScriptFile({ scriptId: library.scriptId, path });
+        s.setSaveStatus('saved');
+        onDocumentSaved?.(JSON.stringify(content));
+        clearRecoverySnapshot();
+        if (outcome === 'written') {
+          showToast(`Saved to ${name}. From now on, saving this script updates that file too.`, 'success');
+        } else {
+          const err = useLinkedFileStore.getState().byScript[library.scriptId]?.error;
+          showToast(`Linked to ${name}, but it could not be written yet${err ? `: ${err}` : ''}. OpenDraft will keep trying.`, 'error');
+        }
+        return;
+      }
+
+      s.setSaveStatus('saving');
+      await saveDocumentInPlace(path, await serializeForOrigin(ext));
+      // The document is that file now: Save writes back to it from here on.
+      s.setDocumentOrigin({ bookmark: path, name, format: ext });
+      // A draft still called "Untitled …" takes the file's name, as it would
+      // if the file were opened; a title the writer chose is kept.
+      const fileTitle = name.replace(/\.\w+$/, '');
+      if (fileTitle && (!s.documentTitle.trim() || /^untitled\b/i.test(s.documentTitle.trim()))) {
+        s.setDocumentTitle(fileTitle);
+      }
+      s.setSaveStatus('saved');
+      const saved = buildSaveContent();
+      if (saved) onDocumentSaved?.(JSON.stringify(saved));
+      clearRecoverySnapshot();
+      showToast(`Saved to ${name}. Save now writes to this file.`, 'success');
+    } catch (err) {
+      console.error('Save to File As failed:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      s.setSaveStatus('error', msg);
+      showToast(`Could not save to the file: ${msg}`, 'error');
+    }
+  }, [editor, currentProject, currentScriptId, buildSaveContent, serializeForOrigin, onDocumentSaved]);
+
+  /**
+   * Open Folder as Project… (desktop, issue #135): the folder becomes a
+   * project, its screenplay files become its scripts, and the project keeps
+   * saving to them.
+   */
+  const handleOpenFolderAsProject = useCallback(async () => {
+    try {
+      const lf = await import('../services/linkedFiles');
+      const folder = await lf.pickFolder('Open Folder as Project');
+      if (!folder) return;
+
+      const existing = (await api.listProjects()).find((p) => {
+        const f = lf.projectFolder(p);
+        return f !== null && lf.samePath(f, folder);
+      });
+      if (existing) {
+        showToast(`That folder is already the project "${existing.name}".`, 'info');
+        void leaveEditor(() => navigate(`/project/${existing.id}`, { state: { from: '/projects' } }));
+        return;
+      }
+
+      const { project, scan } = await lf.createProjectInFolder(
+        lf.projectNameForFolder(folder),
+        folder,
+        normalizeLinkedFormat(useSettingsStore.getState().defaultFileFormat),
+      );
+      const found = `${scan.added} script${scan.added === 1 ? '' : 's'} found`;
+      if (scan.failed.length > 0) {
+        showToast(`Opened ${project.name}: ${found}; could not read ${scan.failed.join(', ')}.`, 'info');
+      } else {
+        showToast(`Opened ${project.name}: ${found}.`, 'success');
+      }
+      void leaveEditor(() => navigate(`/project/${project.id}`, { state: { from: '/projects' } }));
+    } catch (err) {
+      console.error('Open folder as project failed:', err);
+      showToast(`Could not open the folder: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [leaveEditor, navigate]);
+
   // ── Unsaved-changes confirmation before New / Import ──
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
 
   // ── Word import: best-effort warning shown before opening the file picker ──
   const [docxImportWarningOpen, setDocxImportWarningOpen] = useState(false);
+  /** Pending "you are about to hide N rows' worth of work" confirmation, for
+   *  the AV column toggles. Null when nothing is being asked. */
+  const [avColumnWarning, setAvColumnWarning] = useState<{ which: 'cue' | 'image'; rows: number } | null>(null);
 
   /**
    * Set when a file in someone else's format has been opened in place, so the
@@ -513,6 +774,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   const handleDiscardConfirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
+    // The crash-recovery copy holds exactly the edits just thrown away. Left
+    // behind — leaving the editor for another screen unmounts it before the
+    // snapshot hook can notice — the next launch offers to "recover" them.
+    clearRecoverySnapshot();
     pendingAction?.();
     setPendingAction(null);
   }, [pendingAction]);
@@ -521,6 +786,47 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setDiscardConfirmOpen(false);
     setPendingAction(null);
   }, []);
+
+  // ── Leaving the editor for another screen ──
+  // With library auto-save on, outstanding work is flushed and the writer goes.
+  // With it off nothing may be written unasked (issue #135), and a library
+  // script is reloaded from the database on the way back, so they are asked —
+  // the same Save / Discard / Cancel as File → Open. Anything else open (a
+  // file from disk, an unsaved draft) is held in memory across the move by the
+  // editor's session stash, so it needs no question.
+  useEffect(() => {
+    return setLeaveGuard((go) => {
+      const libraryScript =
+        Boolean(currentProject && currentScriptId) && !useEditorStore.getState().documentOrigin;
+      if (libraryScript && !autoSaveAppliesToOpenDocument(useSettingsStore.getState(), false) && editorHasUnsavedChanges()) {
+        confirmOrRun(go);
+        return;
+      }
+      void flushPendingSave().then(go);
+    });
+  }, [currentProject, currentScriptId, editorHasUnsavedChanges, confirmOrRun]);
+
+  // ── Auto-save for a file opened from disk ──
+  // Opt-in (Settings → Saving): it rewrites the writer's own file unasked, and
+  // in another application's format that rewrite can drop what the format
+  // cannot hold. Retries while the last attempt failed, so a network drive that
+  // drops out and comes back catches up on its own.
+  const autoSaveFiles = useSettingsStore((s) => s.autoSaveFiles);
+  const autoSaveIntervalSeconds = useSettingsStore((s) => s.autoSaveIntervalSeconds);
+  useEffect(() => {
+    if (!hasFileOrigin || !autoSaveFiles || isCollabGuest) return;
+    let running = false;
+    const timer = setInterval(() => {
+      if (running) return;
+      const { documentOrigin, saveStatus } = useEditorStore.getState();
+      if (!documentOrigin || (saveStatus !== 'unsaved' && saveStatus !== 'error')) return;
+      running = true;
+      saveInPlace(documentOrigin, true)
+        .catch((err) => console.error('Auto-save in place threw:', err))
+        .finally(() => { running = false; });
+    }, autoSaveIntervalSeconds * 1000);
+    return () => clearInterval(timer);
+  }, [hasFileOrigin, autoSaveFiles, autoSaveIntervalSeconds, isCollabGuest, saveInPlace]);
 
   // ── Page Setup ──
   const [pageSetupOpen, setPageSetupOpen] = useState(false);
@@ -535,14 +841,142 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   // ── Per-attribute locking from active template ──
   const activeTemplate = useFormattingTemplateStore((s) => s.getActiveTemplate());
+  const formatNumbersElements = hasNumbering(numberingRulesOf(activeTemplate.rules));
   const isEnforceMode = activeTemplate.mode === 'enforce';
   const editorRule = editor ? getCurrentElementRule(editor, activeTemplate) : null;
   const locked = getLockedFormatting(editorRule, isEnforceMode);
   // Manual "start on a new page" flag for the element(s) under the cursor.
   const selectionOnNewPage = selectionStartsNewPage(editor);
+  // AV row actions only mean something inside a two-column AV body. The gate is
+  // the ROW, not the cell: clicking a storyboard frame selects the frame itself,
+  // which has no cell in its ancestry, and gating on the cell greyed out every
+  // AV control the moment the writer clicked the frame they wanted to fill.
+  const inAvRow = editor ? isInAvRow(editor.state) : false;
+  const avRowHint = inAvRow
+    ? undefined
+    : 'Put the cursor in an AV script\u2019s Video or Audio cell first';
+
+  /**
+   * The AV body and row under the cursor, for the column and storyboard menus.
+   *
+   * Read off the editor state rather than mirrored into React state: the menus
+   * only open on demand, and a stale checkmark is worse than the cost of two
+   * walks up the node tree.
+   *
+   * Memoised on the state itself. ProseMirror builds a new EditorState for
+   * every transaction and reuses it across plain re-renders, so its identity is
+   * exactly the right key — the walk runs when the document or the selection
+   * moved, not on every hover — and the callbacks below that depend on the
+   * result get a stable identity with it.
+   */
+  const editorState = editor?.state ?? null;
+  const avContext = useMemo(() => {
+    if (!editorState || !inAvRow) return null;
+    try {
+      const ctx = avRowContext(editorState);
+      if (!ctx) return null;
+      const { $from } = editorState.selection;
+      const block = $from.node(ctx.blockDepth);
+      const row = $from.node(ctx.rowDepth);
+      const frame = row.childCount > 2 ? row.child(row.childCount - 1) : null;
+      return {
+        blockAttrs: block.attrs as Record<string, unknown>,
+        frame: frame && frame.type.name === 'avImage' ? (frame.attrs as Record<string, unknown>) : null,
+      };
+    } catch {
+      return null;
+    }
+  }, [editorState, inAvRow]);
+  const avColumns = readColumnConfig(avContext?.blockAttrs);
+  const avRepeatHeaders = (avContext?.blockAttrs as { repeatHeaders?: boolean } | undefined)?.repeatHeaders !== false;
+  // Only the ratio is read off the frame now — the checkmark in the Frame
+  // Aspect Ratio submenu. The picture itself is the command's business.
+  const avFrameAspect = (avContext?.frame as { aspect?: string } | null)?.aspect || '16:9';
+
+  /** Nudge one AV column's relative width; clamped by the command. */
+  const nudgeAvWidth = useCallback((which: 'cue' | 'video' | 'audio' | 'image', delta: number) => {
+    if (!editor) return;
+    const current = readColumnConfig(avContext?.blockAttrs).widths[which];
+    editor.chain().focus().setAvColumnWidth(which, current + delta).run();
+  }, [editor, avContext]);
+
+  /** Put one AV column back to the default width. */
+  const resetAvWidth = useCallback((which: 'cue' | 'video' | 'audio' | 'image') => {
+    if (!editor) return;
+    editor.chain().focus().setAvColumnWidth(which, AV_DEFAULT_COLUMNS.widths[which]).run();
+  }, [editor]);
+
+  /**
+   * Turn an AV column on or off, asking first when switching one off would take
+   * work out of sight.
+   *
+   * Off is not a delete — durations stay on their rows, frames stay in theirs,
+   * and turning the column back on brings them back exactly as they were. But
+   * the flag also decides what `readAvBlock` writes, so a writer who has timed
+   * their shots loses the gutter, the PDF column and the spreadsheet column in
+   * one click, and from where they sit that is indistinguishable from losing
+   * the timings. Turning a column ON never asks.
+   */
+  const toggleAvColumnChecked = useCallback((which: 'cue' | 'image') => {
+    if (!editor) return;
+    try {
+      const block = avBlockAtSelection(editor.state);
+      const turningOff = block ? readColumnConfig(block.attrs)[which] : false;
+      const rows = block && turningOff ? avColumnDataCount(block, which) : 0;
+      if (rows > 0) {
+        setAvColumnWarning({ which, rows });
+        return;
+      }
+    } catch (err) {
+      // A count we could not take is not a reason to refuse the toggle; the
+      // worst case is the writer is not asked about something reversible.
+      console.warn('[av] could not check the column for data', err);
+    }
+    editor.chain().focus().toggleAvColumn(which).run();
+  }, [editor]);
+
+  /** The writer said yes to hiding the column. */
+  const confirmAvColumnToggle = useCallback(() => {
+    const pending = avColumnWarning;
+    setAvColumnWarning(null);
+    if (!editor || !pending) return;
+    editor.chain().focus().toggleAvColumn(pending.which, false).run();
+  }, [editor, avColumnWarning]);
+
+  /** Flip whether this AV body repeats its header row on each printed page.
+   *  Defaults to on, so only an explicit `false` counts as off. */
+  const toggleAvRepeatHeaders = useCallback(() => {
+    if (!editor) return;
+    try {
+      const ctx = avRowContext(editor.state);
+      if (!ctx) return;
+      const pos = editor.state.selection.$from.before(ctx.blockDepth);
+      const block = editor.state.doc.nodeAt(pos);
+      if (!block) return;
+      const currentlyOn = (block.attrs as { repeatHeaders?: boolean }).repeatHeaders !== false;
+      editor.view.dispatch(
+        editor.state.tr.setNodeMarkup(pos, undefined, { ...block.attrs, repeatHeaders: !currentlyOn }),
+      );
+    } catch (err) {
+      console.warn('[av] could not toggle repeating headers', err);
+    }
+  }, [editor]);
+
+  /**
+   * Choose an image for the cursor's storyboard frame.
+   *
+   * Shared with the frame's own double-click handler (utils/avFrame), so both
+   * routes upload to the project's asset store rather than embedding bytes in
+   * the document, and both leave the frame's aspect ratio alone.
+   */
+  const pickAvFrame = useCallback(() => {
+    void chooseAvFrameImage(editor);
+  }, [editor]);
 
   // ── About / What's New ──
   const [recoverBackupOpen, setRecoverBackupOpen] = useState(false);
+  // Backups asked for before a folder was chosen: ask for one here, then go on.
+  const [backupFolderPrompt, setBackupFolderPrompt] = useState<'backup' | 'open' | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   // Asked of the platform rather than assumed: iPad can tile a second window
   // but iPhone cannot, and Android needs API 32+ (issue #63). Desktop answers
@@ -568,6 +1002,9 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   // ── Diagnostics (Help menu) ──
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  // Compatibility detail in About starts collapsed (issue #94).
+  const [compatOpen, setCompatOpen] = useState(false);
   const [diagnosticsReport, setDiagnosticsReport] = useState<import('../services/diagnostics').DiagnosticsReport | null>(null);
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
 
@@ -592,6 +1029,11 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   // ── Check in (git commit) ──
   const [checkinOpen, setCheckinOpen] = useState(false);
+  const [clearRevisionsOpen, setClearRevisionsOpen] = useState(false);
+  const [revisionSettingsOpen, setRevisionSettingsOpen] = useState(false);
+  const scriptProfileOpen = useEditorStore((s) => s.scriptProfileOpen);
+  // Stable, so the dialog measures its runtime previews once per opening.
+  const getEditorDoc = useCallback(() => (editor && !editor.isDestroyed ? editor.getJSON() : null), [editor]);
   const [checkinMessage, setCheckinMessage] = useState('');
   const [checkinSaving, setCheckinSaving] = useState(false);
   const checkinInputRef = useRef<HTMLInputElement>(null);
@@ -625,7 +1067,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
     }
     try {
       const result = await api.checkin(currentProject.id, checkinMessage.trim());
-      if (result.hash) {
+      if (result.backup?.status === 'failed') {
+        const label = result.short_hash ? 'Version ' + result.short_hash : 'Version';
+        showToast(label + ' saved locally, but the Git backup failed', 'error');
+      } else if (result.hash) {
         showToast(`Version saved: ${result.short_hash}`, 'success');
       } else {
         showToast(result.message || 'No changes to commit', 'success');
@@ -755,8 +1200,61 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   const setElement = (type: string) => {
     if (!editor) return;
+    // "AV Columns" is not a paragraph type — it inserts a two-column body, and
+    // `setNode('avBlock')` would be asked to put `avRow+` content into a line
+    // of text. Every route to it goes through the same command.
+    if (type === AV_BLOCK_RULE_ID) {
+      editor.chain().focus().insertAvRow('below').run();
+      return;
+    }
     editor.chain().focus().setNode(type).run();
   };
+
+  /**
+   * The elements Format ▸ Element offers, for wherever the cursor is.
+   *
+   * Inside an AV cell that is the template's list for THAT column, resolved the
+   * same way the toolbar and the element menu resolve it. Outside one, the four
+   * AV paragraph types are dropped: they exist only inside a cell, and
+   * `setNode('avShot')` on a line of Action asks the schema for a node the
+   * document cannot hold there. They were listed here before `avCell` rules
+   * existed — the AV template marks them enabled, and this list only filtered
+   * out the title page.
+   */
+  const elementMenuRules = React.useMemo(() => {
+    const inCell = editorState ? isInAvCell(editorState) : false;
+    if (inCell) {
+      const side = avCellSideAt(editorState!) || 'video';
+      // The caret's own element, so it can always be converted back.
+      const current = editorState!.selection.$from.parent;
+      const currentId = current.type.name === 'customElement'
+        ? String(current.attrs?.customTypeId || 'customElement')
+        : current.type.name;
+      return avCellElementRules(activeTemplate, side, currentId);
+    }
+    return scriptBodyElementRules(activeTemplate, isTitlePageRuleId);
+  }, [editorState, activeTemplate]);
+
+  /**
+   * Cut, Copy and Paste run off ProseMirror's selection rather than the DOM's.
+   * Opening this menu takes focus out of the editor, and on iOS that collapses
+   * the DOM selection — which is why the old `document.execCommand` calls did
+   * nothing there while the long-press callout worked fine.
+   */
+  const handleCut = useCallback(async () => {
+    const result = await cutSelection(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
+
+  const handleCopy = useCallback(async () => {
+    const result = await copySelection(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
+
+  const handlePaste = useCallback(async () => {
+    const result = await pasteIntoEditor(editor);
+    if (!result.ok && result.error) showToast(result.error, 'error');
+  }, [editor]);
 
   const handlePasteAsFountain = useCallback(async () => {
     if (!editor) return;
@@ -796,6 +1294,18 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
       const opened = outcome.document;
 
+      // A file that is linked to a script in a project folder is that script.
+      // Editing it here as well would leave two copies writing one file.
+      if (isDesktopTauri()) {
+        const lf = await import('../services/linkedFiles');
+        const link = await lf.findLinkByPath(opened.bookmark);
+        if (link) {
+          showToast(`${opened.name} belongs to one of your projects — opened it there.`, 'info');
+          navigate(`/project/${link.projectId}/edit/${link.scriptId}`);
+          return;
+        }
+      }
+
       // Asked before the document is put on screen. The editor notices a
       // duplicate after the fact as well, but being shown a screenplay and
       // then asked whether you meant to open it reads as if opening it caused
@@ -811,7 +1321,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
       console.error('Open in place failed:', err);
       showToast(`Could not open the file: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
-  }, [editor, applyInPlaceDocument]);
+  }, [editor, applyInPlaceDocument, navigate]);
 
   /** Put an opened-in-place document into the editor. */
   const applyInPlaceDocumentImpl = useCallback(async (opened: InPlaceDocument) => {
@@ -896,6 +1406,86 @@ const MenuBar: React.FC<MenuBarProps> = ({
     }
   }, [editor, clearTrackChanges, setCurrentProject, setCurrentScriptId, setScripts]);
 
+  /**
+   * Import an AV spreadsheet as a new AV document.
+   *
+   * Column mapping is guessed from the header row, because a sheet from another
+   * production will not use OpenDraft's names — see utils/avImport. The guess is
+   * reported in a toast so the writer can see what it decided rather than having
+   * to compare the result against the source by eye.
+   */
+  const handleImportAvSheet = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const result = await openTextOrBinaryFile(
+        [{ name: 'AV Document', extensions: ['yaml', 'yml', 'xlsx', 'csv'] }],
+        ['xlsx'],
+      );
+      if (!result) return;
+
+      const isYaml = /\.(ya?ml)$/i.test(result.name);
+      const isXlsx = /\.xlsx$/i.test(result.name);
+
+      let blocks: JSONContent[];
+      let rowCount: number;
+      let summary: string;
+
+      if (isYaml) {
+        // AvYamlError carries a message written for the writer — a file from a
+        // newer OpenDraft, or one that is not an AV document — so it is shown
+        // as-is rather than wrapped in a generic failure.
+        const { importAvYaml } = await import('../utils/avYaml');
+        const parsed = importAvYaml(result.text ?? '');
+        blocks = parsed.blocks;
+        rowCount = parsed.rowCount;
+        summary = `Imported ${rowCount} shot(s) from AV YAML`;
+      } else {
+        const { importAvCsv, importAvXlsx } = await import('../utils/avImport');
+        const imported = isXlsx
+          ? await importAvXlsx(result.bytes ?? new ArrayBuffer(0))
+          : importAvCsv(result.text ?? '');
+        // One block per body: a document exported with two AV sections comes
+        // back as two, not as one with the second section's header sitting in
+        // the middle of it as a shot.
+        blocks = imported.blocks;
+        rowCount = imported.rowCount;
+        const mapped = imported.roles.filter(r => r !== 'ignore');
+        const bodies = imported.blocks.length > 1 ? ` across ${imported.blocks.length} bodies` : '';
+        summary = `Imported ${rowCount} shot(s)${bodies}; matched ${mapped.length} column(s): ${mapped.join(', ')}`;
+      }
+
+      if (rowCount === 0) {
+        showToast('That file had no AV rows to import.', 'error');
+        return;
+      }
+
+      clearTrackChanges();
+      // Same reason the Word import does it: beats, notes, tags, character
+      // profiles and scenes live outside the document, so replacing the
+      // document alone leaves the previous script's panels standing beside the
+      // imported shot list as though they belonged to it.
+      resetStoresForImport();
+      editor.commands.setContent({ type: 'doc', content: blocks }, true);
+      clearEditorHistory(editor);
+
+      const store = useEditorStore.getState();
+      const scriptTitle = result.name.replace(/\.\w+$/, '') || 'Untitled';
+      store.setDocumentTitle(scriptTitle);
+      setCurrentProject(null);
+      setCurrentScriptId(null);
+      setScripts([]);
+      store.setImportedSource({
+        name: result.name,
+        format: isYaml ? 'OpenDraft AV YAML' : isXlsx ? 'AV Spreadsheet (.xlsx)' : 'AV Spreadsheet (.csv)',
+      });
+      useBackupStatusStore.getState().noteDocumentOpened();
+      showToast(summary, 'info');
+    } catch (err) {
+      console.error('AV import failed:', err);
+      showToast(`Import failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, clearTrackChanges, setCurrentProject, setCurrentScriptId, setScripts]);
+
   // Core Word import: open binary file → parse → apply.  The pre-import
   // warning dialog and the unsaved-changes guard wrap this.
   const handleImportDocxCore = useCallback(async () => {
@@ -973,11 +1563,17 @@ const MenuBar: React.FC<MenuBarProps> = ({
     store.setBeatColumns([]);
     store.setBeatArrangeMode('auto');
     store.setNotes([]);
+    // General notes belong to the document too — leaving them behind carried
+    // one script's notes into the next.
+    store.setGeneralNotes([]);
     store.setTags([]);
     store.setTagCategories([]);
     store.setCharacterProfiles([]);
     store.setScenes([]);
     store.setPageLayout({ ...DEFAULT_PAGE_LAYOUT });
+    store.resetRevisionState();
+    // A new screenplay starts at Standard pacing with no genres.
+    store.setScriptProfile(DEFAULT_SCRIPT_PROFILE);
     if (window.location.pathname !== '/') {
       window.history.replaceState(null, '', '/');
     }
@@ -1020,9 +1616,14 @@ const MenuBar: React.FC<MenuBarProps> = ({
   /** Run the format-selection flow. Mode 'reset' is the global New Screenplay
    *  action; 'apply-only' is invoked from in-project script creation, where the
    *  caller has already wired up project context. */
-  const promptForNewScreenplayFormat = useCallback((mode: 'reset' | 'apply-only') => {
+  const promptForNewScreenplayFormat = useCallback(async (mode: 'reset' | 'apply-only') => {
     if (!editor) return;
     setFormatPickerMode(mode);
+    // The enabled ids are read back from localStorage the moment the app
+    // starts, but a custom template among them lives in storage and arrives
+    // over a promise. Wait for it, or a writer quick enough to beat the load
+    // gets Industry Standard instead of their own format.
+    await ensureTemplatesLoaded();
     const settings = useSettingsStore.getState();
     const enabled = settings.enabledScriptFormats;
 
@@ -1044,12 +1645,14 @@ const MenuBar: React.FC<MenuBarProps> = ({
       return;
     }
 
-    // 2+ enabled — show the quick single-select picker.
+    // 2+ enabled — show the quick single-select picker. Keeping several formats
+    // enabled is the writer saying the next script could be any of them, so the
+    // question still gets asked; the default is what the picker opens on.
     setFormatPickerOpen(true);
   }, [editor, finishNewScreenplayWithFormat]);
 
   const handleNewScreenplay = useCallback(() => {
-    confirmOrRun(() => promptForNewScreenplayFormat('reset'));
+    confirmOrRun(() => { void promptForNewScreenplayFormat('reset'); });
   }, [confirmOrRun, promptForNewScreenplayFormat]);
 
   // ProjectView sets pendingFormatPromptInProject=true before navigating into
@@ -1060,7 +1663,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
   useEffect(() => {
     if (!pendingFormatPromptInProject || !editor) return;
     useEditorStore.getState().setPendingFormatPromptInProject(false);
-    promptForNewScreenplayFormat('apply-only');
+    void promptForNewScreenplayFormat('apply-only');
   }, [pendingFormatPromptInProject, editor, promptForNewScreenplayFormat]);
 
   /**
@@ -1082,11 +1685,24 @@ const MenuBar: React.FC<MenuBarProps> = ({
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         const appWindow = getCurrentWindow();
-        const stop = await appWindow.onCloseRequested((event) => {
+        const stop = await appWindow.onCloseRequested(async (event) => {
           if (!editorHasUnsavedChanges()) return;
-          // Held open until the writer has answered; the dialog's Save and
-          // Discard both end in destroy(), and Cancel simply leaves it open.
+          const origin = useEditorStore.getState().documentOrigin;
+          const settings = useSettingsStore.getState();
+          const autoSaveFile = settings.autoSaveFiles;
+          // A library script with auto-save on is saved on the way out by the
+          // editor's own close handler; asking as well only raced it.
+          if (!origin && currentProject && currentScriptId && autoSaveAppliesToOpenDocument(settings, false)) return;
+          // Held open until the work is saved or the writer has answered; the
+          // dialog's Save and Discard both end in destroy(), and Cancel simply
+          // leaves it open.
           event.preventDefault();
+          // Auto-save covers closing too. If the file cannot be written, fall
+          // through to the question rather than lose the edits.
+          if (origin && autoSaveFile && await saveInPlace(origin, true)) {
+            void appWindow.destroy();
+            return;
+          }
           confirmOrRun(() => {
             void appWindow.destroy();
           });
@@ -1104,7 +1720,296 @@ const MenuBar: React.FC<MenuBarProps> = ({
       cancelled = true;
       unlisten?.();
     };
-  }, [editorHasUnsavedChanges, confirmOrRun]);
+  }, [editorHasUnsavedChanges, confirmOrRun, currentProject, currentScriptId, saveInPlace]);
+
+  const handleExportFDX = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const s = useEditorStore.getState();
+      await downloadFDX(editor.getJSON(), documentTitle, s.characterProfiles, s.tagCategories, s.tags, s.beats, s.beatColumns, s.pageLayout,
+        { family: s.fontFamily, size: s.fontSize },
+        buildExportFootnotePlan(editor.getJSON(), s.pageLayout, s.notes, s.generalNotes),
+        { mode: s.revisionMode, color: s.revisionColor, settings: s.revisionSettings },
+          { sceneNumbersVisible: s.sceneNumbersVisible, elementNumbersVisible: s.elementNumbersVisible });
+    } catch (err) {
+      console.error('FDX export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle]);
+
+  const handleExportFadeIn = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const s = useEditorStore.getState();
+      const { downloadFadeIn } = await import('../utils/osfExporter');
+      await downloadFadeIn(editor.getJSON(), documentTitle, {
+        font: { family: s.fontFamily, size: String(s.fontSize) },
+        ...osfExtras(s),
+      });
+    } catch (err) {
+      console.error('Fade In export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle]);
+
+  const handleExportFountain = useCallback(async () => {
+    if (!editor) return;
+    try {
+      await downloadFountain(editor.getJSON(), documentTitle, {
+        revisionSettings: useEditorStore.getState().revisionSettings,
+        sceneNumbersVisible: useEditorStore.getState().sceneNumbersVisible,
+      });
+    } catch (err) {
+      console.error('Fountain export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle]);
+
+  /**
+   * AV-specific exports.
+   *
+   * These only appear when the document actually contains an AV body. A
+   * spreadsheet is the interchange format for AV work because the industry has
+   * no structured shot-list standard — FDX, Fountain and OSF are built around
+   * screenplay elements — while production tools exchange CSV and xlsx.
+   */
+  /** Whether the open document contains an AV body, which gates the AV-only
+   *  export formats. Recomputed when the document changes rather than on every
+   *  render — walking the doc is cheap but not free, and the menu re-renders
+   *  on hover. */
+  const [hasAv, setHasAv] = useState(false);
+  useEffect(() => {
+    if (!editor) { setHasAv(false); return; }
+    // Walked straight off the ProseMirror doc, stopping at the first AV body.
+    // It used to serialise the whole document with getJSON() and then read
+    // every AV body out of it in full, twice per keystroke, to answer a yes/no
+    // that only changes when a body is inserted or removed.
+    const recompute = () => {
+      try {
+        let found = false;
+        editor.state.doc.descendants((node) => {
+          if (found) return false;
+          if (node.type.name === 'avBlock') { found = true; return false; }
+          // Inline content cannot hold a body, so there is no reason to enter it.
+          return node.isBlock;
+        });
+        setHasAv(found);
+      } catch (err) {
+        console.warn('[av] could not check the document for AV bodies', err);
+        setHasAv(false);
+      }
+    };
+    recompute();
+    const onUpdate = ({ transaction }: { transaction: { docChanged: boolean } }) => {
+      if (transaction.docChanged) recompute();
+    };
+    editor.on('update', onUpdate);
+    return () => { editor.off('update', onUpdate); };
+  }, [editor]);
+
+  const handleExportAv = useCallback(async (kind: 'xlsx' | 'csv' | 'txt' | 'yaml') => {
+    if (!editor) return;
+    try {
+      const json = editor.getJSON();
+      if (kind === 'yaml') {
+        const { downloadAvYaml } = await import('../utils/avYaml');
+        await downloadAvYaml(json, documentTitle);
+        return;
+      }
+      const mod = await import('../utils/avSpreadsheet');
+      if (kind === 'xlsx') await mod.downloadAvXlsx(json, documentTitle);
+      else if (kind === 'csv') await mod.downloadAvCsv(json, documentTitle);
+      else await mod.downloadAvText(json, documentTitle);
+    } catch (err) {
+      console.error('AV export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle]);
+
+  /** Everything the PDF exporter needs beyond the document itself. Shared, so
+   *  what Print sends to the printer is the file Export would have written. */
+  const pdfOptions = useCallback((json: JSONContent): PDFExportOptions => {
+    const store = useEditorStore.getState();
+    return {
+      sceneNumbersVisible: store.sceneNumbersVisible,
+      elementNumbersVisible: store.elementNumbersVisible,
+      documentTitle: store.documentTitle,
+      revisionColor: store.revisionMode ? store.revisionColor : '',
+      documentFont: store.fontFamily,
+      footnotes: buildExportFootnotePlan(json, pageLayout, store.notes, store.generalNotes),
+      includeTitlePage: store.includeTitlePageInOutput,
+      revisionSettings: store.revisionSettings,
+      colorRevisedPages: store.revisionSettings.colorPages,
+      pageLabels: store.pageLabels,
+    };
+  }, [pageLayout]);
+
+  /** File → Export → PDF (Revised Pages Only): the pages that go out to cast
+   *  and crew between full drafts. */
+  const handleExportRevisedPDF = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const json = editor.getJSON();
+      const warning = await exportPDF(json, `${documentTitle || 'Untitled'} - Revised Pages`, pageLayout, {
+        ...pdfOptions(json),
+        revisedPagesOnly: true,
+      });
+      if (warning) showToast(warning, 'error');
+    } catch (err) {
+      console.error('Revised-pages PDF export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle, pageLayout, pdfOptions]);
+
+  /** Tools → Production → Lock Pages / Unlock Pages. */
+  const handleToggleLockPages = useCallback(() => {
+    if (!editor) return;
+    try {
+      if (pagesLocked(editor.state.doc)) {
+        editor.chain().focus().unlockPages().run();
+        showToast('Pages unlocked — page numbers flow freely again', 'info');
+        return;
+      }
+      const start = resolveHeaderFooter(pageLayout).startingPageNumber;
+      const ok = editor.chain().focus().lockPages((page) => String(printedPageNumber(page, start))).run();
+      if (ok) showToast('Pages locked — new text spills onto A pages instead of renumbering', 'success');
+      else showToast('Could not lock pages: the script has not been paginated yet', 'error');
+    } catch (err) {
+      console.error('[lockedPages] toggle failed', err);
+      showToast(`Could not change page locking: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, pageLayout]);
+
+  /** Tools → Production → Omit Scene: the scene at the cursor becomes an
+   *  OMITTED heading that keeps its locked number. */
+  const handleOmitScene = useCallback(() => {
+    if (!editor) return;
+    try {
+      const pos = editor.state.selection.from;
+      if (sceneOmittedAt(editor.state, pos)) {
+        showToast('This scene is already omitted', 'info');
+        return;
+      }
+      const tr = omitSceneTransaction(editor.state, pos);
+      if (!tr) {
+        showToast('Put the cursor in the scene you want to omit', 'info');
+        return;
+      }
+      editor.view.dispatch(tr);
+      editor.commands.focus();
+      showToast('Scene omitted — Edit → Undo brings it back', 'success');
+    } catch (err) {
+      console.error('[omitScene] failed', err);
+      showToast(`Could not omit the scene: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor]);
+
+  const handleExportPDF = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const json = editor.getJSON();
+      // A font that would not load leaves the script it was for blank on the
+      // page — the writer has to hear that now, not from whoever they send it
+      // to. See RenderedPDF.warning.
+      const warning = await exportPDF(json, documentTitle, pageLayout, pdfOptions(json));
+      if (warning) showToast(warning, 'error');
+    } catch (err) {
+      console.error('PDF export failed:', err);
+      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle, pageLayout, pdfOptions]);
+
+  /**
+   * File → Print (and ⌘P).
+   *
+   * Where the web view has a print dialog this is that dialog, rendering the
+   * paginated editor through the @media print rules exactly as it appears.
+   * Neither mobile platform has one — see printRoute() for why — so both send
+   * the PDF instead: iOS to the share sheet that carries AirPrint (issue #97),
+   * Android to PrintManager, which gives the real system print dialog with
+   * printer, copies and Save as PDF. Either way it is the file File → Export →
+   * PDF would have written, so the printed script matches the exported one.
+   */
+  const handlePrint = useCallback(async () => {
+    const route = printRoute();
+
+    // Where there is a print dialog, the writer chooses what goes into it: the
+    // PDF the exporter lays out, or the page as the web view paginates it.
+    // Everywhere else there is no choice to make — see printRoute().
+    if (route === 'dialog' && printViaPdf && editor) {
+      try {
+        showToast('Preparing your script for printing…');
+        const json = editor.getJSON();
+        const { renderPDF } = await import('../utils/pdfExporter');
+        const { printPDFBytes } = await import('../utils/printPdf');
+        const { bytes, filename, warning } = await renderPDF(json, documentTitle, pageLayout, pdfOptions(json));
+        // The desktop web view cannot print a frame, so there the file is
+        // opened in whatever the machine uses for PDFs and printed from there.
+        const outcome = await printPDFBytes(bytes, filename, isDesktopTauri());
+        if (warning) showToast(warning, 'error');
+        else if (outcome === 'opened-externally') {
+          showToast('Opened your script as a PDF — print it from there.');
+        }
+      } catch (err) {
+        console.error('[print] could not print the PDF:', err);
+        // The reason is in the message, not just the console: there is no
+        // console to open in a packaged desktop build, and "it did not work"
+        // on its own is what made the DOM print path so slow to diagnose.
+        const reason = err instanceof Error ? err.message : String(err);
+        showToast(`Could not print the PDF: ${reason}. Turn off "Print the PDF" in Settings → Printing to use the print dialog instead.`);
+      }
+      return;
+    }
+
+    if (route === 'dialog') {
+      // In a browser this opens the dialog and returns nothing. Inside a Tauri
+      // web view `window.print` is a shim over `plugin:webview|print`, so it
+      // returns a promise — and one that rejects if the command is not allowed
+      // by the ACL, which is how Print came to be a menu item that did nothing
+      // at all on the desktop app. Awaited, so a refusal is something the
+      // writer is told about rather than a menu item that silently does
+      // nothing.
+      // Let any open menu close first. Print is reached from the File menu,
+      // and `handleItemClick` runs the action before it clears the menu, so
+      // the dropdown was still mounted when the dialog took its snapshot —
+      // and being portalled to the body it is outside everything the print
+      // stylesheet hides. What came out was a picture of the File menu.
+      // Two frames: one for React to re-render without it, one for the
+      // browser to lay the page out again before it is captured.
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      try {
+        await (window.print() as unknown as void | Promise<void>);
+      } catch (err) {
+        console.error('[print] the web view refused to print:', err);
+        showToast('Could not open the print dialog. Export to PDF and print that instead.');
+      }
+      return;
+    }
+    if (!editor) return;
+    try {
+      // Laying out a feature-length script takes a moment, and nothing appears
+      // until it is done — without this the tap looks like it was ignored.
+      showToast(route === 'ios-share-sheet'
+        ? 'Preparing your script — choose Print in the share sheet.'
+        : 'Preparing your script for printing…');
+
+      const json = editor.getJSON();
+      if (route === 'ios-share-sheet') {
+        const warning = await exportPDF(json, documentTitle, pageLayout, pdfOptions(json));
+        if (warning) showToast(warning, 'error');
+        return;
+      }
+      const { bytes, filename, warning } = await renderPDF(json, documentTitle, pageLayout, pdfOptions(json));
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('android_print_pdf', { filename, contents: Array.from(bytes) });
+      if (warning) showToast(warning, 'error');
+    } catch (err) {
+      console.error('Print failed:', err);
+      showToast(`Print failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [editor, documentTitle, pageLayout, pdfOptions, printViaPdf]);
 
   // ── Global keyboard shortcuts ──
   useEffect(() => {
@@ -1129,7 +2034,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           break;
         case 'p':
           e.preventDefault();
-          window.print();
+          void handlePrint();
           break;
         case 'f':
           e.preventDefault();
@@ -1152,71 +2057,24 @@ const MenuBar: React.FC<MenuBarProps> = ({
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [handleSave, handleSaveAs, handleNewScreenplay, isCollabGuest, setSearchOpen, setGoToPageOpen, setZoomLevel, setSpellModalOpen, setGrammarModalOpen]);
-
-  const handleExportFDX = useCallback(async () => {
-    if (!editor) return;
-    try {
-      const s = useEditorStore.getState();
-      await downloadFDX(editor.getJSON(), documentTitle, s.characterProfiles, s.tagCategories, s.tags, s.beats, s.beatColumns, s.pageLayout,
-        { family: s.fontFamily, size: s.fontSize });
-    } catch (err) {
-      console.error('FDX export failed:', err);
-      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  }, [editor, documentTitle]);
-
-  const handleExportFadeIn = useCallback(async () => {
-    if (!editor) return;
-    try {
-      const s = useEditorStore.getState();
-      const { downloadFadeIn } = await import('../utils/osfExporter');
-      await downloadFadeIn(editor.getJSON(), documentTitle, {
-        font: { family: s.fontFamily, size: String(s.fontSize) },
-      });
-    } catch (err) {
-      console.error('Fade In export failed:', err);
-      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  }, [editor, documentTitle]);
-
-  const handleExportFountain = useCallback(async () => {
-    if (!editor) return;
-    try {
-      await downloadFountain(editor.getJSON(), documentTitle);
-    } catch (err) {
-      console.error('Fountain export failed:', err);
-      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  }, [editor, documentTitle]);
-
-  const handleExportPDF = useCallback(async () => {
-    if (!editor) return;
-    try {
-      const store = useEditorStore.getState();
-      await exportPDF(editor.getJSON(), documentTitle, pageLayout, {
-        sceneNumbersVisible: store.sceneNumbersVisible,
-        documentTitle: store.documentTitle,
-        revisionColor: store.revisionMode ? store.revisionColor : '',
-        documentFont: store.fontFamily,
-      });
-    } catch (err) {
-      console.error('PDF export failed:', err);
-      showToast(`Export failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-    }
-  }, [editor, documentTitle, pageLayout]);
+  }, [handleSave, handleSaveAs, handleNewScreenplay, handlePrint, isCollabGuest, setSearchOpen, setGoToPageOpen, setZoomLevel, setSpellModalOpen, setGrammarModalOpen]);
 
   const handleExportDocx = useCallback(async () => {
     if (!editor) return;
     try {
       const store = useEditorStore.getState();
       await downloadDocx(editor.getJSON(), documentTitle, pageLayout, {
+        footnotes: buildExportFootnotePlan(editor.getJSON(), pageLayout, store.notes, store.generalNotes),
         documentTitle: store.documentTitle,
+        revisionSettings: store.revisionSettings,
         revisionColor: store.revisionMode ? store.revisionColor : '',
         documentFont: store.fontFamily,
         // So `{pages}` matches what the editor and the PDF report, rather than
         // Word's NUMPAGES, which counts the title page.
         scriptPageCount: store.pageCount,
+        includeTitlePage: store.includeTitlePageInOutput,
+        elementNumbersVisible: store.elementNumbersVisible,
+        sceneNumbersVisible: store.sceneNumbersVisible,
       });
     } catch (err) {
       console.error('Word export failed:', err);
@@ -1230,12 +2088,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
   // .odraft: Export is "give me a file to send somewhere", Back Up Now is "pin
   // this moment in my safety net". Same bytes, different lifecycle — manual
   // snapshots are never pruned by the retention limit.
-  const handleBackupNow = useCallback(async () => {
-    if (!backupsAvailable()) {
-      showToast('Choose a backup folder first', 'info');
-      navigate('/settings');
-      return;
-    }
+  const backUpNow = useCallback(async () => {
     const content = buildSaveContent();
     if (!content) return;
     try {
@@ -1256,21 +2109,40 @@ const MenuBar: React.FC<MenuBarProps> = ({
       const reason = describeBackupError(err instanceof Error ? err.message : String(err));
       showToast(`Backup failed — ${reason}`, 'error');
     }
-  }, [buildSaveContent, currentProject, currentScriptId, navigate]);
+  }, [buildSaveContent, currentProject, currentScriptId]);
 
-  const handleOpenBackupFolder = useCallback(async () => {
-    const folder = useSettingsStore.getState().backupFolder;
-    if (!folder) {
-      showToast('Choose a backup folder first', 'info');
-      navigate('/settings');
+  const handleBackupNow = useCallback(() => {
+    if (!backupsAvailable()) {
+      setBackupFolderPrompt('backup');
       return;
     }
+    void backUpNow();
+  }, [backUpNow]);
+
+  const openBackupFolder = useCallback(async () => {
+    const folder = useSettingsStore.getState().backupFolder;
+    if (!folder) return;
     try {
+      // The Documents default is only created by the first backup; make it
+      // now so opening it straight after choosing it works.
+      if (isDesktopTauri()) {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('ensure_dir', { path: folder });
+      }
       await revealSnapshot(folder);
-    } catch {
-      showToast('Could not open the backup folder', 'error');
+    } catch (err) {
+      console.error('[backup] could not open the backup folder:', err);
+      showToast(`Could not open the backup folder: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
-  }, [navigate]);
+  }, []);
+
+  const handleOpenBackupFolder = useCallback(() => {
+    if (!useSettingsStore.getState().backupFolder) {
+      setBackupFolderPrompt('open');
+      return;
+    }
+    void openBackupFolder();
+  }, [openBackupFolder]);
 
   const handleExportOdraft = useCallback(async () => {
     if (!editor) return;
@@ -1287,10 +2159,16 @@ const MenuBar: React.FC<MenuBarProps> = ({
       // script it came from.
       const content = buildSaveContent();
       if (!content) return;
+      // A document with no project keeps its images in the scratch store, so
+      // they have to be packed into the file explicitly. They used to travel
+      // (as base64) simply by being inside the document; without this they
+      // would silently vanish from the export.
+      const packed = currentProject ? null : await packScratchAssets(content);
       await downloadOdraft(meta, content, {
         projectId: currentProject?.id ?? null,
         scriptId: currentScriptId ?? null,
         projectTitle: currentProject?.name,
+        ...(packed ? { assets: packed.assets, assetsOmitted: packed.truncated } : {}),
       });
     } catch (err) {
       console.error('OpenDraft export failed:', err);
@@ -1303,6 +2181,26 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setOpenSubmenu(null);
   };
 
+  /**
+   * Keep the writer's selection where it is while they reach for a menu.
+   *
+   * Pressing a menu moves focus out of the editor by default. On iPadOS that
+   * costs the selection twice over: the highlight stops being painted, and —
+   * the part this fixes — WebKit collapses the DOM selection on the way out,
+   * ProseMirror's observer syncs the collapse into its own state, and the
+   * caret comes back somewhere other than where the writer left it. A menu
+   * that does not take focus leaves the selection exactly as it was.
+   *
+   * Same treatment as ElementPicker and CharacterAutocomplete: mousedown
+   * rather than pointerdown, because preventing the pointer event suppresses
+   * the click that follows it and the menu would stop responding at all.
+   * Nothing inside a menu wants focus of its own.
+   *
+   * It does not bring the highlight back — an unfocused view paints none
+   * regardless, which is what SelectionHandles' bands are for.
+   */
+  const keepEditorSelection = (e: React.MouseEvent) => e.preventDefault();
+
   const handleItemClick = (item: MenuItem, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!item.disabled && item.action) {
@@ -1312,18 +2210,149 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setOpenSubmenu(null);
   };
 
+  /**
+   * Which submenu is open, as a path of labels rather than a single one.
+   *
+   * Submenus nest more than one deep (Format ▸ AV Script ▸ Columns ▸ Column
+   * Width ▸ Video), so "the open submenu" is a trail, not a label: opening the
+   * innermost one has to leave every ancestor open behind it. The separator is
+   * a unit separator so no menu label can ever collide with it.
+   */
+  const SUBMENU_SEP = '\u241F';
+  const submenuPath = (parentPath: string, label: string) =>
+    parentPath ? `${parentPath}${SUBMENU_SEP}${label}` : label;
+  /** True when `path`'s submenu is on the open trail — itself or an ancestor
+   *  of whatever is open. */
+  const isSubmenuOpen = (path: string) =>
+    openSubmenu === path || (openSubmenu != null && openSubmenu.startsWith(path + SUBMENU_SEP));
+
   // Mouse: hover switches submenu (desktop) — no pointerleave to avoid layout shift
-  const handleSubmenuPointerEnter = (label: string, e: React.PointerEvent) => {
-    if (e.pointerType === 'mouse') setOpenSubmenu(label);
+  const handleSubmenuPointerEnter = (path: string, e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse') setOpenSubmenu(path);
   };
-  const handleItemPointerEnter = (e: React.PointerEvent) => {
-    if (e.pointerType === 'mouse') setOpenSubmenu(null);
+  /** Hovering a plain row closes anything open *below* its own level, and
+   *  leaves its ancestors alone — at depth 0 that is the old "close all". */
+  const handleItemPointerEnter = (parentPath: string, e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse') setOpenSubmenu(parentPath || null);
   };
-  // Touch: tap toggles submenu (mobile)
-  const handleSubmenuTouchEnd = (label: string, e: React.TouchEvent) => {
+  // Touch: tap toggles submenu (mobile) — closing falls back to the parent
+  // level so a tap on an inner submenu does not dismiss the whole trail.
+  const handleSubmenuTouchEnd = (parentPath: string, path: string, e: React.TouchEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setOpenSubmenu((prev) => (prev === label ? null : label));
+    setOpenSubmenu((prev) => (prev === path || (prev != null && prev.startsWith(path + SUBMENU_SEP))
+      ? (parentPath || null)
+      : path));
+  };
+
+  /**
+   * Place an open submenu, pinned to the viewport rather than to its parent.
+   *
+   * Fixed, not absolute, because the dropdown itself scrolls when it is taller
+   * than the window (see `dropdownPos.maxHeight`): an absolutely positioned
+   * flyout sitting outside its scroll container's padding box gets clipped
+   * away entirely. Fixed coordinates leave the scroll container behind, which
+   * also lets a deep submenu open past the bottom of a short window.
+   *
+   * Measured after clearing the previous placement, so a submenu that fits
+   * only *because* it was flipped last render does not read as fitting and
+   * flip back on the render after — easy to hit three levels deep, where every
+   * level shifts another 240px right.
+   *
+   * Below the mobile breakpoint submenus render inline (`position: static`),
+   * so there is nothing to place and inline coordinates would break the
+   * stacked layout.
+   */
+  const positionSubmenu = (el: HTMLElement) => {
+    const row = el.parentElement;
+    if (!row) return;
+    if (window.matchMedia('(max-width: 600px)').matches) {
+      el.style.position = '';
+      el.style.left = '';
+      el.style.top = '';
+      el.style.maxHeight = '';
+      return;
+    }
+    el.style.position = 'fixed';
+    el.style.left = '0px';
+    el.style.top = '0px';
+    el.style.maxHeight = `${Math.max(120, window.innerHeight - 16)}px`;
+    const anchor = row.getBoundingClientRect();
+    const box = el.getBoundingClientRect();
+    // Out to the right of the parent row, or back to its left when that would
+    // leave the window.
+    let left = anchor.right;
+    if (left + box.width > window.innerWidth - 8) left = anchor.left - box.width;
+    // Top-aligned with the row, lifted just enough to stay on screen.
+    let top = anchor.top - 4;
+    if (top + box.height > window.innerHeight - 8) top = window.innerHeight - 8 - box.height;
+    el.style.left = `${Math.max(8, left)}px`;
+    el.style.top = `${Math.max(8, top)}px`;
+  };
+
+  /**
+   * One dropdown row, at any depth.
+   *
+   * Recursive because submenus nest: the old renderer drew exactly two levels,
+   * so an item with children *inside* a submenu (Column Width, Frame Aspect
+   * Ratio) rendered as a row with no arrow and no action — a dead end.
+   */
+  const renderMenuNode = (item: MenuItem, parentPath: string, index: number): React.ReactNode => {
+    if (item.separator) {
+      return (
+        <div
+          key={`sep-${index}`}
+          className="menu-separator"
+          onPointerEnter={(e) => handleItemPointerEnter(parentPath, e)}
+        />
+      );
+    }
+    if (item.children && item.children.length > 0) {
+      const path = submenuPath(parentPath, item.label);
+      const open = isSubmenuOpen(path);
+      return (
+        // Never marked `disabled` here: the class kills pointer events, and a
+        // parent that cannot be opened hides its children instead of
+        // explaining them. Leaves carry the disabled state and the hint.
+        <div
+          key={path}
+          className={`menu-dropdown-item has-children ${open ? 'submenu-open' : ''}`}
+          title={item.title}
+          onPointerEnter={(e) => handleSubmenuPointerEnter(path, e)}
+          onTouchEnd={(e) => handleSubmenuTouchEnd(parentPath, path, e)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpenSubmenu((prev) => (prev === path || (prev != null && prev.startsWith(path + SUBMENU_SEP))
+              ? (parentPath || null)
+              : path));
+          }}
+        >
+          {item.icon && <span className="menu-dropdown-icon">{item.icon}</span>}
+          <span>{item.label}</span>
+          <span className="menu-submenu-arrow">{open ? '\u25BE' : '\u25B8'}</span>
+          <div
+            className={`menu-submenu ${open ? 'submenu-visible' : ''}`}
+            ref={(el) => { if (el && open) positionSubmenu(el); }}
+          >
+            {item.children.map((child, j) => renderMenuNode(child, path, j))}
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div
+        key={submenuPath(parentPath, item.label)}
+        className={`menu-dropdown-item ${item.disabled ? 'disabled' : ''}`}
+        title={item.title}
+        onPointerEnter={(e) => handleItemPointerEnter(parentPath, e)}
+        onTouchEnd={(e) => e.stopPropagation()}
+        onClick={(e) => handleItemClick(item, e)}
+      >
+        {item.icon && <span className="menu-dropdown-icon">{item.icon}</span>}
+        <span>{item.label}</span>
+        {item.shortcut && <span className="menu-shortcut">{item.shortcut}</span>}
+      </div>
+    );
   };
 
   const menus: MenuSection[] = [
@@ -1360,6 +2389,8 @@ const MenuBar: React.FC<MenuBarProps> = ({
           children: [
             { icon: <FaFileCode />, label: 'Final Draft / Fountain / Fade In / OpenDraft…', action: () => confirmOrRun(handleImport), disabled: isCollabGuest },
             { icon: <FaFileWord />, label: 'Microsoft Word (.docx)…', action: handleImportDocx, disabled: isCollabGuest },
+            { separator: true, label: '' },
+            { icon: <FaFileExcel />, label: 'AV Document (.yaml / .xlsx / .csv)…', action: () => confirmOrRun(handleImportAvSheet), disabled: isCollabGuest },
           ],
         },
         // Opens the library — projects and scripts held by OpenDraft, on this
@@ -1377,6 +2408,14 @@ const MenuBar: React.FC<MenuBarProps> = ({
           // is just opening a file from disk.
           label: isDesktopTauri() ? 'Open File from Disk…' : 'Open from Files…',
           action: () => confirmOrRun(handleOpenInPlace),
+          disabled: isCollabGuest,
+        }] : []),
+        // Desktop: a folder of screenplay files becomes a project that keeps
+        // saving to them (issue #135).
+        ...(isDesktopTauri() ? [{
+          icon: <FaFolderOpen />,
+          label: 'Open Folder as Project…',
+          action: () => { void handleOpenFolderAsProject(); },
           disabled: isCollabGuest,
         }] : []),
         {
@@ -1410,6 +2449,14 @@ const MenuBar: React.FC<MenuBarProps> = ({
           action: handleSaveAs,
           disabled: isCollabGuest,
         },
+        // Desktop: keep the script in a file of the writer's choosing — on a
+        // RAID, a network share, a project's own folder (issue #135).
+        ...(isDesktopTauri() ? [{
+          icon: <FaSave />,
+          label: 'Save to File As…',
+          action: () => { void handleSaveToFileAs(); },
+          disabled: isCollabGuest,
+        }] : []),
         { separator: true, label: '' },
         {
           icon: <FaFileExport />, label: 'Export',
@@ -1418,8 +2465,23 @@ const MenuBar: React.FC<MenuBarProps> = ({
             { icon: <FaFileAlt />, label: 'Fountain (.fountain)', action: handleExportFountain, disabled: isCollabGuest },
             { icon: <FaFileCode />, label: 'Fade In (.fadein)', action: handleExportFadeIn, disabled: isCollabGuest },
             { icon: <FaFilePdf />, label: 'PDF', action: handleExportPDF },
+            {
+              icon: <FaFilePdf />, label: 'PDF (Revised Pages Only)', action: handleExportRevisedPDF,
+              title: 'Only the pages that carry a revision mark',
+            },
             { icon: <FaFileWord />, label: 'Microsoft Word (.docx)', action: handleExportDocx },
             { icon: <FaFile />, label: 'OpenDraft (.odraft)', action: handleExportOdraft, disabled: isCollabGuest },
+            // AV formats are offered only for documents that have an AV body —
+            // a spreadsheet of a screenplay would be meaningless.
+            ...(hasAv
+              ? [
+                  { separator: true, label: '' },
+                  { icon: <FaFileCode />, label: 'AV YAML (.yaml)', action: () => handleExportAv('yaml') },
+                  { icon: <FaFileExcel />, label: 'AV Spreadsheet (.xlsx)', action: () => handleExportAv('xlsx') },
+                  { icon: <FaFileCsv />, label: 'AV Spreadsheet (.csv)', action: () => handleExportAv('csv') },
+                  { icon: <FaFileAlt />, label: 'AV Plain Text (.txt)', action: () => handleExportAv('txt') },
+                ]
+              : []),
           ],
         },
         { separator: true, label: '' },
@@ -1457,13 +2519,17 @@ const MenuBar: React.FC<MenuBarProps> = ({
               ...(supportsRevealBackup() ? [
                 { icon: <FaFolderOpen />, label: 'Open Backup Folder', action: handleOpenBackupFolder },
               ] : []),
-              { icon: <FaCog />, label: 'Backup Settings\u2026', action: () => navigate('/settings') },
+              { icon: <FaCog />, label: 'Backup Settings\u2026', action: goToSettings },
             ],
           },
         ] : []),
         { separator: true, label: '' },
         { icon: <FaCog />, label: 'Page Setup…', action: () => setPageSetupOpen(true) },
-        { icon: <FaPrint />, label: 'Print…', shortcut: `${mod}P`, action: () => window.print() },
+        // "Include Title Page" used to sit here. It moved to the Title Page
+        // dialog (Format ▸ Title Page): a bare entry in a long File menu is not
+        // where anyone looks for it — the writer who wants the title page kept
+        // out of a PDF is the writer already looking at their title page.
+        { icon: <FaPrint />, label: 'Print…', shortcut: `${mod}P`, action: () => { void handlePrint(); } },
       ],
     },
     {
@@ -1472,12 +2538,20 @@ const MenuBar: React.FC<MenuBarProps> = ({
         { icon: <FaUndo />, label: 'Undo', shortcut: `${mod}Z`, action: () => { try { editor?.chain().focus().undo().run(); } catch {} } },
         { icon: <FaRedo />, label: 'Redo', shortcut: `⇧${mod}Z`, action: () => { try { editor?.chain().focus().redo().run(); } catch {} } },
         { separator: true, label: '' },
-        { icon: <FaCut />, label: 'Cut', shortcut: `${mod}X`, action: () => document.execCommand('cut') },
-        { icon: <FaCopy />, label: 'Copy', shortcut: `${mod}C`, action: () => document.execCommand('copy') },
-        { icon: <FaPaste />, label: 'Paste', shortcut: `${mod}V`, action: () => document.execCommand('paste') },
+        { icon: <FaCut />, label: 'Cut', shortcut: `${mod}X`, action: handleCut, disabled: !editor },
+        { icon: <FaCopy />, label: 'Copy', shortcut: `${mod}C`, action: handleCopy, disabled: !editor },
+        { icon: <FaPaste />, label: 'Paste', shortcut: `${mod}V`, action: handlePaste, disabled: !editor },
         { icon: <FaPaste />, label: 'Paste as Fountain', shortcut: `⇧${mod}V`, action: handlePasteAsFountain, disabled: !editor },
         { icon: <FaMousePointer />, label: 'Select All', shortcut: `${mod}A`, action: () => editor?.chain().focus().selectAll().run() },
         { separator: true, label: '' },
+        ...(supportsApplePencil()
+          ? [{
+            icon: <FaPencilAlt />,
+            label: 'Handwriting\u2026',
+            action: requestHandwriting,
+            disabled: !editor,
+          }]
+          : []),
         { icon: <FaSearch />, label: 'Find & Replace…', shortcut: `${mod}F`, action: () => setSearchOpen(true) },
         { icon: <FaHashtag />, label: 'Go to Page…', shortcut: `${mod}G`, action: () => setGoToPageOpen(true) },
         {
@@ -1499,7 +2573,17 @@ const MenuBar: React.FC<MenuBarProps> = ({
         {
           icon: <FaListOl />, label: 'Element',
           children: [
-            ...Object.values(activeTemplate.rules).filter((r) => r.enabled).map((r) => {
+            {
+              label: 'Show Element Menu\u2026',
+              shortcut: formatShortcut(elementMenuShortcut),
+              title: 'Choose the element for this line, at the cursor',
+              action: requestElementMenu,
+            },
+            { separator: true, label: '' },
+            // Title page fields have template rules but are not conversion
+            // targets — "make this line of action a copyright notice" is not a
+            // thing. They are reached through the Title Page editor.
+            ...elementMenuRules.map((r) => {
               const shortcuts: Record<string, string> = {
                 sceneHeading: `${mod}1`, action: `${mod}2`, character: `${mod}3`, dialogue: `${mod}4`,
                 parenthetical: `${mod}5`, transition: `${mod}6`, general: `${mod}7`, shot: `${mod}8`,
@@ -1538,6 +2622,135 @@ const MenuBar: React.FC<MenuBarProps> = ({
         { separator: true, label: '' },
         { icon: <FaColumns />, label: 'Dual Dialogue', shortcut: `${mod}D`, action: () => (editor as any)?.commands?.toggleDualDialogue() },
         {
+          // Every AV control under one roof. Three sibling entries (Row,
+          // Columns, Storyboard) pushed the Format menu past the bottom of the
+          // window on a laptop, and they are one feature, not three.
+          //
+          // Disabled is set on the leaves, not on a parent: the renderer
+          // honours `disabled` on a leaf but opens a submenu regardless, so a
+          // screenplay still shows what AV can do rather than hiding it —
+          // issue #116 was in the end about discoverability.
+          icon: <FaColumns />, label: 'AV Script',
+          children: [
+            {
+              // The way INTO the AV format, and the reason everything below it
+              // used to sit permanently greyed out in a normal script: the
+              // only route to toggleAvBlock was ⌘⇧A, which an iPad does not
+              // have. Deliberately the first item, and never disabled.
+              icon: <FaColumns />,
+              label: inAvRow ? 'Remove AV Columns' : 'Insert AV Columns',
+              shortcut: `${mod}\u21e7A`,
+              title: inAvRow
+                ? 'Delete this AV table, and everything in it, back to a single line'
+                : 'Start a two-column AV table beside this line — Video on the left, Audio on the right. '
+                  + 'A line with text is kept; a blank one makes way for the table, and a table already '
+                  + 'above or below gains a row instead.',
+              disabled: !editor,
+              action: () => editor?.chain().focus().toggleAvBlock().run(),
+            },
+            { separator: true, label: '' },
+            {
+              // The way OUT of the table.
+              //
+              // Every other route is a keystroke a soft keyboard does not
+              // have, and the AV Script template's starter document is a
+              // single avBlock and nothing else — so on a phone the format
+              // opened with a table the writer could fill and no way to write
+              // a line anywhere but inside it. Tapping the page below does
+              // not help either: that area is `.page`, not `.ProseMirror`.
+              icon: <FaSignInAlt />,
+              label: 'Line After Table',
+              disabled: !inAvRow,
+              title: inAvRow
+                ? 'Put the cursor on an ordinary script line below this AV table, adding one if it is not there yet'
+                : avRowHint,
+              action: () => editor?.chain().focus().exitAvBlock('after').run(),
+            },
+            {
+              icon: <FaSignInAlt />,
+              label: 'Line Before Table',
+              disabled: !inAvRow,
+              title: inAvRow
+                ? 'Put the cursor on an ordinary script line above this AV table, adding one if it is not there yet'
+                : avRowHint,
+              action: () => editor?.chain().focus().exitAvBlock('before').run(),
+            },
+            { separator: true, label: '' },
+            {
+              icon: <FaColumns />, label: 'Row',
+              children: [
+                { icon: <FaPlus />, label: 'Insert Row Below', shortcut: `${mod}\u21b5`, disabled: !inAvRow, title: avRowHint, action: () => editor?.chain().focus().insertAvRow('below').run() },
+                { icon: <FaPlus />, label: 'Insert Row Above', disabled: !inAvRow, title: avRowHint, action: () => editor?.chain().focus().insertAvRow('above').run() },
+                { separator: true, label: '' },
+                { icon: <FaTimes />, label: 'Delete Row', disabled: !inAvRow, title: avRowHint, action: () => editor?.chain().focus().deleteAvRow().run() },
+              ],
+            },
+            {
+              // Column and storyboard controls. Same reasoning as the row
+              // controls: every one of these has to be reachable without a
+              // hardware keyboard, so the menu is the primary route, not a
+              // shortcut.
+              icon: <FaColumns />, label: 'Columns',
+              children: [
+                {
+                  icon: <FaClock />,
+                  label: avColumns.cue ? '\u2713 Cue / Timing Column' : 'Cue / Timing Column',
+                  disabled: !inAvRow, title: avRowHint,
+                  action: () => toggleAvColumnChecked('cue'),
+                },
+                {
+                  icon: <FaImage />,
+                  label: avColumns.image ? '\u2713 Storyboard Column' : 'Storyboard Column',
+                  disabled: !inAvRow, title: avRowHint,
+                  action: () => toggleAvColumnChecked('image'),
+                },
+                { separator: true, label: '' },
+                {
+                  icon: <FaFileAlt />,
+                  label: avRepeatHeaders ? '\u2713 Repeat Headers On Each Page' : 'Repeat Headers On Each Page',
+                  disabled: !inAvRow, title: avRowHint,
+                  action: () => toggleAvRepeatHeaders(),
+                },
+                { separator: true, label: '' },
+                {
+                  icon: <FaColumns />, label: 'Column Width',
+                  children: (['video', 'audio', 'cue', 'image'] as const).map((which) => ({
+                    icon: <FaColumns />,
+                    label: which === 'cue' ? 'Cue' : which === 'image' ? 'Storyboard' : which === 'video' ? 'Video' : 'Audio',
+                    children: [
+                      { icon: <FaColumns />, label: 'Narrower', disabled: !inAvRow, title: avRowHint, action: () => nudgeAvWidth(which, -0.25) },
+                      { icon: <FaColumns />, label: 'Wider', disabled: !inAvRow, title: avRowHint, action: () => nudgeAvWidth(which, 0.25) },
+                      { icon: <FaColumns />, label: 'Reset', disabled: !inAvRow, title: avRowHint, action: () => resetAvWidth(which) },
+                    ],
+                  })),
+                },
+              ],
+            },
+            {
+              icon: <FaImage />, label: 'Storyboard',
+              children: [
+                { icon: <FaImage />, label: 'Add / Replace Frame\u2026', disabled: !inAvRow, title: avRowHint, action: () => pickAvFrame() },
+                { icon: <FaPlus />, label: 'Add Blank Frame', disabled: !inAvRow, title: avRowHint, action: () => editor?.chain().focus().setAvRowImage(AV_BLANK_FRAME).run() },
+                { separator: true, label: '' },
+                {
+                  icon: <FaImage />, label: 'Frame Aspect Ratio',
+                  children: AV_ASPECT_RATIOS.map((ratio) => ({
+                    icon: <FaImage />,
+                    label: avFrameAspect === ratio ? `\u2713 ${ratio}` : ratio,
+                    disabled: !inAvRow,
+                    title: avRowHint,
+                    // Only the ratio — setAvRowImage merges, so the picture
+                    // in the frame (if any) stays exactly where it is.
+                    action: () => editor?.chain().focus().setAvRowImage({ aspect: ratio }).run(),
+                  })),
+                },
+                { separator: true, label: '' },
+                { icon: <FaTimes />, label: 'Remove Frame', disabled: !inAvRow, title: avRowHint, action: () => editor?.chain().focus().clearAvRowImage().run() },
+              ],
+            },
+          ],
+        },
+        {
           icon: <FaFileAlt />,
           label: selectionOnNewPage ? '✓ Start On New Page' : 'Start On New Page',
           action: () => {
@@ -1547,11 +2760,14 @@ const MenuBar: React.FC<MenuBarProps> = ({
           disabled: !editor,
         },
         { separator: true, label: '' },
+        { icon: <FaFont />, label: 'Fonts…', action: () => useEditorStore.getState().setFontsDialogOpen(true) },
         { icon: <FaCommentDots />, label: 'Mores & Continueds…', action: () => useEditorStore.getState().setMoresContdsOpen(true) },
         { icon: <FaHeading />, label: 'Header & Footer…', action: () => useEditorStore.getState().setHeaderFooterOpen(true) },
+        { icon: <FaStickyNote />, label: 'Footnotes & Endnotes…', action: () => useEditorStore.getState().setFootnoteDialogOpen(true) },
         { icon: <FaImage />, label: 'Insert Image…', action: () => useEditorStore.getState().imageInsertHandler?.() },
         { separator: true, label: '' },
         { icon: <FaFileAlt />, label: 'Title Page…', action: () => useEditorStore.getState().setTitlePageEditorOpen(true) },
+        { icon: <FaStream />, label: 'Genre & Pacing…', title: 'Genres for this script, and the pacing the runtime estimate uses', action: () => useEditorStore.getState().setScriptProfileOpen(true) },
         { icon: <FaFileAlt />, label: `Formatting Template (${activeTemplate.name})...`, action: () => setTemplateSelectOpen(true) },
         { icon: <FaFileAlt />, label: 'Script Format Preferences…', action: () => setFormatPrefsOpen({ firstRun: false, afterSave: null }) },
       ],
@@ -1584,9 +2800,12 @@ const MenuBar: React.FC<MenuBarProps> = ({
         },
         { separator: true, label: '' },
         {
-          icon: <FaAdjust />,
-          label: theme === 'light' ? '\u2713 Light Theme' : 'Light Theme',
-          action: () => setTheme(theme === 'light' ? 'dark' : 'light'),
+          icon: <FaAdjust />, label: 'Theme',
+          children: [
+            { icon: <FaSun />, label: appearance === 'light' ? '\u2713 Light' : 'Light', action: () => setAppearance('light') },
+            { icon: <FaMoon />, label: appearance === 'dark' ? '\u2713 Dark' : 'Dark', action: () => setAppearance('dark') },
+            { icon: <FaRegFileAlt />, label: appearance === 'dark-pages' ? '\u2713 Dark Pages' : 'Dark Pages', action: () => setAppearance('dark-pages') },
+          ],
         },
         { separator: true, label: '' },
         {
@@ -1630,9 +2849,25 @@ const MenuBar: React.FC<MenuBarProps> = ({
           ],
         },
         { separator: true, label: '' },
-        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: () => { window.location.href = '/projects'; }, disabled: isCollabGuest },
+        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: goToProjects, disabled: isCollabGuest },
         { icon: <FaBoxes />, label: 'Asset Manager', action: () => useAssetStore.getState().toggleAssetManager() },
         { separator: true, label: '' },
+        {
+          icon: <FaMicrophoneAlt />,
+          label: tableReadOpen ? '\u2713 Table Read' : 'Table Read',
+          title: 'Hear the script read aloud, with a voice for each character',
+          action: () => {
+            const tr = useTableReadStore.getState();
+            if (tr.open) { tr.setOpen(false); return; }
+            tr.setOpen(true);
+            // A browser asks where the voices come from before the first
+            // read, rather than at the first Play; so does a choice of AI
+            // voices with no provider set up yet.
+            const vs = useVoiceSettingsStore.getState();
+            if (activeEngineKind(vs) === 'ai' && !isAiProviderConfigured(vs)) tr.setNeedsProvider(true);
+          },
+          disabled: !editor,
+        },
         {
           icon: <FaStream />, label: 'Analytics',
           children: [
@@ -1649,12 +2884,38 @@ const MenuBar: React.FC<MenuBarProps> = ({
           ],
         },
         { separator: true, label: '' },
-        { icon: <FaCog />, label: 'System Settings…', action: () => navigate('/settings') },
+        { icon: <FaCog />, label: 'System Settings…', action: goToSettings },
         { separator: true, label: '' },
         {
           icon: <FaFilm />, label: 'Production',
           children: [
             { icon: <FaToggleOn />, label: revisionMode ? '\u2713 Revision Mode' : 'Revision Mode', action: () => setRevisionMode(!revisionMode) },
+            {
+              icon: <FaHighlighter />, label: `Revision Color (${revisionColor})`,
+              children: REVISION_COLORS.map((c) => ({
+                label: c.name === revisionColor ? `\u2713 ${c.name}` : c.name,
+                action: () => setRevisionColor(c.name),
+              })),
+            },
+            {
+              icon: <FaStepForward />, label: 'Next Revision Color',
+              title: `Start the ${nextRevisionColor(revisionColor)} revision and turn Revision Mode on`,
+              action: () => {
+                advanceRevisionColor();
+                showToast(`Revising in ${useEditorStore.getState().revisionColor}`, 'info');
+              },
+            },
+            {
+              icon: <FaEye />,
+              label: showRevisionColors ? '\u2713 Show Revision Colors' : 'Show Revision Colors',
+              action: () => setShowRevisionColors(!showRevisionColors),
+            },
+            { icon: <FaEraser />, label: 'Clear Revision Marks\u2026', action: () => setClearRevisionsOpen(true), disabled: !editor },
+            {
+              icon: <FaSlidersH />, label: 'Revision Settings\u2026',
+              title: 'The revision mark, a mark for each revision, and colored pages',
+              action: () => setRevisionSettingsOpen(true),
+            },
             { separator: true, label: '' },
             {
               icon: <FaListUl />,
@@ -1665,30 +2926,98 @@ const MenuBar: React.FC<MenuBarProps> = ({
               icon: <FaLock />,
               label: sceneNumbersLocked ? '\u2713 Lock Scene Numbers' : 'Lock Scene Numbers',
               action: () => setSceneNumbersLocked(!sceneNumbersLocked),
-              disabled: !sceneNumbersVisible,
+              // Unlocking is always allowed; locking needs numbers to lock.
+              disabled: !sceneNumbersVisible && !sceneNumbersLocked,
+            },
+            {
+              icon: <FaBan />, label: 'Omit Scene',
+              title: sceneNumbersLocked
+                ? 'Replace the scene at the cursor with an OMITTED heading that keeps its number'
+                : 'Lock scene numbers first — an unlocked script can simply delete the scene',
+              action: handleOmitScene,
+              disabled: !editor || !sceneNumbersLocked,
             },
             { separator: true, label: '' },
-            { icon: <FaLock />, label: 'Lock Pages', disabled: true },
+            {
+              icon: <FaListOl />,
+              label: elementNumbersVisible && formatNumbersElements ? '\u2713 Show Element Numbers' : 'Show Element Numbers',
+              title: formatNumbersElements
+                ? 'Numbers beside the elements this format numbers, such as every line of dialogue'
+                : `${activeTemplate.name} numbers no elements. Turn numbering on for an element in Element Numbering\u2026`,
+              action: () => setElementNumbersVisible(!elementNumbersVisible),
+              disabled: !formatNumbersElements,
+            },
+            {
+              icon: <FaSlidersH />, label: 'Element Numbering\u2026',
+              title: 'Choose which elements are numbered and what restarts each count, in the formatting template',
+              action: () => setTemplateSelectOpen(true),
+            },
+            { separator: true, label: '' },
+            {
+              icon: pageLabels ? <FaUnlock /> : <FaLock />,
+              label: pageLabels ? 'Unlock Pages' : 'Lock Pages',
+              title: pageLabels
+                ? 'Let page numbers flow again; A pages are renumbered'
+                : 'Keep every page number where it is; new text spills onto A pages',
+              action: handleToggleLockPages,
+              disabled: !editor,
+            },
           ],
         },
       ],
     },
   ];
 
-  // Help menu rendered separately as a 3-dot overflow on the right
+  // Help sits at the right-hand end of the bar, after the spacer.
+  /**
+   * Help → Check for Updates (issue #106).
+   *
+   * Unlike the silent check on launch this one always answers: it ignores the
+   * throttle, the snooze and any earlier Dismiss, and says so when it cannot
+   * reach the manifest rather than looking like it did nothing. When there is
+   * an update the banner shows it, so there is one place the buttons live.
+   */
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const handleCheckForUpdates = async () => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    try {
+      const outcome = await checkForUpdate(true);
+      if (outcome.status === 'up-to-date') {
+        showToast(`OpenDraft ${outcome.version} is the latest version.`, 'success');
+      } else if (outcome.status === 'unreachable') {
+        showToast('Could not check for updates. Check your connection.', 'error');
+      }
+      // 'available' needs no toast — the banner is already on screen.
+    } catch (err) {
+      console.error('[MenuBar] update check failed:', err);
+      showToast('Could not check for updates.', 'error');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
   const helpMenu: MenuSection = {
     label: 'Help',
     items: [
       {
+        icon: <FaBook />,
+        label: 'User Manual\u2026',
+        action: () => setManualOpen(true),
+      },
+      { separator: true, label: '' },
+      // Meaningless in a browser, where a reload already serves the newest
+      // build, so it is not offered there.
+      ...(isWeb() ? [] : [{
+        icon: <FaCloudDownloadAlt />,
+        label: checkingUpdate ? 'Checking\u2026' : 'Check for Updates\u2026',
+        disabled: checkingUpdate,
+        action: () => { void handleCheckForUpdates(); },
+      }]),
+      {
         icon: <FaInfoCircle />,
         label: 'About Open Draft',
         action: () => setAboutOpen(true),
-      },
-      {
-        icon: <FaKeyboard />,
-        label: 'Keyboard Shortcuts',
-        action: () =>
-          showToast(`${mod}1-8: Elements | Tab: Next | ${mod}B/I/U: Format | ${mod}Z: Undo | ${mod}F: Find | ${mod}G: Go to Page`, 'success'),
       },
       {
         icon: <FaStethoscope />,
@@ -1727,7 +3056,11 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
   // Track the active menu item's position for the portal dropdown
   const menuItemRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const [dropdownPos, setDropdownPos] = useState<{ top?: number; bottom?: number; left: number }>({ top: 0, left: 0 });
+  // `maxHeight` keeps a long menu (Format, on a short window in comfortable
+  // density) inside the viewport instead of running off the bottom where the
+  // last few items cannot be reached at all. Submenus are positioned fixed, so
+  // they still fly out past the scroll container.
+  const [dropdownPos, setDropdownPos] = useState<{ top?: number; bottom?: number; left: number; maxHeight?: number }>({ top: 0, left: 0 });
 
   useEffect(() => {
     if (!activeMenu) return;
@@ -1743,15 +3076,18 @@ const MenuBar: React.FC<MenuBarProps> = ({
 
       // In floating mode, position relative to the panel edges (not individual items)
       // so the dropdown clears the rounded, padded floating menu panel.
+      const fit = (edge: number) => Math.max(160, window.innerHeight - edge - 8);
       if (toolbarMode === 'hidden' && menuRef.current) {
         const panelRect = menuRef.current.getBoundingClientRect();
         if (panelRect.bottom > window.innerHeight * 0.55) {
-          setDropdownPos({ bottom: window.innerHeight - panelRect.top + 4, left, top: undefined });
+          const bottom = window.innerHeight - panelRect.top + 4;
+          setDropdownPos({ bottom, left, top: undefined, maxHeight: fit(bottom) });
         } else {
-          setDropdownPos({ top: panelRect.bottom + 4, left, bottom: undefined });
+          const top = panelRect.bottom + 4;
+          setDropdownPos({ top, left, bottom: undefined, maxHeight: fit(top) });
         }
       } else {
-        setDropdownPos({ top: rect.bottom, left, bottom: undefined });
+        setDropdownPos({ top: rect.bottom, left, bottom: undefined, maxHeight: fit(rect.bottom) });
       }
     }
   }, [activeMenu, toolbarMode]);
@@ -1764,6 +3100,9 @@ const MenuBar: React.FC<MenuBarProps> = ({
   // Draggable FAB position — persisted to localStorage
   const FAB_POS_KEY = 'opendraft:fabPosition';
   const FAB_SIZE = 36;
+  // How far down the window the iPadOS window control reaches, plus room for
+  // the FAB itself — below this the corner is the app's own again.
+  const FAB_PILL_BAND_PX = 56;
   const [fabPos, setFabPos] = useState<{ x: number; y: number } | null>(() => {
     try {
       const s = localStorage.getItem('opendraft:fabPosition');
@@ -1790,6 +3129,16 @@ const MenuBar: React.FC<MenuBarProps> = ({
   const fabTopStyle = isAndroidWebView
     ? `max(${fabY}px, calc(max(env(safe-area-inset-top), 28px) + 8px))`
     : `max(${fabY}px, calc(env(safe-area-inset-top, 0px) + 8px))`;
+  // Same problem on the other axis: iPadOS draws its window-management pill
+  // over the top-leading corner of a windowed app, and the FAB's default spot
+  // is right underneath it. This FAB *is* the menu while the toolbar is
+  // hidden, so a buried one leaves no way to reach anything (issue #66).
+  // --ios-window-gutter is 0 unless the app is in a window, and the clamp only
+  // applies in the band the pill occupies — lower down, the leading edge is
+  // the user's to park on.
+  const fabLeftStyle = fabY < FAB_PILL_BAND_PX
+    ? `max(${fabX}px, calc(env(safe-area-inset-left, 0px) + var(--ios-window-gutter, 0px)))`
+    : `max(${fabX}px, env(safe-area-inset-left, 0px))`;
 
   // Desktop: pointer events with capture for mouse drag
   const handleFabPointerDown = useCallback((e: React.PointerEvent) => {
@@ -1956,6 +3305,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           key={menu.label}
           ref={(el) => { menuItemRefs.current[menu.label] = el; }}
           className={`menu-item ${activeMenu === menu.label ? 'active' : ''}`}
+          onMouseDown={keepEditorSelection}
           onClick={() => handleMenuClick(menu.label)}
           onMouseEnter={() => {
             if (activeMenu) setActiveMenu(menu.label);
@@ -1965,19 +3315,21 @@ const MenuBar: React.FC<MenuBarProps> = ({
           <span className="menu-label">{menu.label}</span>
         </div>
       ))}
-      <div className="menu-spacer" />
-      <AuthIndicator />
       <div
         ref={(el) => { menuItemRefs.current['Help'] = el; }}
-        className={`menu-item menu-item--more ${activeMenu === 'Help' ? 'active' : ''}`}
+        className={`menu-item ${activeMenu === 'Help' ? 'active' : ''}`}
+        onMouseDown={keepEditorSelection}
         onClick={() => handleMenuClick('Help')}
         onMouseEnter={() => {
           if (activeMenu) setActiveMenu('Help');
         }}
-        title="Help & About"
+        title="User manual, about and diagnostics"
       >
-        <FaEllipsisH />
+        <span className="menu-icon"><FaQuestionCircle /></span>
+        <span className="menu-label">Help</span>
       </div>
+      <div className="menu-spacer" />
+      <AuthIndicator />
     </>
   );
 
@@ -1989,7 +3341,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           <div
             ref={fabElRef}
             className={`menu-fab ${floatingMenuOpen ? 'menu-fab--open' : ''}`}
-            style={{ left: fabX, top: fabTopStyle }}
+            style={{ left: fabLeftStyle, top: fabTopStyle }}
             onPointerDown={handleFabPointerDown}
             onPointerMove={handleFabPointerMove}
             onPointerUp={handleFabPointerUp}
@@ -2030,76 +3382,10 @@ const MenuBar: React.FC<MenuBarProps> = ({
     {activeMenuData && createPortal(
       <div
         className={`menu-dropdown${toolbarMode === 'comfortable' ? ' menu-dropdown--comfortable' : ''}${dropdownPos.bottom != null ? ' menu-dropdown--above' : ''}`}
-        style={{ top: dropdownPos.top, bottom: dropdownPos.bottom, left: dropdownPos.left }}
+        onMouseDown={keepEditorSelection}
+        style={{ top: dropdownPos.top, bottom: dropdownPos.bottom, left: dropdownPos.left, maxHeight: dropdownPos.maxHeight }}
       >
-        {activeMenuData.items.map((item, i) =>
-          item.separator ? (
-            <div key={i} className="menu-separator" onPointerEnter={handleItemPointerEnter} />
-          ) : item.children ? (
-            <div
-              key={item.label}
-              className={`menu-dropdown-item has-children ${openSubmenu === item.label ? 'submenu-open' : ''}`}
-              onPointerEnter={(e) => handleSubmenuPointerEnter(item.label!, e)}
-              onTouchEnd={(e) => handleSubmenuTouchEnd(item.label!, e)}
-              onClick={(e) => { e.stopPropagation(); setOpenSubmenu((prev) => (prev === item.label ? null : item.label!)); }}
-            >
-              {item.icon && <span className="menu-dropdown-icon">{item.icon}</span>}
-              <span>{item.label}</span>
-              <span className="menu-submenu-arrow">{openSubmenu === item.label ? '\u25BE' : '\u25B8'}</span>
-              <div
-                className={`menu-submenu ${openSubmenu === item.label ? 'submenu-visible' : ''}`}
-                ref={(el) => {
-                  if (el && openSubmenu === item.label) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.right > window.innerWidth) {
-                      el.classList.add('submenu-flip');
-                    } else {
-                      el.classList.remove('submenu-flip');
-                    }
-                    if (rect.bottom > window.innerHeight) {
-                      el.classList.add('submenu-flip-y');
-                    } else {
-                      el.classList.remove('submenu-flip-y');
-                    }
-                  }
-                }}
-              >
-                {item.children.map((child, j) =>
-                  child.separator ? (
-                    <div key={j} className="menu-separator" />
-                  ) : (
-                    <div
-                      key={child.label}
-                      className={`menu-dropdown-item ${child.disabled ? 'disabled' : ''}`}
-                      title={child.title}
-                      onTouchEnd={(e) => e.stopPropagation()}
-                      onClick={(e) => handleItemClick(child, e)}
-                    >
-                      {child.icon && <span className="menu-dropdown-icon">{child.icon}</span>}
-                      <span>{child.label}</span>
-                      {child.shortcut && (
-                        <span className="menu-shortcut">{child.shortcut}</span>
-                      )}
-                    </div>
-                  )
-                )}
-              </div>
-            </div>
-          ) : (
-            <div
-              key={item.label}
-              className={`menu-dropdown-item ${item.disabled ? 'disabled' : ''}`}
-              onPointerEnter={handleItemPointerEnter}
-              onClick={(e) => handleItemClick(item, e)}
-            >
-              {item.icon && <span className="menu-dropdown-icon">{item.icon}</span>}
-              <span>{item.label}</span>
-              {item.shortcut && (
-                <span className="menu-shortcut">{item.shortcut}</span>
-              )}
-            </div>
-          )
-        )}
+        {activeMenuData.items.map((item, i) => renderMenuNode(item, '', i))}
       </div>,
       document.body,
     )}
@@ -2181,7 +3467,8 @@ const MenuBar: React.FC<MenuBarProps> = ({
           setFormatPrefsOpen(null);
           if (next?.afterSave === 'apply-new-screenplay') {
             // After saving prefs, immediately route the new-screenplay action through
-            // the same logic again (1 enabled = apply directly, 2+ = show picker).
+            // the same logic again (1 enabled = apply directly, 2+ = show picker
+            // with the default selected).
             if (ids.length === 1) finishNewScreenplayWithFormat(ids[0], formatPickerMode);
             else if (ids.length > 1) setFormatPickerOpen(true);
             else finishNewScreenplayWithFormat(INDUSTRY_STANDARD_ID, formatPickerMode);
@@ -2193,11 +3480,22 @@ const MenuBar: React.FC<MenuBarProps> = ({
     {formatPickerOpen && (
       <ScriptFormatPickerDialog
         enabledIds={useSettingsStore.getState().enabledScriptFormats}
+        defaultId={useSettingsStore.getState().defaultScriptFormat}
         onPick={(id) => {
           setFormatPickerOpen(false);
           finishNewScreenplayWithFormat(id, formatPickerMode);
         }}
         onCancel={() => setFormatPickerOpen(false)}
+      />
+    )}
+    {backupFolderPrompt && (
+      <BackupFolderPrompt
+        then={backupFolderPrompt}
+        onClose={() => setBackupFolderPrompt(null)}
+        onFolderChosen={() => {
+          if (backupFolderPrompt === 'backup') void backUpNow();
+          else void openBackupFolder();
+        }}
       />
     )}
     <RecoverBackupDialog
@@ -2218,12 +3516,171 @@ const MenuBar: React.FC<MenuBarProps> = ({
           <div className="dialog-header">About Open Draft</div>
           <div className="dialog-body about-body">
             <div className="about-title">Open Draft</div>
-            <div className="about-version">Version 0.24.1</div>
+            <div className="about-version">Version 2.5.4</div>
             <div className="about-tagline">Free, open-source screenwriting software</div>
 
             <div className="about-whats-new">
-              <div className="about-section-title">What's New in 0.24.1</div>
+              <div className="about-section-title">What's New in 2.5.4</div>
               <div className="about-changelog">
+              <div className="about-subsection-title">v2.5.4</div>
+              <ul className="about-list">
+                <li><strong>Runtime To The Second</strong> &mdash; The <em>Est.</em> runtime in the status bar, Script Statistics, the Timing Report and the <em>Genre &amp; Pacing</em> previews now show minutes and seconds &mdash; <em>1h 47m 12s</em> rather than <em>1h 47m</em> &mdash; so a short film or a single scene no longer rounds to a whole minute. A scene just short of two minutes read <em>1:60</em> in the Timing Report; it now reads <em>2:00</em>.</li>
+                <li><strong>No Server Check At Startup</strong> &mdash; The desktop and mobile apps asked the OpenDraft server whether it was a demo server every time they opened, even for writers who never sign in, and waited ten seconds for an answer with no connection. They now ask only when you open Settings or sign in.</li>
+              </ul>
+              <div className="about-subsection-title">v2.5.3</div>
+              <ul className="about-list">
+                <li><strong>A Runtime Estimate That Matches The Screen</strong> &mdash; The <em>Est.</em> runtime in the status bar ran well short &mdash; a 110-page feature came out at little over an hour. It counted words at 250 a page, which is a page of prose, not of screenplay, and gave character names, scene headings and every blank line no time at all. It now measures the printed page the way the rule of thumb means it &mdash; one page, about a minute &mdash; counting each element at its own width and the white space around it. Checked against thirteen released films, it lands on their running time without the end credits, give or take the pace each was directed at. Scene timings in the Scene Navigator and the Timing Report follow it.</li>
+                <li><strong>Genre &amp; Pacing</strong> &mdash; <em>Format &rarr; Genre &amp; Pacing&hellip;</em>, or a click on <em>Est.</em>, tells OpenDraft how your film will play. <strong>Brisk</strong> is for fast talk and quick cutting, <strong>Measured</strong> for slow-burn and lingering images, and <strong>Standard</strong> for everything else; each shows the runtime it gives your script before you choose, and timings you set on a scene by hand are kept. Tag the script with as many genres as fit, or type your own. Both are saved with the script and shared with collaborators; genre is for you and does not change the estimate.</li>
+              </ul>
+              <div className="about-subsection-title">v2.5.2</div>
+              <ul className="about-list">
+                <li><strong>Dark Pulldowns</strong> &mdash; Under the Dark theme, the lists that drop down from the element, font size, sort and other pulldowns opened white when the computer itself was set to Light &mdash; on Windows almost unreadable. OpenDraft now draws every pulldown list itself, so it follows the app&rsquo;s theme, Light or Dark, whatever the system is set to. The desktop window&rsquo;s title bar follows the theme too. To make the script page dark as well, choose <em>View &rarr; Theme &rarr; Dark Pages</em>.</li>
+              </ul>
+              <div className="about-subsection-title">v2.5.1</div>
+              <ul className="about-list">
+                <li><strong>Character Voices Are Kept</strong> &mdash; A voice chosen for a character under <em>Table Read Voice</em> was lost the next time the script was opened, and the following save wrote the profile back without it. The voice now stays with the character on every platform. Voices chosen in 2.5.0 need picking once more.</li>
+              </ul>
+              <div className="about-subsection-title">v2.5.0</div>
+              <ul className="about-list">
+                <li><strong>Table Read</strong> &mdash; <em>Tools &rarr; Table Read</em> reads your script aloud, with a different voice for each character and a narrator for scene headings, action and transitions. A panel under the script shows the line being read with the word being spoken highlighted, and the same word is highlighted in the script, which scrolls to keep up. Pause picks up at the word it stopped on; skip a line or a scene, change the speed, or click any line to read from there.</li>
+                <li><strong>A Voice For Each Character</strong> &mdash; Every character gets a voice of their own automatically, matched to the Gender on their profile or to how the script introduces them. To choose one yourself, pick it under <em>Table Read Voice</em> on the character&rsquo;s profile. The choice is saved with the script.</li>
+                <li><strong>Your Device&rsquo;s Voices, Or AI Voices</strong> &mdash; Use the voices already installed on your device, free and offline, or AI voices: <strong>Kokoro</strong>, free and running on your own device, or Google Gemini, OpenAI, ElevenLabs, Microsoft Azure Speech or your own speech server, with your own API key.</li>
+                <li><strong>Confidentiality</strong> &mdash; Every AI voice except Kokoro sends the text of your script to that company. This may breach your data security or confidentiality obligations, and OpenDraft does not guarantee the confidentiality of anything sent to a third-party provider. Table Read says so wherever one is in use.</li>
+                <li><strong>Projects In A Folder On Disk</strong> &mdash; On the desktop, a project can save its scripts as files in a folder you choose &mdash; an external disk, a RAID, a network drive &mdash; as OpenDraft, Fountain or Final Draft files. <em>File &rarr; Open Folder as Project&hellip;</em> turns an existing folder into a project. A file changed somewhere else is never overwritten: OpenDraft opens the new version, or asks which to keep.</li>
+                <li><strong>Auto-Save, Your Way</strong> &mdash; Separate auto-save switches for library scripts and for files opened from disk, in <em>Tools &rarr; System Settings &rarr; Saving</em>. With auto-save off, leaving a script or closing the window asks first.</li>
+                <li><strong>Back Up Now Asks For A Folder</strong> &mdash; With no backup folder chosen, <em>Back Up Now</em> asks for one right there instead of sending you to Settings.</li>
+                <li><strong>Also Fixed</strong> &mdash; Leaving a script can no longer save an empty page over your saved text. OpenDraft now needs Android 8 or later; on Android 7 it closed as soon as it opened.</li>
+              </ul>
+              <div className="about-subsection-title">v2.4.0</div>
+              <ul className="about-list">
+                <li><strong>Dark Pages</strong> &mdash; View &rarr; Theme is one menu now: Light, Dark, and Dark Pages. Dark Pages turns the script page itself dark, with light text, for writing at night. Black text that came in from a formatting template, or was pasted from Word or Google Docs, turns light with the page instead of disappearing into it, and a colour you actually chose is left alone. It is a screen setting only &mdash; PDF, print and every export are still black on white. Whichever theme you pick is remembered.</li>
+                <li><strong>Revision Mode Marks What You Change</strong> &mdash; Revision Mode used to put the revision colour in the header and nothing more. Now every line you change while it is on gets an asterisk in the right margin &mdash; text you type or paste, a line you shorten, join, split or turn into another element &mdash; and it prints on the PDF beside each revised line, AV tables included. Tools &rarr; Production has the colour, <em>Next Revision Color</em> to start the next round in the White, Blue, Pink, Yellow&hellip; sequence, <em>Show Revision Colors</em>, and <em>Clear Revision Marks</em>. The marks are saved with the script and shared with collaborators. An older version of OpenDraft still opens a revised script; it just does not show the asterisks.</li>
+                <li><strong>Your Own Revision Mark</strong> &mdash; <em>Tools &rarr; Production &rarr; Revision Settings</em> sets the character printed beside a revised line, and can give each revision a mark of its own, so a page carrying Blue and Pink changes shows which is which. A line changed in two rounds shows the later round&rsquo;s mark. The marks are used on screen, in the PDF and in print.</li>
+                <li><strong>Revised Pages On Coloured Paper</strong> &mdash; Revision Settings can tint every revised page in the PDF and in print with its revision&rsquo;s colour, the way revised pages go out on coloured stock. <em>File &rarr; Export &rarr; PDF (Revised Pages Only)</em> writes just the pages that carry a revision &mdash; what goes to cast and crew between full drafts.</li>
+                <li><strong>Locked Pages And A Pages</strong> &mdash; <em>Tools &rarr; Production &rarr; Lock Pages</em> fixes every page where it is. Text added to page 12 then spills onto 12A and 12B instead of pushing every later page along, text added above page 1 goes onto A1, and a page whose text is all cut is folded into the one before it as 12-13. The labels show in the header, the status bar and the page thumbnails, and print on the PDF.</li>
+                <li><strong>Locked Scene Numbers That Stay Put</strong> &mdash; With scene numbers locked, a scene added after 12 is now 12A rather than taking a number another scene already has, and one added before scene 1 is A1. A copied heading never brings its number with it, and hiding the numbers no longer erases the locked ones. Scripts locked in an earlier version that ended up with two scenes sharing a number are put right when they open. <em>Omit Scene</em> cuts a scene but leaves its heading, numbered, reading OMITTED.</li>
+                <li><strong>Revisions In Every Format</strong> &mdash; Final Draft files keep their revisions both ways: export writes each revision with its colour and mark, and import now reads them back &mdash; the revised text, the colours, the marks and the current revision &mdash; and keeps a production&rsquo;s locked scene numbers instead of renumbering them. Word marks each revised paragraph in the right margin, Fountain carries the mark in a note on each revised line, and Fade In gets its own revision table and marks; all three read them back in.</li>
+                <li><strong>Exporting And Importing A Project</strong> &mdash; Importing a project that had been exported as a zip brought every screenplay in twice &mdash; once as itself, and once as a script named after its <code>.meta.json</code> file. Each script now comes back once, in the order it was in, with its colour, pin and the project&rsquo;s properties, and with its images when the project was exported from the app. A script that cannot be read stops the export with its name rather than being quietly left out of the zip.</li>
+                <li><strong>Treatments Stay Treatments</strong> &mdash; On the desktop, iPhone, iPad and Android apps a treatment opened in the treatment editor the first time and in the screenplay editor every time after. It now always opens as a treatment, and treatments written before this update are recognised and put right the first time the app starts.</li>
+              </ul>
+              <div className="about-subsection-title">v2.3.3</div>
+              <ul className="about-list">
+                <li><strong>Linux On Older Graphics Cards</strong> &mdash; On some Linux machines the OpenDraft window came up dark and empty, and on an older NVIDIA card using the open-source <em>nouveau</em> driver it could freeze the whole desktop until a restart. The page is drawn by the web engine on the graphics card, and two of the ways it does that are ones those drivers cannot handle. OpenDraft now turns off the faster buffer-sharing path on every Linux machine, and on nouveau it also draws the window without the graphics card &mdash; slower to scroll, but a window you can write in. Setting <code>WEBKIT_DISABLE_DMABUF_RENDERER</code> or <code>WEBKIT_DISABLE_COMPOSITING_MODE</code> yourself still wins, <code>=0</code> included.</li>
+                <li><strong>A Crash On Android From Another App&rsquo;s Link</strong> &mdash; Another app could ask OpenDraft to open something it was not allowed to read &mdash; a contact, say &mdash; and OpenDraft closed instead of saying no. It now turns the request down and keeps running.</li>
+              </ul>
+              <div className="about-subsection-title">v2.3.2</div>
+              <ul className="about-list">
+                <li><strong>A PDF In The Script You Wrote It In</strong> &mdash; Write in Hindi and export, and the page came back blank where the dialogue had been: the words were in the file, but the only embedded typeface had no Devanagari in it and drew nothing. Eleven writing systems now travel with the app &mdash; Devanagari, Bengali, Gujarati, Gurmukhi, Kannada, Malayalam, Odia, Sinhala, Tamil, Telugu and Thai &mdash; each cut down to its own block, so the lot adds under half a megabyte. The vowel signs that are stored after their consonant and read before it are put back into reading order, so &#2361;&#2367;&#2344;&#2381;&#2342;&#2368; comes out as it was typed. A Latin word inside an Indic line keeps Courier&rsquo;s fixed cell, and an English screenplay&rsquo;s PDF is byte for byte what it was.</li>
+                <li><strong>Chinese, Japanese And Korean</strong> &mdash; Those faces are five to ten megabytes apiece and cannot be cut down in advance, because which characters a screenplay uses is not known until it is exported. They are fetched the first time a script needs one and kept on the machine afterwards &mdash; once per computer, not once per export &mdash; so the app does not double in size for writers who will never draw a glyph from them. Which of the four a document gets is read off its own text. A line of them breaks in the right place now, too: those characters are twice the width of a Latin one, and a page measured by counting characters ran off the margin.</li>
+                <li><strong>Hebrew And Arabic, In The Order They Are Read</strong> &mdash; Both are written right to left and stored in the order they are read, so a font on its own would have turned &#1513;&#1500;&#1493;&#1501; back to front &mdash; worse than a blank page, because it looks like text and would be sent out. Every line is now reordered before it is drawn, by the standard bidirectional algorithm, brackets and mixed-in English included. Arabic letters change shape according to what they join to, so each is swapped for the shape it needs and a word comes out joined rather than as a row of separate letters; what Persian and Urdu add is covered too. The page itself is not mirrored &mdash; margins and indents stay where Final Draft puts them.</li>
+                <li><strong>Word Files Ask Word For The Right Typeface</strong> &mdash; Word picks a font per character out of four names written into the file, and the export put the document&rsquo;s own family into all four &mdash; telling Word that the Hindi in the script was set in Courier Prime, which has no Devanagari in it. The complex-script name now comes from what is actually in the line, so Hindi, Thai, Hebrew, Arabic and Chinese, Japanese and Korean all reach a face that can draw them, and a sentence mixing English and Hindi needs no splitting. A font you chose yourself is taken at your word and left alone, and an English screenplay&rsquo;s file is unchanged.</li>
+                <li><strong>A Missing Font Now Says So</strong> &mdash; Typefaces are loaded as the export runs, and one that failed to load left the export to carry on and write nothing where the text was &mdash; the same silent blank page the whole problem was reported as. The face that would not load is now named beside the result, in <em>File &rarr; Export &rarr; PDF</em> and in every print route: desktop, browser, the iOS share sheet and the Android print dialog. A script nothing covers at all &mdash; Khmer, Tibetan, Lao, Myanmar and the rest &mdash; is named as well, by name rather than as &ldquo;some characters&rdquo;, because one of those may come right on the next attempt and the other will not. The PDF is still written either way: a script is not worth losing over a font.</li>
+              </ul>
+              <div className="about-subsection-title">v2.3.1</div>
+              <ul className="about-list">
+                <li><strong>Export And Print On Older Android</strong> &mdash; On Android 12 and earlier, <em>File &rarr; Export</em> stopped with &ldquo;Permission denied (os error 13)&rdquo; and no permission anywhere to grant, and <em>File &rarr; Print</em> did nothing at all. Every format went the same way &mdash; PDF, Final Draft, Fountain, Word &mdash; because each of them writes the file out before handing it to Android&rsquo;s save dialog, and it was writing it to a folder no app is allowed into. It writes inside the app&rsquo;s own storage now. Android 13 and later were never affected.</li>
+              </ul>
+              <div className="about-subsection-title">v2.3.0</div>
+              <ul className="about-list">
+                <li><strong>A Cue Column, And A Clock That Keeps Itself</strong> &mdash; An AV script can carry shot numbers and timings beside its columns. Type a duration on a row and every start time below it moves with it; insert a row in the middle and the numbering follows. Neither is stored &mdash; both are worked out from the script as it stands, so there is nothing to renumber by hand &mdash; and either can be overridden on the row that needs it. The running total is the section&rsquo;s runtime, and it carries on through a script that has several tables in it rather than starting again at each one.</li>
+                <li><strong>A Storyboard Column</strong> &mdash; Each row can hold a frame: a picture of the shot, at 16:9, 4:3, 1:1, 9:16, 2.39:1 or free. Double-click an empty frame to choose an image, or use <em>Format &rarr; AV Script &rarr; Storyboard</em>. Turning the column off hides the frames rather than throwing them away, and the menu tells you how many rows would go quiet before it does it.</li>
+                <li><strong>Columns You Can Size</strong> &mdash; Drag the divider between any two columns to set their widths, and double-click it to put that pair back to where they started. <em>Format &rarr; AV Script &rarr; Columns &rarr; Column Width</em> does the same in steps, which is the route on a touchscreen. The widths travel with the document, and the printed page, the PDF and the spreadsheet all use them.</li>
+                <li><strong>Screenplay Elements Inside The Columns</strong> &mdash; An AV body could hold four paragraph types and no more, so there was no way to write an on-camera interview or a spokesperson &mdash; which is most of what a corporate or documentary script is made of. A cell now takes Action, Shot, Character, Dialogue, Parenthetical and Lyrics as well, and the template decides which column offers which: the AV Script format puts Action and Shot in Video, and Character, Dialogue, Parenthetical and Lyrics in Audio. Your own templates set it per element, in the template editor.</li>
+                <li><strong>AV Scripts In And Out As Spreadsheets</strong> &mdash; <em>File &rarr; Export</em> writes an AV script as .xlsx or .csv for a shot-list tool, as plain text, or as OpenDraft AV YAML &mdash; a readable file that keeps the paragraph styles, cue timings and column widths a spreadsheet flattens. <em>File &rarr; Import</em> reads .xlsx and .csv back and works out what each column is, so a sheet from another production still lands in the right places: <em>Visual</em>, <em>Picture</em> and <em>Vision</em> are video, <em>Sound</em>, <em>Narration</em> and <em>VO</em> are audio, <em>Length</em> and <em>Run Time</em> are durations. PDF and Word get a real table, with the header repeated on every page and no row ever split across a page break.</li>
+                <li><strong>AV Controls A Finger Can Reach</strong> &mdash; Adding a row meant Tab or Cmd-Enter, and a phone or tablet keyboard has neither &mdash; so on touch the format could be filled in but not extended: one row, and no way to a second. Every AV control now has a route that is not a keystroke. There is <em>+ Row</em> and a delete button in the toolbar while the cursor is in a cell, the same three on the long-press menu, and rows, columns and storyboard sit together under one <em>Format &rarr; AV Script</em> menu instead of three.</li>
+                <li><strong>A Way Out Of An AV Table</strong> &mdash; On a phone there was no way to write anything that was not inside the table. The AV Script format opened as the table and nothing else, every route out was a key the on-screen keyboard has not got, and tapping the empty page below the table did nothing at all. An AV script now opens with a line beneath the table, and <em>Format &rarr; AV Script &rarr; Line After Table</em> &mdash; or <em>Line Before Table</em> &mdash; puts the cursor on an ordinary line outside it whenever you need one, adding it if it is not already there. With a keyboard, Down and Up do it too.</li>
+                <li><strong>Pictures On Android</strong> &mdash; Choosing an image for a storyboard frame opened the picker, took the photo you chose, and then quietly did nothing &mdash; the frame stayed empty with nothing to say why. Pictures could not be shown on Android at all, either, so an image inserted anywhere in a script was blank space. Both are fixed.</li>
+                <li><strong>A Picture Put In An AV Row</strong> &mdash; Inserting, pasting or dropping an image while the cursor was in a cell split the table in two: an empty row appeared belonging to a second table with its own column widths, and the picture was nowhere to be seen. An image in an AV row is that row&rsquo;s storyboard frame now, in the row you put it in, with the storyboard column turned on to show it.</li>
+                <li><strong>The PDF Turns Its Pages Where The Editor Does</strong> &mdash; A 33-page script came out as 35, and from the first page that disagreed onwards nothing was on the page you had put it on &mdash; which in a screenplay is a change to the script. It was not one fault but several, each worth a line or two, in the places where the PDF measured a line differently from the screen: where a long line wraps, what a blank line is worth, where a page may be broken. They measure the same now.</li>
+                <li><strong>Signing In On A Fresh Desktop Install</strong> &mdash; Every desktop build shipped pointing at an address on your own machine with nothing behind it &mdash; left over from a version that ran a small server alongside the app. Signing in failed straight out of the box with <em>error sending request for url</em>, and Settings offered that address as the default.</li>
+                <li><strong>A Second Browser Tab Stopped Overwriting The First</strong> &mdash; In a browser every tab shared one slot for unsaved-work recovery, so opening OpenDraft in a second tab destroyed the protection the first one was holding &mdash; within ten seconds, and without a word. Each tab keeps its own now. The recovery prompt has also stopped offering you a document that is open and being edited in another tab, which it used to describe as unsaved work from a previous session while you were looking at it.</li>
+                <li><strong>Downloading An Asset With An Awkward Name</strong> &mdash; Any file whose name was not plain ASCII failed to download with a server error. It took no exotic name to hit: every screenshot taken on a Mac carries an unusual kind of space before the AM or PM.</li>
+              </ul>
+              <div className="about-subsection-title">v2.2.0</div>
+              <ul className="about-list">
+                <li><strong>Your Own Template As The Default</strong> &mdash; A custom template could be applied to the script in front of you and nowhere else: every new script still started in one of the built-in formats. Your templates are now offered alongside those formats, and <em>Make default</em> &mdash; in the template manager, or in <em>Format &rarr; Script Format Preferences</em> &mdash; puts one at the top of the New Screenplay picker, already selected, so Enter takes it. The picker still asks, because keeping several formats means the next script could be any of them. Duplicating a format now also keeps its starter pages, act breaks and dialogue spacing, which a copy used to lose.</li>
+                <li><strong>A Blank White Window On Linux</strong> &mdash; The AppImage came up as an empty white window on any distribution newer than the one it is built on &mdash; reported from Arch, and the same on Fedora and anything else current. It carried its own copy of a system library that has to match the machine it is running on, and the mismatch left the graphics driver unable to start, so there was nothing to draw the editor with. That copy is gone, and every release is now checked for it before it ships.</li>
+                <li><strong>The Mac App Store Said You Were Up To Date</strong> &mdash; A Mac App Store user on 2.0.0 was told there was nothing new while 2.1.0 was already on sale. The two Apple stores share one product page but approve and publish separately, so either can be a release ahead &mdash; and the check that watches them asked once and gave both the iPhone and iPad answer. Each store is now asked for itself, and a store that cannot answer leaves the notice looking rather than being told the wrong version.</li>
+                <li><strong>Handwriting Kept Up With The Cursor</strong> &mdash; The handwriting panel floats over the script, so everything that moves the cursor happens behind it: tapping another line, a scribble being converted, the keyboard coming and going. It read the cursor once and trusted it afterwards, so it could offer to insert somewhere the cursor had long left, and its <em>Keyboard on</em> label could describe a keyboard that had gone down. It now keeps up &mdash; including when you resize the panel, which rewraps every line inside it.</li>
+              </ul>
+              <div className="about-subsection-title">v2.1.0</div>
+              <ul className="about-list">
+                <li><strong>Handles On A Selection, On iPad</strong> &mdash; Selecting text on an iPad highlighted it and left it at that: with no grabber at either end, widening a selection by a word meant throwing it away and starting again. There is now a handle at each end to drag, and dragging one past the other turns the selection around, the way it does everywhere else on the device.</li>
+                <li><strong>The Selection Stays Visible</strong> &mdash; Reaching for a menu, or the keyboard coming and going, made the highlight disappear &mdash; while the selection itself was still there and still what the next command would act on. Cutting a selected line from the Edit menu also moved the cursor before cutting it. The highlight now stays put, and so does the cursor.</li>
+                <li><strong>A Handwriting Panel That Stays Open</strong> &mdash; On iPad, handwriting opened as a sheet over the script and the page underneath could not be touched, so moving the insertion point meant closing it, tapping the new line and opening it again. It is a floating panel now: drag it by its title bar, tap any line behind it to choose where the next insert goes, and it stays up between inserts, so a run of small revisions is one panel and no reopening. Where you leave it is remembered.</li>
+                <li><strong>A Handwriting Panel You Can Size And See Through</strong> &mdash; Drag its bottom-right corner to make it bigger or smaller; made narrow, the buttons keep their icons and drop their words. The gear in the title bar sets how much of the script shows through the panel and through the writing box &mdash; turned right down you can read the line you are adding to straight through the place you are writing &mdash; and picks the ink colour your handwriting comes out in, so it stays legible against whatever shows through.</li>
+                <li><strong>The Page Holds Still When You Insert</strong> &mdash; Inserting handwriting scrolled the script so the cursor cleared the panel, which moved the page at the one moment you were looking for what had just landed. It now stays exactly where it was.</li>
+                <li><strong>Handwriting Added To A Line You Already Wrote</strong> &mdash; Handwriting inserted in the middle of a line arrived with no space around it, so writing &ldquo;(CONTINUOUS)&rdquo; at the end of a scene heading gave you DAY(CONTINUOUS). It is now spaced against the words either side, while a full stop, a comma or a bracket stays tight to what it belongs to.</li>
+                <li><strong>Print Prints The Pages You Are Looking At</strong> &mdash; The editor draws its page turns rather than making them, and printing asked the browser to lay the script out a second time by its own rules &mdash; so the printed pages could end somewhere you had never seen, which in a screenplay is a change to the script. Print now sends the PDF, the same pages <em>File &rarr; Export &rarr; PDF</em> produces, so what comes off the printer is what is on screen and what anyone you send it to would read. The browser's date, title, URL and page number are gone with it. <em>Settings &rarr; Printing</em> turns it off if you would rather have the browser's own dialog and its margin and scaling controls.</li>
+                <li><strong>Print Did Nothing On The Desktop App</strong> &mdash; <em>File &rarr; Print</em> was a menu item that did nothing at all, silently and with no error to find: the desktop web view's print command had never been permitted, so the call was refused and the refusal went nowhere. It works, and if it ever cannot it now says why.</li>
+                <li><strong>Printing From The File Menu Printed The File Menu</strong> &mdash; The print started before the menu had closed, and the menu is drawn outside everything the print styles hide, so what came out was a picture of it.</li>
+                <li><strong>Pasting A Line Into The Middle Of Another</strong> &mdash; <em>Paste as Fountain</em> read an ordinary line of prose as a screenplay element and put it in as a block, which split the line the cursor was in: a scene heading pasted into came back torn in half around it. A single plain line now goes in as text at the cursor. Anything with real structure &mdash; a heading, a character cue and its dialogue, a transition, a centred line &mdash; still arrives as those elements.</li>
+                <li><strong>Pasting A Line That Starts With An Ellipsis</strong> &mdash; <em>Paste as Fountain</em> read a leading &ldquo;&hellip;&rdquo; as markup, so pasting a continued line of dialogue into the middle of an element broke that element in two. Fountain does not treat an ellipsis as markup and neither does this any more.</li>
+              </ul>
+              <div className="about-subsection-title">v2.0.0</div>
+              <ul className="about-list">
+                <li><strong>Blank Lines, And A Way Out Of The Element Menu</strong> — Pressing Enter on a blank line opened the element menu with no keystroke left to mean “just another blank line”. Enter again accepted the highlighted row, and on a blank Action line that row is Action, so nothing happened; Escape and then Enter only reopened the menu. Five things now insert the line: Enter with nothing chosen, choosing the element the line is already on, a <em>Blank Line</em> row for touch, a line that already follows a blank one, and Escape then Enter. If you would rather Enter never opened the menu at all, there is a switch for it in <em>Settings &rarr; Editing</em>.</li>
+                <li><strong>An Element Menu Shortcut Of Your Own</strong> — Alt+Enter, or ⌥↩ on a Mac, opens the element menu wherever the cursor is — on a blank line, or in the middle of a line with text, where it is an ordinary type chooser. Change it in <em>Settings &rarr; Editing</em> by clicking the box and pressing the keys you want.</li>
+                <li><strong>Footnotes Missing From A Page Ending In (MORE)</strong> — When a speech carried over to the next page, the page it left printed none of its footnotes. They were being counted against the part of the speech that fitted rather than against the page they belonged to.</li>
+                <li><strong>A Speech That Would Not Split</strong> — A speech near the foot of a page moved to the next page whole, rather than breaking, whenever breaking would have left a single line behind. It now breaks a paragraph earlier instead of not at all, so the page still fills and no orphan line is left on either side. The shaded break band also drew a line too tall when the CONT'D marker was switched off.</li>
+                <li><strong>Context Menus That Ran Off The Screen</strong> — <em>Element</em>, <em>Style</em>, <em>Revision Color</em> and <em>Add to Dictionary</em> opened flush against the right edge, so near the side of the window the rest of the list could not be reached. They now flip to the left when there is no room on the right, lift clear of the bottom edge, and scroll when the list is taller than the window.</li>
+                <li><strong>ALL CAPS Across Several Lines</strong> — Selecting more than one line and choosing <em>ALL CAPS</em> merged them into a single line, taking bold, italic and colour with them. Each line is now changed where it sits and keeps its formatting.</li>
+                <li><strong>One Version Number Everywhere</strong> — The same app was numbered 1.8 on the App Store and 0.26.3 on Windows, Linux, Android and the Mac download, so the version in <em>Help &rarr; About</em> did not match the one on the page you installed it from. From this release there is a single number on every platform. That is why this release is 2.0.0 rather than 0.27.0 — nothing in the app changes because of it.</li>
+              </ul>
+              <div className="about-subsection-title">v0.26.3</div>
+              <ul className="about-list">
+                <li><strong>Paste Works Again On Android</strong> — <em>Edit &rarr; Paste</em> and <em>Paste as Fountain</em> failed on Android with &ldquo;Could not read the clipboard&rdquo;, even though the text was still there and pressing and holding in the script could still paste it. Android does not let a web page read the clipboard at all, so OpenDraft now asks Android itself. Bold, italic and colour come across with the text, the way they do when you press and hold.</li>
+              </ul>
+              <div className="about-subsection-title">v0.26.2</div>
+              <ul className="about-list">
+                <li><strong>Blank Space Where The Title Page Was</strong> — Clearing every field on the title page and pressing Apply took the words away but left the page's empty lines behind, so the script opened on a gap instead of the first scene. An emptied title page is now removed outright, in the editor and in anything you print or export.</li>
+                <li><strong>The Title Page Switch Moved</strong> — <em>Include Title Page</em> has left the File menu for the bottom of the Title Page editor, under the preview, where the question comes up. It takes effect the moment you tick it — no Apply, and Cancel leaves it alone, because it is a preference rather than part of your script.</li>
+              </ul>
+              <div className="about-subsection-title">v0.26.1</div>
+              <ul className="about-list">
+                <li><strong>A Title Page You Never Wrote</strong> — Opening a Fade In file could bring a title page with it reading TITLE, Author's Name and Draft information. Every new Fade In document ships one already filled in with that boilerplate, so having a title page in the file and having written one are not the same thing. A title page you never touched is left behind; one you did keep — even if you left Fade In's copyright line alone — comes across whole.</li>
+                <li><strong>&ldquo;Untitled Screenplay&rdquo; On The Title Page</strong> — Exporting a script that had no title page to Final Draft wrote one anyway, using the name of the document. Reopening that file read the name back in as a real title page. A script without a title page now exports without one.</li>
+                <li><strong>Written By, Twice</strong> — A title page imported from Fade In printed its credit line a second time at the foot of the page, because Fade In marks the credit differently from every other field and it was being filed as a note.</li>
+                <li><strong>Print Without The Title Page</strong> — <em>Format &rarr; Title Page</em>, under the fields. Turn it off and the title page stays in the script but out of anything you print or export to PDF or Word. Sending someone the pages should not mean deleting the title page to do it. The choice is remembered, and the screenplay formats — Final Draft, Fountain, Fade In — always carry the title page either way.</li>
+                <li><strong>Print On iPhone, iPad And Android</strong> — Print used to land on an error screen you could only leave by force-quitting the app, and on Android did nothing at all. iPhone and iPad now hand the script to the share sheet, where AirPrint is; Android opens the system print dialog, with Save as PDF alongside the printers.</li>
+                <li><strong>Panels Below The Status Bar</strong> — On iPhone the Notes, Characters and Tags panels ran their headers under the clock, putting the close button out of reach. On Android the scene navigator did the same, so its tabs and its close button could not be tapped at all.</li>
+                <li><strong>About Uses The Screen</strong> — About and Diagnostics opened as a short card on phones and tablets, scrolling a sliver of themselves on a device with room to spare. They now fill the screen, the way the manual does.</li>
+              </ul>
+
+              <div className="about-subsection-title">v0.26.0</div>
+              <ul className="about-list">
+                <li><strong>Notes That Print — Footnotes And Endnotes</strong> — A script note can now go on the page. Pick where from the note's own dropdown: <em>Do not print</em>, <em>Page footer</em>, or <em>End note</em>. A superscript number appears beside the text and the note prints at the foot of that page, or on a NOTES page at the end. Written for anyone quoting a source who needs the citation on the page rather than beside it.</li>
+                <li><strong>Configured The Way Word Does It</strong> — Format → Footnotes &amp; Endnotes… sets the default location, the number format (1, 2, 3 &middot; a, b, c &middot; i, ii, iii &middot; *, &dagger;, &Dagger;, &sect;), superscript or bracketed markers, the number to start at, and whether numbering runs continuously or restarts each page. A preview shows your own citations in the script's typeface.</li>
+                <li><strong>A Long Footnote Splits Rather Than Spills</strong> — As much as fits prints at the foot of the page and the rest continues on the next, without repeating the number — the same thing Word does. No page gives up more than half of itself, so the script always keeps the greater part of every page.</li>
+                <li><strong>Footnotes Reach Your Exports</strong> — PDF gets them exactly as they appear on screen, page for page. Word gets <em>real</em> Word footnotes and endnotes, which Word lays out and reflows itself. Final Draft carries the citation as a script note. One switch turns the lot off for a clean send-out.</li>
+                <li><strong>General Notes Print Too</strong> — A note attached to the file rather than to a line of it has nowhere on the page to point from, so it can only ever be an end note. It is numbered after the anchored ones, and its title prints above its text.</li>
+                <li><strong>Find The Text A Note Belongs To</strong> — Every script note has a Go&nbsp;to button that scrolls to the words it is attached to and flashes them, so you can see what the note was about even with highlights turned off.</li>
+                <li><strong>A Tidier Notes Panel</strong> — The colour swatches, the print dropdown and the buttons were on one line and the last of them fell off the edge of a narrow panel. They are on two rows now, and a long note scrolls inside its card instead of growing taller than the panel.</li>
+                <li><strong>Deleting A Note Takes Its Highlight</strong> — A note's colour could outlive the note, leaving a stubborn yellow on a passage nothing was attached to any more. It was a second highlight, harvested from the note's own span whenever the document's HTML was parsed again — a copy and paste inside the editor was enough. New pastes no longer make one, and any left in a script are cleared when it opens.</li>
+                <li><strong>General Notes Stay With Their Script</strong> — Starting a new script, opening another, importing a file or leaving a project each left the previous script's general notes in place, so they turned up under the next one. They belong to the file and now go with it.</li>
+                <li><strong>Android: The Panel Header Is Reachable</strong> — The Notes, Characters and Tags panels slide over the whole screen, and their headers sat underneath the status bar, which put the close button out of reach.</li>
+                <li><strong>The Manual Is In The App</strong> — Help → User Manual… opens the whole manual inside OpenDraft, contents down the side and links between pages working the way they do on the web. It is not bundled with the app: download it once, about 8&nbsp;MB of pages and screenshots, and it stays on the device and works with no connection after that. Update fetches a newer copy when the manual changes; Remove takes the space back.</li>
+                <li><strong>Search What You Have Downloaded</strong> — Type in the reader and it searches every page, matching titles first and showing a line of context under each result. It runs against the local copy, so it works on a plane.</li>
+                <li><strong>A Mark That Survives Being Small</strong> — The old icon was a detailed illustration: a pen, a flock of birds, film strips, a painterly background and two lines of type. Below about 128 pixels none of it survived, so the app was hard to pick out on a home screen or in a browser tab. It is now one shape — a nib whose body opens into three feather planes — that still reads at 32 pixels and in a single colour.</li>
+                <li><strong>Help Is A Menu</strong> — It sits after Tools, where the three dots used to be at the far right of the bar, and holds the manual, About and Diagnostics. Keyboard Shortcuts has gone from it: dropping six shortcuts into a toast was never much use, and the manual has a page listing all of them.</li>
+                <li><strong>About Opens Shorter</strong> — The compatibility table is collapsed until you ask for it. It is there for filing bug reports, not for the first thing you read.</li>
+              </ul>
+
+              <div className="about-subsection-title">v0.25.0</div>
+              <ul className="about-list">
+                <li><strong>A Font Library Worth The Name</strong> — Around 185 fonts, grouped by what they are: screenplay, typewriter, serif, sans-serif, monospace, display faces for title pages, handwriting, and the Noto families covering most writing systems. The picker searches, and every name is drawn in its own face so you can see what you are choosing. Courier Prime 12pt is still what a new script is.</li>
+                <li><strong>Install Your Own Fonts</strong> — Format → Fonts… takes TrueType and OpenType files. The family name is read out of the font itself, so weights group together rather than arriving as separate families. Because OpenDraft holds the file, a font you install is embedded in exported PDFs — a title page in your own typeface comes out looking like the one on screen.</li>
+                <li><strong>The Fonts Already On Your Device</strong> — Faces from your operating system are checked before they are offered: one this platform hasn't got is greyed out and marked <em>not installed</em>, instead of silently rendering as Courier. On iPad and Android, where no app can list installed fonts, you can add one by name.</li>
+                <li><strong>A Font Choice Travels With The Script</strong> — Open a script on a machine without the font and OpenDraft substitutes the closest match of the same kind — a typewriter face for a typewriter face, a serif for a serif — rather than dropping everything to Courier. The original name is kept, so the font returns the moment you open it somewhere it exists.</li>
+                <li><strong>The Title Page Is Part Of The Template</strong> — Title, Credit &amp; Author, Draft &amp; Date, Contact, Copyright and Notes are formatting elements like any other, so you can set the title in a display face at 24pt and leave the contact block in Courier. Anything you change by hand outranks the template and stays put.</li>
+                <li><strong>Comfortable On A Tablet</strong> — Touch devices start in the comfortable toolbar, and the menus, font list and dialogs have finger-sized targets rather than mouse-sized ones. The font picker no longer closed itself the instant the on-screen keyboard appeared, which on iPad made tapping it look like it did nothing at all.</li>
+                <li><strong>Cut, Copy And Paste From The Menus</strong> — All three ran on the DOM selection, and tapping a menu item takes focus out of the editor — which on iOS collapses the selection with it, so Cut and Copy silently did nothing and Paste had never worked from a menu at all.</li>
+                <li><strong>Pasted Text Keeps Its Font</strong> — A paste used to have every font stripped out of it. It now keeps the face it came with, while taking the element type of wherever it lands.</li>
+                <li><strong>Highlights Come Across</strong> — Google Docs, Word Online, Notes and the browsers all write a highlight as a coloured background rather than a <code>&lt;mark&gt;</code>, so a highlighted sentence pasted in as plain text. It arrives highlighted now.</li>
+                <li><strong>Images Live Outside The Document</strong> — An image added to a script with no project behind it was embedded inside the document, where a single phone photo weighed about as much as five hundred pages of screenplay — enough to push the file past the crash-recovery limit and leave it with no crash protection at all.</li>
+                <li><strong>Android: Back At The First Screen</strong> — Pressing Back on the opening screen now backgrounds the app, the way every Android app does, instead of tearing down the view and reopening to a blank white page.</li>
+              </ul>
+
               <div className="about-subsection-title">v0.24.1</div>
               <ul className="about-list">
                 <li><strong>Header &amp; Footer Has Its Own Dialog</strong> — Format → Header &amp; Footer, out of the bottom of Page Setup where nobody found it. Buttons insert the page number, total pages, title, date and revision colour into whichever slot you are typing in, and a preview of the first two pages shows what you will actually get.</li>
@@ -2375,7 +3832,15 @@ const MenuBar: React.FC<MenuBarProps> = ({
             </div>
 
             <div className="about-whats-new">
-              <div className="about-section-title">Compatibility</div>
+              <button
+                className="about-disclosure"
+                aria-expanded={compatOpen}
+                onClick={() => setCompatOpen((v) => !v)}
+              >
+                <span className="about-disclosure-caret">&#9654;</span>
+                <span className="about-section-title" style={{ margin: 0 }}>Compatibility</span>
+              </button>
+              {compatOpen && (
               <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse', marginTop: 8 }}>
                 <thead>
                   <tr style={{ textAlign: 'left', color: 'var(--fd-text-secondary)' }}>
@@ -2428,6 +3893,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
                   ))}
                 </tbody>
               </table>
+              )}
             </div>
           </div>
           <div className="dialog-actions">
@@ -2436,6 +3902,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
         </div>
       </div>
     )}
+    {manualOpen && <UserManualDialog onClose={() => setManualOpen(false)} />}
     {diagnosticsOpen && (
       <div className="dialog-overlay" onClick={() => setDiagnosticsOpen(false)}>
         <div className="dialog-box about-dialog" onClick={(e) => e.stopPropagation()}>
@@ -2496,6 +3963,49 @@ const MenuBar: React.FC<MenuBarProps> = ({
               {diagnosticsCopied ? 'Copied ✓' : 'Copy Report'}
             </button>
             <button className="dialog-primary" onClick={() => setDiagnosticsOpen(false)}>Close</button>
+          </div>
+        </div>
+      </div>
+    )}
+    {scriptProfileOpen && (
+      <ScriptProfileDialog
+        onClose={() => useEditorStore.getState().setScriptProfileOpen(false)}
+        getDoc={getEditorDoc}
+      />
+    )}
+    {revisionSettingsOpen && (
+      <RevisionSettingsDialog onClose={() => setRevisionSettingsOpen(false)} />
+    )}
+    {clearRevisionsOpen && (
+      <div className="dialog-overlay" onClick={() => setClearRevisionsOpen(false)}>
+        <div className="dialog-box" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+          <div className="dialog-header">Clear Revision Marks</div>
+          <div className="dialog-body">
+            <p style={{ margin: 0, fontSize: 14, color: 'var(--fd-text)' }}>
+              Remove every revision asterisk from this script? The text itself is not changed, and Edit &rarr; Undo brings the marks back.
+            </p>
+          </div>
+          <div className="dialog-actions">
+            <button onClick={() => setClearRevisionsOpen(false)}>Cancel</button>
+            <button
+              className="dialog-primary"
+              onClick={() => {
+                setClearRevisionsOpen(false);
+                try {
+                  editor?.chain().focus().clearRevisionMarks().run();
+                  // The dialog's button had focus; once it unmounts focus
+                  // falls to <body>. Put it back in the script so the Undo
+                  // the dialog promises is one keystroke away.
+                  requestAnimationFrame(() => { if (editor && !editor.isDestroyed) editor.commands.focus(); });
+                  showToast('Revision marks cleared', 'success');
+                } catch (err) {
+                  console.error('[revisions] clear failed', err);
+                  showToast(`Could not clear revision marks: ${err instanceof Error ? err.message : String(err)}`, 'error');
+                }
+              }}
+            >
+              Clear Marks
+            </button>
           </div>
         </div>
       </div>
@@ -2583,6 +4093,38 @@ const MenuBar: React.FC<MenuBarProps> = ({
         </div>
       </div>
     )}
+    {avColumnWarning && (() => {
+      const isCue = avColumnWarning.which === 'cue';
+      const rows = avColumnWarning.rows;
+      const what = isCue
+        ? `${rows} ${rows === 1 ? 'shot has' : 'shots have'} a time on`
+        : `${rows} ${rows === 1 ? 'row has' : 'rows have'} a storyboard frame in`;
+      return (
+        <div className="dialog-overlay" onClick={() => setAvColumnWarning(null)}>
+          <div className="dialog-box" onClick={(e) => e.stopPropagation()}>
+            <div className="dialog-header">
+              Hide the {isCue ? 'Cue / Timing' : 'Storyboard'} Column?
+            </div>
+            <div className="dialog-body">
+              <p style={{ margin: '0 0 8px 0', fontSize: 14, color: 'var(--fd-text)' }}>
+                {what} it. Hiding the column takes {isCue ? 'those times' : 'them'} out
+                of the script on screen, off the printed page, and out of
+                exported spreadsheets and PDFs.
+              </p>
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--fd-text-muted, #888)' }}>
+                Nothing is deleted — {isCue ? 'the times' : 'the frames'} stay with their
+                rows, and turning the column back on brings them back exactly as
+                they are now.
+              </p>
+            </div>
+            <div className="dialog-actions">
+              <button onClick={() => setAvColumnWarning(null)}>Cancel</button>
+              <button className="dialog-primary" onClick={confirmAvColumnToggle}>Hide Column</button>
+            </div>
+          </div>
+        </div>
+      );
+    })()}
     {docxImportWarningOpen && (
       <div className="dialog-overlay" onClick={() => setDocxImportWarningOpen(false)}>
         <div className="dialog-box" onClick={(e) => e.stopPropagation()}>

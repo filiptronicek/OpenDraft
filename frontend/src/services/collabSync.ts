@@ -10,6 +10,8 @@
 
 import * as Y from 'yjs';
 import { useEditorStore } from '../stores/editorStore';
+import { normalizeRevisionSettings } from '../editor/revisionColors';
+import { normalizeScriptProfile } from '../utils/scriptProfile';
 
 const SYNC_KEYS = [
   'characterProfiles',
@@ -21,6 +23,15 @@ const SYNC_KEYS = [
   'beats',
   'beatColumns',
   'beatArrangeMode',
+  // Revision Mode is per script, so every collaborator marks edits the same
+  // way — one writer in Revision Mode and another not would leave the draft
+  // half-marked.
+  'revisionMode',
+  'revisionColor',
+  'revisionHistory',
+  'revisionSettings',
+  // Pacing changes everyone's runtime estimate, so it is shared like the rest.
+  'scriptProfile',
 ] as const;
 
 type SyncKey = (typeof SYNC_KEYS)[number];
@@ -54,6 +65,11 @@ export function startCollabSync(ydoc: Y.Doc, isHost: boolean): void {
       metaMap!.set('beats', JSON.stringify(store.beats));
       metaMap!.set('beatColumns', JSON.stringify(store.beatColumns));
       metaMap!.set('beatArrangeMode', JSON.stringify(store.beatArrangeMode));
+      metaMap!.set('revisionMode', JSON.stringify(store.revisionMode));
+      metaMap!.set('revisionColor', JSON.stringify(store.revisionColor));
+      metaMap!.set('revisionHistory', JSON.stringify(store.revisionHistory));
+      metaMap!.set('revisionSettings', JSON.stringify(store.revisionSettings));
+      metaMap!.set('scriptProfile', JSON.stringify(store.scriptProfile));
     });
   }
 
@@ -112,6 +128,11 @@ function takeSnapshot(): Record<SyncKey, string> {
     beats: JSON.stringify(s.beats),
     beatColumns: JSON.stringify(s.beatColumns),
     beatArrangeMode: JSON.stringify(s.beatArrangeMode),
+    revisionMode: JSON.stringify(s.revisionMode),
+    revisionColor: JSON.stringify(s.revisionColor),
+    revisionHistory: JSON.stringify(s.revisionHistory),
+    revisionSettings: JSON.stringify(s.revisionSettings),
+    scriptProfile: JSON.stringify(s.scriptProfile),
   };
 }
 
@@ -163,6 +184,42 @@ function applyYjsToStore() {
     const bc = metaMap.get('beatColumns');
     if (bc) {
       try { store.setBeatColumns(JSON.parse(bc)); } catch { /* ignore */ }
+    }
+
+    const rm = metaMap.get('revisionMode');
+    const rc = metaMap.get('revisionColor');
+    const rh = metaMap.get('revisionHistory');
+    const rs = metaMap.get('revisionSettings');
+    if (rm || rc || rh || rs) {
+      try {
+        const patch: Partial<Pick<ReturnType<typeof useEditorStore.getState>, 'revisionMode' | 'revisionColor' | 'revisionHistory' | 'revisionSettings'>> = {};
+        if (rm) { const v = JSON.parse(rm); if (typeof v === 'boolean') patch.revisionMode = v; }
+        if (rc) { const v = JSON.parse(rc); if (typeof v === 'string' && v) patch.revisionColor = v; }
+        if (rh) { const v = JSON.parse(rh); if (Array.isArray(v)) patch.revisionHistory = v; }
+        // Only when it differs: a fresh object for the same settings would redraw
+        // the marks, and every redraw ends the writer's undo group.
+        if (rs) {
+          const next = normalizeRevisionSettings(rs);
+          if (JSON.stringify(next) !== JSON.stringify(useEditorStore.getState().revisionSettings)) patch.revisionSettings = next;
+        }
+        // Set directly: the setters also record the colour in the history,
+        // which here arrives from the peer already recorded.
+        useEditorStore.setState(patch);
+      } catch (err) {
+        console.warn('[collabSync] could not apply revision state', err);
+      }
+    }
+
+    const sp = metaMap.get('scriptProfile');
+    if (sp) {
+      try {
+        const next = normalizeScriptProfile(sp);
+        if (JSON.stringify(next) !== JSON.stringify(useEditorStore.getState().scriptProfile)) {
+          store.setScriptProfile(next);
+        }
+      } catch (err) {
+        console.warn('[collabSync] could not apply script profile', err);
+      }
     }
 
     const bam = metaMap.get('beatArrangeMode');

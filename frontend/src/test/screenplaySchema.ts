@@ -20,16 +20,21 @@ import Strike from '@tiptap/extension-strike';
 import type { JSONContent } from '@tiptap/react';
 
 import { ScreenplayHardBreak, HardBreakLeafText } from '../editor/extensions/ScreenplayHardBreak';
+import { ScriptNoteMark } from '../editor/extensions/ScriptNoteMark';
+import { TagMark } from '../editor/extensions/TagMark';
+import { PastedHighlight } from '../editor/extensions/PastedHighlight';
 import {
   SceneHeading, Action, Character, Dialogue, Parenthetical, Transition,
   General, Shot, NewAct, EndOfAct, Lyrics, ShowEpisode, CastList,
+  Section, Note,
   TitlePage, CustomElement,
   DualDialogue, DualDialogueColumn,
-  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection,
+  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage,
   StartsNewPage,
 } from '../editor/extensions';
 
-export const testSchema = getSchema([
+/** The extensions `testSchema` is built from, for a test that needs one more. */
+export const testExtensions = [
   Document.extend({ content: 'block+' }),
   Text,
   ScreenplayHardBreak,
@@ -37,11 +42,20 @@ export const testSchema = getSchema([
   Bold, Italic, Underline, Strike,
   SceneHeading, Action, Character, Dialogue, Parenthetical, Transition,
   General, Shot, NewAct, EndOfAct, Lyrics, ShowEpisode, CastList,
+  Section, Note,
   TitlePage, CustomElement,
   DualDialogue, DualDialogueColumn,
-  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection,
+  AvBlock, AvRow, AvCell, AvPara, AvShot, AvDirection, AvGraphic, AvImage,
   StartsNewPage,
-]);
+  ScriptNoteMark,
+  TagMark,
+  // Configured as the editor configures it: without `multicolor` the mark
+  // carries no colour at all. It is here because a script note's own colour
+  // used to be re-read through its parse rule — see editor/scriptNoteMarks.
+  PastedHighlight.configure({ multicolor: true }),
+];
+
+export const testSchema = getSchema(testExtensions);
 
 /** A hard break, for use in the `block()` builder. */
 export const BR = { type: 'hardBreak' } as const;
@@ -56,11 +70,18 @@ export function block(type: string, ...parts: Part[]): JSONContent {
   };
 }
 
+/** A mark by name, optionally with attributes. */
+export type MarkSpec = string | { type: string; attrs: Record<string, unknown> };
+
 /** A block with marks applied to its (single) text run. */
-export function marked(type: string, text: string, ...markNames: string[]): JSONContent {
+export function marked(type: string, text: string, ...marks: MarkSpec[]): JSONContent {
   return {
     type,
-    content: [{ type: 'text', text, marks: markNames.map((m) => ({ type: m })) }],
+    content: [{
+      type: 'text',
+      text,
+      marks: marks.map((m) => (typeof m === 'string' ? { type: m } : m)),
+    }],
   };
 }
 

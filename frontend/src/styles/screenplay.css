@@ -70,6 +70,35 @@
   --screenplay-font: 'Courier Final Draft', 'Courier Prime', 'Courier New', 'Courier', monospace;
   --screenplay-font-size: 12pt;
   --screenplay-line-height: 1;
+
+  /* The script page itself — paper and ink. Kept apart from --fd-page-bg,
+     which treatment pages, the diff view and the template preview also use
+     with their own hard-coded dark text. Only Dark Pages changes these. */
+  --page-paper: #ffffff;
+  --page-ink: #000000;
+  --page-ink-muted: #8a8a8a;
+  --page-ink-faint: #b0b0b0;
+  --page-ink-placeholder: #cccccc;
+  --page-grammar-style: #2e7dd7;
+}
+
+/* ── Dark Pages (View → Theme → Dark Pages) ──
+   Screen only: the @media print block below puts the paper back to white, and
+   PDF export never reads these. The :not() guard keeps a stray attribute from
+   darkening pages under the light theme. */
+:root[data-dark-pages="on"]:not([data-theme="light"]) {
+  --page-paper: #1e1e1e;
+  --page-ink: #d8d8d8;
+  --page-ink-muted: #8c8c8c;
+  --page-ink-faint: #6e6e6e;
+  --page-ink-placeholder: #5a5a5a;
+  --page-grammar-style: #64a8f5;
+}
+/* Explicit near-black text (pasted from Word/Docs, or the colour picker's
+   default) is ink, not a choice — see InkAwareColor.ts. Beats the inline
+   style; the stored colour, and every export, is unchanged. */
+:root[data-dark-pages="on"]:not([data-theme="light"]) .page [data-ink="dark"] {
+  color: var(--page-ink) !important;
 }
 
 /* ── Light theme ── */
@@ -95,6 +124,56 @@
   --fd-dialog-bg: #f5f5f5;
   --fd-input-bg: #ffffff;
 }
+/* ── Pulldowns (issue #138) ──
+   Every pulldown is components/Select.tsx, which draws its own list. A native
+   <select>'s list is drawn by the OS in the OS's light or dark, which no CSS
+   can reach — so under Dark on a Light machine every list opened white. The
+   trigger's own look still comes from each call site's class; these are the
+   defaults for one that sets nothing. */
+.od-select {
+  display: inline-flex; align-items: center; justify-content: space-between; gap: 6px;
+  min-width: 0; max-width: 100%;
+  padding: 2px 8px; min-height: 24px;
+  background: var(--fd-input-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-overlay-medium); border-radius: 4px;
+  font-family: inherit; font-size: 12px; line-height: 1.2;
+  text-align: left; white-space: nowrap; cursor: pointer; outline: none;
+}
+.od-select:focus-visible { border-color: var(--fd-accent); }
+.od-select:disabled { opacity: .55; cursor: default; }
+/* All labels share one cell so the trigger is as wide as its longest option. */
+.od-select-sizer { display: inline-grid; min-width: 0; flex: 1 1 auto; overflow: hidden; }
+.od-select-sizer > * { grid-area: 1 / 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.od-select-ghost { visibility: hidden; height: 0; }
+.od-select-caret { flex: none; opacity: .6; font-size: 9px; font-family: sans-serif; }
+
+.od-select-popup {
+  position: fixed; z-index: 2147483000;
+  overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 4px 0;
+  background: var(--fd-dropdown-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-overlay-medium); border-radius: 6px;
+  box-shadow: 0 8px 28px var(--fd-shadow);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px; text-align: left;
+}
+.od-select-group {
+  padding: 6px 10px 3px; font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--fd-text-muted); cursor: default;
+}
+.od-select-option {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 12px 4px 6px; line-height: 1.35; cursor: pointer; white-space: nowrap;
+}
+.od-select-check { flex: none; width: 12px; font-size: 11px; color: var(--fd-accent); text-align: center; }
+.od-select-option-label { overflow: hidden; text-overflow: ellipsis; }
+.od-select-option.is-active { background: var(--fd-accent); color: #fff; }
+.od-select-option.is-active .od-select-check { color: #fff; }
+.od-select-option.is-disabled { color: var(--fd-text-muted); cursor: default; }
+@media (pointer: coarse) {
+  .od-select-option { padding: 10px 14px 10px 8px; font-size: 16px; }
+}
+
 /* Light theme: page keeps white bg, editor area uses a warm gray */
 [data-theme="light"] .editor-main {
   background: #d5d5d5;
@@ -117,7 +196,7 @@
 }
 [data-theme="light"] .dialog-body input,
 [data-theme="light"] .dialog-body textarea,
-[data-theme="light"] .dialog-body select {
+[data-theme="light"] .dialog-body .od-select {
   background: var(--fd-input-bg);
   color: var(--fd-text);
   border-color: var(--fd-border);
@@ -191,7 +270,7 @@
 [data-theme="light"] input[type="text"],
 [data-theme="light"] input[type="number"],
 [data-theme="light"] textarea,
-[data-theme="light"] select {
+[data-theme="light"] .od-select {
   background: var(--fd-input-bg) !important;
   color: var(--fd-text) !important;
   border-color: var(--fd-border) !important;
@@ -199,7 +278,7 @@
 [data-theme="light"] input[type="text"]:focus,
 [data-theme="light"] input[type="number"]:focus,
 [data-theme="light"] textarea:focus,
-[data-theme="light"] select:focus {
+[data-theme="light"] .od-select:focus {
   border-color: var(--fd-accent) !important;
 }
 /* Light theme: buttons */
@@ -383,8 +462,12 @@ body {
 .menu-item:hover .menu-icon, .menu-item.active .menu-icon { color: var(--fd-text); }
 .menu-label { font-size: 12.5px; color: var(--fd-text); font-weight: 450; }
 .menu-spacer { flex: 1; }
-.menu-item--more { font-size: 12px; color: var(--fd-text-muted); padding: 4px 8px; }
-.menu-item--more:hover { color: var(--fd-text); }
+
+/* Leading "back to the project" control, shown only for a script that is
+   inside one. Icon-only and menu-item sized so it reads as part of the bar
+   rather than as an extra row of chrome, with a hairline separating it from
+   File so it is clearly a way out and not another menu (issue #65). It picks
+   up the comfortable-chrome and touch sizing from .menu-item. */
 
 /* Auth indicator — sits at the right end of the menu bar. */
 .auth-indicator {
@@ -434,12 +517,18 @@ body {
 .menu-bar.chrome-comfortable .menu-item { padding: 10px 16px; min-height: 44px; gap: 8px; border-radius: 8px; }
 .menu-bar.chrome-comfortable .menu-label { font-size: 14px; font-weight: normal; }
 .menu-bar.chrome-comfortable .menu-icon { font-size: 14px; }
-.menu-bar.chrome-comfortable .menu-item--more { padding: 10px 12px; min-height: 44px; }
 .menu-dropdown {
   position: fixed; min-width: 260px;
   background: var(--fd-dropdown-bg); border: 1px solid var(--fd-border);
   border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,.4);
   padding: 4px 0; z-index: 2147483647;
+  /* A menu taller than the window scrolls rather than losing its last items
+     off the bottom edge. max-height comes from JS, which knows where the top
+     of the dropdown landed. Submenus are positioned fixed by positionSubmenu()
+     so they escape this scroll container instead of being clipped by it —
+     nothing here may create a containing block (transform, filter, contain),
+     or fixed descendants would be clipped after all. */
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .menu-dropdown-item {
   display: flex; align-items: center; gap: 8px;
@@ -553,15 +642,15 @@ body {
   display: none; position: absolute; left: 100%; top: -4px;
   min-width: 240px; background: var(--fd-dropdown-bg);
   border: 1px solid var(--fd-border); border-radius: 6px;
-  box-shadow: 0 4px 16px rgba(0,0,0,.4); padding: 4px 0; z-index: 10001;
+  box-shadow: 0 4px 16px rgba(0,0,0,.4); padding: 4px 0; z-index: 2147483647;
+  /* Same bargain as the dropdown: scroll a long submenu (the Element list) and
+     let the next level out, since it is fixed too. */
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .menu-submenu.submenu-visible { display: block; }
-/* Flip submenu to the left when it would overflow the viewport */
-.menu-submenu.submenu-flip { left: auto; right: 100%; }
-/* Flip submenu upward when it would overflow the bottom */
-.menu-submenu.submenu-flip-y { top: auto; bottom: -4px; }
-/* When the dropdown itself opens above, flip ALL submenus upward */
-.menu-dropdown--above .menu-submenu { top: auto; bottom: -4px; }
+/* No flip classes here any more: positionSubmenu() measures the open submenu
+   and writes fixed left/top. A `bottom` from a stylesheet would fight that
+   inline `top` and stretch the box to span both edges. */
 
 /* ============ TOOLBAR ============ */
 .toolbar {
@@ -1251,7 +1340,7 @@ body {
   margin-bottom: 4px; font-weight: 600;
 }
 .location-db-field input,
-.location-db-field select,
+.location-db-field .od-select,
 .location-db-field textarea {
   width: 100%; padding: 6px 10px;
   background: var(--fd-overlay-subtle); border: 1px solid var(--fd-border);
@@ -1649,6 +1738,63 @@ body {
 .structure-act {
   border-bottom: 1px solid var(--fd-overlay-subtle);
 }
+/* ── Section outline (Structure tab) ──────────────────────────────────
+   Fountain Sections, drawn as the tree their hashes describe. Depth comes from
+   the node's own level via an inline padding, not from nesting, so an outline
+   that jumps from # to ### still lines up where the writer put it. */
+.structure-outline {
+  border-bottom: 1px solid var(--fd-border);
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+}
+.structure-outline-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fd-text-muted);
+  padding: 10px 12px 4px;
+}
+.structure-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.structure-section-header:hover { background: var(--fd-overlay-subtle); }
+.structure-section-level {
+  font-family: var(--fd-mono, monospace);
+  font-size: 11px;
+  color: var(--fd-accent, #3b82f6);
+  flex-shrink: 0;
+}
+.structure-section-name {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fd-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.structure-section-count {
+  font-size: 11px;
+  color: var(--fd-text-muted);
+  background: var(--fd-overlay-light);
+  border-radius: 8px;
+  padding: 1px 6px;
+  flex-shrink: 0;
+}
+.structure-section-synopsis {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--fd-text-muted);
+  padding-right: 12px;
+  padding-bottom: 4px;
+  white-space: pre-wrap;
+}
+
 .structure-act-header {
   display: flex;
   align-items: center;
@@ -1786,12 +1932,6 @@ body {
   outline: none;
   cursor: pointer;
   min-height: 36px;
-  -webkit-appearance: none;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  padding-right: 24px;
 }
 .scene-filter-select:focus {
   border-color: var(--fd-accent);
@@ -1906,7 +2046,15 @@ body {
 .status-timing {
   color: var(--fd-text-muted);
   font-variant-numeric: tabular-nums;
+  /* A button, so it opens Genre & Pacing — but it should read as status text. */
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  cursor: pointer;
 }
+.status-timing:hover { color: var(--fd-text); text-decoration: underline; }
+.status-timing:focus-visible { outline: 1px solid var(--fd-accent); outline-offset: 2px; }
 
 /* ── Page preview thumbnails ── */
 .page-thumbnails-scroll {
@@ -2018,7 +2166,7 @@ body {
 
 /* ============ PAGE ============ */
 .page {
-  background: var(--fd-page-bg);
+  background: var(--page-paper);
   min-height: var(--page-min-height);
   padding: var(--page-margin-top) var(--page-margin-right) var(--page-margin-bottom) var(--page-margin-left);
   box-shadow: 0 1px 4px rgba(0,0,0,.3), 0 0 0 1px rgba(0,0,0,.06);
@@ -2033,7 +2181,7 @@ body {
   /* Adjust letter-spacing so Courier New matches Final Draft Courier width.
      FD: 62 chars in 6.0" = 9.29px/char. Courier New: 9.60px/char. Diff: -0.31px */
   letter-spacing: -0.31px;
-  color: #000;
+  color: var(--page-ink);
   outline: none;
   overflow: visible;
 }
@@ -2085,6 +2233,114 @@ body {
 .show-scene-numbers .scene-heading[data-scene-number]::after {
   left: calc(100% + 0.15in);
   text-align: left;
+}
+
+/* Element numbers (utils/elementNumbers) — beside every element a format
+   numbers, in the left margin, while .show-element-numbers is on the page.
+   The attribute is a decoration (editor/extensions/ElementNumbers), never in
+   the document.
+
+   A float whose negative margin outweighs its width: its margin box is
+   narrower than nothing, so it sits in the margin without shortening a single
+   line, and the element's wrapping is exactly what pagination counted. Not
+   absolute positioning — that would make the element `position: relative`,
+   and in print every revision asterisk inside it (`.rev-mark::before`, placed
+   against the nearest positioned ancestor) would land inside the text column
+   instead of the right margin. */
+.show-element-numbers [data-element-number]::before {
+  content: attr(data-element-number);
+  float: left;
+  width: 1in;
+  margin-left: calc(-1in - 0.15in);
+  text-align: right;
+  white-space: nowrap;
+  font-weight: normal;
+  font-style: normal;
+  text-transform: none;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ── Revision marks (Tools → Production → Revision Mode) ──
+   One asterisk in the right margin beside every line holding revised text,
+   placed by measuring the lines (RevisionGutter in editor/revisionMarks.ts):
+   the layer sits beside the text column and draws nothing itself. Past the
+   right scene number, which sits at +0.15in and can be "123A" wide. */
+.rev-gutter {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  z-index: 5;
+}
+.rev-star {
+  position: absolute;
+  font-family: var(--screenplay-font);
+  font-weight: bold;
+  color: var(--page-ink);
+}
+/* Printing from the browser lays the script out afresh, so the measured layer
+   would be in the wrong place. There, each revised run draws its own asterisk
+   on the line it starts on — close enough for a print that is not the PDF
+   route (the default), which marks every line exactly. */
+@media print {
+  .rev-gutter { display: none !important; }
+  .rev-mark::before {
+    content: var(--rev-mark, '*');
+    position: absolute;
+    left: calc(100% + 0.65in);
+    font-weight: bold;
+    font-style: normal;
+    text-decoration: none;
+    color: #000;
+  }
+  .av-cell .rev-mark::before { left: calc(100% + 2px); }
+  /* A mark of its own for each revision (Revision Settings), handed over as
+     custom properties by RevisionGutter. */
+  .rev-mark[data-rev="blue"]::before       { content: var(--rev-mark-blue, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="pink"]::before       { content: var(--rev-mark-pink, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="yellow"]::before     { content: var(--rev-mark-yellow, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="green"]::before      { content: var(--rev-mark-green, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="goldenrod"]::before  { content: var(--rev-mark-goldenrod, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="buff"]::before       { content: var(--rev-mark-buff, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="salmon"]::before     { content: var(--rev-mark-salmon, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="cherry"]::before     { content: var(--rev-mark-cherry, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="2nd-blue"]::before   { content: var(--rev-mark-2nd-blue, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="2nd-pink"]::before   { content: var(--rev-mark-2nd-pink, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="2nd-yellow"]::before { content: var(--rev-mark-2nd-yellow, var(--rev-mark, '*')); }
+  .rev-mark[data-rev="2nd-green"]::before  { content: var(--rev-mark-2nd-green, var(--rev-mark, '*')); }
+}
+
+/* View the colours: revised text in its revision's colour. Screen only. */
+.rev-mark[data-rev="blue"]       { --rev-ink: #2f5f9e; }
+.rev-mark[data-rev="pink"]       { --rev-ink: #b03a72; }
+.rev-mark[data-rev="yellow"]     { --rev-ink: #8a7400; }
+.rev-mark[data-rev="green"]      { --rev-ink: #2e7d32; }
+.rev-mark[data-rev="goldenrod"]  { --rev-ink: #8b6508; }
+.rev-mark[data-rev="buff"]       { --rev-ink: #7a5c33; }
+.rev-mark[data-rev="salmon"]     { --rev-ink: #c0503f; }
+.rev-mark[data-rev="cherry"]     { --rev-ink: #b02525; }
+.rev-mark[data-rev="2nd-blue"]   { --rev-ink: #1f4e79; }
+.rev-mark[data-rev="2nd-pink"]   { --rev-ink: #8e3563; }
+.rev-mark[data-rev="2nd-yellow"] { --rev-ink: #6f5f00; }
+.rev-mark[data-rev="2nd-green"]  { --rev-ink: #256b25; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="blue"]       { --rev-ink: #6fa8dc; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="pink"]       { --rev-ink: #e06c9f; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="yellow"]     { --rev-ink: #f4d35e; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="green"]      { --rev-ink: #6abf69; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="goldenrod"]  { --rev-ink: #daa520; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="buff"]       { --rev-ink: #d2b48c; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="salmon"]     { --rev-ink: #fa8072; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="cherry"]     { --rev-ink: #e05555; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="2nd-blue"]   { --rev-ink: #7aaee0; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="2nd-pink"]   { --rev-ink: #d77fae; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="2nd-yellow"] { --rev-ink: #e0c84e; }
+:root[data-dark-pages="on"]:not([data-theme="light"]) .rev-mark[data-rev="2nd-green"]  { --rev-ink: #6cc46c; }
+/* !important: revised text may also carry its own inline colour, and showing
+   which round it belongs to is the whole point of this view. White has none. */
+@media screen {
+  .show-revision-colors .rev-mark[data-rev]:not([data-rev="white"]) { color: var(--rev-ink) !important; }
 }
 
 /* Action */
@@ -2150,6 +2406,39 @@ body {
   font-style: italic;
   padding-left: calc(2.50in - var(--pl, 1.50in));
   padding-right: calc(var(--pw, 8.26in) - 6.00in - var(--pr, 0.76in));
+}
+
+/* ── Non-printing structure: Fountain Sections and Notes ──────────────
+   Both are outline, not script. They are drawn distinctly so a writer can see
+   at a glance that they are not part of the page, and they are removed from
+   print entirely by the @media print rule further down — the same decision
+   pagination and the PDF/DOCX/FDX/OSF exporters make in code. */
+.section {
+  font-weight: bold;
+  color: var(--fd-accent, #3b82f6);
+  border-left: 3px solid var(--fd-accent, #3b82f6);
+  padding-left: 8px;
+  margin-top: 12pt;
+  letter-spacing: 0.02em;
+}
+
+/* Depth by indent and weight, so a nested outline reads as one. Level is
+   carried on the node, not by nesting — a Fountain file may jump from # to ###
+   and the outline has to hold that without inventing the middle rung. */
+.section[data-level="1"] { font-size: 1.08em; }
+.section[data-level="2"] { margin-left: 0.25in; opacity: 0.95; }
+.section[data-level="3"] { margin-left: 0.50in; opacity: 0.9; }
+.section[data-level="4"] { margin-left: 0.75in; opacity: 0.85; }
+.section[data-level="5"] { margin-left: 1.00in; opacity: 0.8; }
+.section[data-level="6"] { margin-left: 1.25in; opacity: 0.75; }
+
+.note {
+  font-style: italic;
+  color: var(--fd-text-dim, #8a8a8a);
+  background: var(--fd-note-bg, rgba(244, 211, 94, 0.10));
+  border-left: 3px solid var(--fd-note-border, #f4d35e);
+  padding: 2px 8px;
+  margin-top: 12pt;
 }
 
 /* Show/Episode */
@@ -2259,6 +2548,26 @@ body {
 }
 .tp-sync-btn:hover { border-color: var(--fd-accent); color: var(--fd-accent); }
 
+/* Print & export preference — a band of its own between the scrolling body and
+   the buttons. It is not a title-page field, so it sits outside the form grid;
+   pinning it here (the body is the only thing that scrolls) keeps it on screen
+   on a phone, which is where not finding it was the whole problem. Aligned
+   under the preview column: the half of the dialog showing what comes out. */
+.tp-output-pref {
+  flex-shrink: 0; padding: 10px 16px;
+  border-top: 1px solid var(--fd-border);
+  display: flex; flex-direction: column; align-items: flex-end;
+}
+.tp-output-check {
+  display: flex; align-items: flex-start; gap: 8px;
+  max-width: min(52%, 360px); cursor: pointer; font-size: 13px; line-height: 1.4;
+}
+.tp-output-check input { width: 15px; height: 15px; margin-top: 1px; flex-shrink: 0; cursor: pointer; }
+.tp-output-help {
+  max-width: min(52%, 360px); margin: 4px 0 0;
+  font-size: 11px; color: var(--fd-text-muted); line-height: 1.4;
+}
+
 /* Title Page Live Preview */
 .tp-editor-preview {
   display: flex; align-items: center; justify-content: center;
@@ -2296,6 +2605,9 @@ body {
   .tp-editor-body { grid-template-columns: 1fr; gap: 14px; }
   .tp-editor-form { grid-template-columns: 1fr; }
   .tp-preview-page { max-width: 240px; }
+  .tp-output-pref { align-items: stretch; }
+  .tp-output-check, .tp-output-help { max-width: none; }
+  .tp-output-check input { width: 18px; height: 18px; }
 }
 
 /* ============ RTL SUPPORT FOR MULTI-LINGUAL DIALOGUE ============ */
@@ -2324,19 +2636,19 @@ body {
 }
 
 /* ============ PLACEHOLDER TEXT ============ */
-div[data-type="scene-heading"].is-empty::before { content: 'INT./EXT. LOCATION - TIME'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="action"].is-empty::before { content: 'Describe the action...'; color: #ccc; pointer-events: none; float: left; height: 0; font-style: italic; }
-div[data-type="character"].is-empty::before { content: 'CHARACTER NAME'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="dialogue"].is-empty::before { content: 'Dialogue...'; color: #ccc; pointer-events: none; float: left; height: 0; font-style: italic; }
-div[data-type="parenthetical"].is-empty::before { content: '(direction)'; color: #ccc; pointer-events: none; float: left; height: 0; font-style: italic; }
-div[data-type="transition"].is-empty::before { content: 'TRANSITION:'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="general"].is-empty::before { content: 'Text...'; color: #ccc; pointer-events: none; float: left; height: 0; }
-div[data-type="shot"].is-empty::before { content: 'SHOT DESCRIPTION'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="new-act"].is-empty::before { content: 'ACT ONE'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="end-of-act"].is-empty::before { content: 'END OF ACT'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="lyrics"].is-empty::before { content: 'Lyrics...'; color: #ccc; pointer-events: none; float: left; height: 0; font-style: italic; }
-div[data-type="show-episode"].is-empty::before { content: 'SHOW TITLE'; color: #ccc; pointer-events: none; float: left; height: 0; text-transform: uppercase; }
-div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; pointer-events: none; float: left; height: 0; }
+div[data-type="scene-heading"].is-empty::before { content: 'INT./EXT. LOCATION - TIME'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="action"].is-empty::before { content: 'Describe the action...'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; font-style: italic; }
+div[data-type="character"].is-empty::before { content: 'CHARACTER NAME'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="dialogue"].is-empty::before { content: 'Dialogue...'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; font-style: italic; }
+div[data-type="parenthetical"].is-empty::before { content: '(direction)'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; font-style: italic; }
+div[data-type="transition"].is-empty::before { content: 'TRANSITION:'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="general"].is-empty::before { content: 'Text...'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; }
+div[data-type="shot"].is-empty::before { content: 'SHOT DESCRIPTION'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="new-act"].is-empty::before { content: 'ACT ONE'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="end-of-act"].is-empty::before { content: 'END OF ACT'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="lyrics"].is-empty::before { content: 'Lyrics...'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; font-style: italic; }
+div[data-type="show-episode"].is-empty::before { content: 'SHOW TITLE'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; text-transform: uppercase; }
+div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: var(--page-ink-placeholder); pointer-events: none; float: left; height: 0; }
 
 
 /* ====================================================================
@@ -2381,7 +2693,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   right: var(--page-margin-right);
   font-family: var(--screenplay-font);
   font-size: 12pt;
-  color: #000;
+  color: var(--page-ink);
   line-height: 1;
 }
 
@@ -2395,7 +2707,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   align-items: baseline;
   font-family: var(--screenplay-font);
   font-size: 12pt;
-  color: #000;
+  color: var(--page-ink);
   line-height: 1;
 }
 .page-sep-header {
@@ -2453,7 +2765,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   font-family: var(--fd-font, system-ui, sans-serif);
   font-size: 10px;
   letter-spacing: 0.3px;
-  color: #8a8a8a;
+  color: var(--page-ink-muted);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.12s ease;
@@ -2470,7 +2782,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   font-family: inherit;
   font-size: inherit;
   line-height: inherit;
-  color: #000;
+  color: var(--page-ink);
   background: transparent;
   border: none;
   outline: none;
@@ -2478,7 +2790,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   min-width: 0;
 }
 .page-sep-hf-input::placeholder {
-  color: #b0b0b0;
+  color: var(--page-ink-faint);
 }
 .page-sep-hf-settings {
   position: absolute;
@@ -2514,7 +2826,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   right: 0;
   font-family: var(--screenplay-font);
   font-size: 12pt;
-  color: #000;
+  color: var(--page-ink);
   line-height: 1;
   text-align: center;
   padding-left: calc(var(--page-margin-left) + 1.31in);
@@ -2528,7 +2840,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 .page-sep-contd {
   font-family: var(--screenplay-font);
   font-size: 12pt;
-  color: #000;
+  color: var(--page-ink);
   line-height: 16px;
   height: 16px;
   text-transform: uppercase;
@@ -2724,6 +3036,60 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   background: var(--fd-accent); border-color: var(--fd-accent); color: #fff;
 }
 .dialog-btn-primary:hover { opacity: .9; }
+
+/* Tools → Production → Revision Settings */
+.revision-settings-dialog { max-width: 460px; width: 100%; }
+.revision-settings-row { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--fd-text); }
+.revision-settings-dialog input[type="text"] {
+  width: 3.5em; height: 32px; text-align: center; font-family: var(--screenplay-font, 'Courier Prime', monospace);
+  font-size: 16px; font-weight: bold; background: var(--fd-input-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-border); border-radius: 4px; outline: none;
+}
+.revision-settings-dialog input[type="text"]:focus { border-color: var(--fd-accent); }
+.revision-settings-help { display: block; margin: 6px 0 0; font-size: 12px; color: var(--fd-text-muted); line-height: 1.4; }
+.revision-settings-subhead { margin-top: 18px; font-size: 14px; font-weight: 600; color: var(--fd-text); }
+.revision-settings-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 14px; margin-top: 10px;
+}
+.revision-settings-color { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fd-text-muted); }
+.revision-settings-color.used { color: var(--fd-text); font-weight: 600; }
+.revision-settings-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--fd-border); flex-shrink: 0; }
+.revision-settings-name { flex: 1; }
+.revision-settings-check { display: flex; align-items: flex-start; gap: 10px; margin-top: 18px; font-size: 14px; color: var(--fd-text); cursor: pointer; }
+.revision-settings-check input { margin-top: 3px; }
+.revision-settings-error { margin: 12px 0 0; font-size: 13px; color: #dc2626; }
+
+/* ── Format ▸ Genre & Pacing ── */
+.script-profile-dialog { max-width: 560px; width: 100%; }
+.script-profile-subhead { margin-top: 4px; font-size: 14px; font-weight: 600; color: var(--fd-text); }
+.script-profile-subhead ~ .script-profile-subhead { margin-top: 20px; }
+.script-profile-help { display: block; margin: 4px 0 0; font-size: 12px; color: var(--fd-text-muted); line-height: 1.4; }
+.script-profile-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.script-profile-chip {
+  padding: 4px 10px; font-size: 12px; line-height: 1.3; border-radius: 999px; cursor: pointer;
+  background: var(--fd-input-bg); color: var(--fd-text); border: 1px solid var(--fd-border);
+}
+.script-profile-chip:hover { border-color: var(--fd-accent); }
+.script-profile-chip.selected { background: var(--fd-accent); border-color: var(--fd-accent); color: #fff; }
+.script-profile-chip:focus-visible { outline: 2px solid var(--fd-accent); outline-offset: 2px; }
+.script-profile-add { display: flex; gap: 8px; margin-top: 10px; }
+.script-profile-add input {
+  flex: 1; min-width: 0; height: 30px; padding: 0 8px; font-size: 13px;
+  background: var(--fd-input-bg); color: var(--fd-text); border: 1px solid var(--fd-border); border-radius: 4px; outline: none;
+}
+.script-profile-add input:focus { border-color: var(--fd-accent); }
+.script-profile-add button { flex: 0 0 auto; min-width: 56px; padding: 0 14px; }
+.script-profile-pacing { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.script-profile-pace {
+  display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px; cursor: pointer;
+  border: 1px solid var(--fd-border); border-radius: 6px;
+}
+.script-profile-pace.selected { border-color: var(--fd-accent); }
+.script-profile-pace input { margin-top: 3px; }
+.script-profile-pace-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.script-profile-pace-label { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; color: var(--fd-text); }
+.script-profile-pace-runtime { color: var(--fd-text-muted); font-variant-numeric: tabular-nums; }
+.script-profile-error { margin: 12px 0 0; font-size: 13px; color: #dc2626; }
 .dialog-btn-primary:disabled { opacity: .5; cursor: default; }
 .dialog-label { display: block; font-size: 13px; color: var(--fd-text-muted); margin-bottom: 4px; }
 .dialog-input {
@@ -2770,6 +3136,32 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 .about-dialog {
   min-width: 440px;
   max-width: 500px;
+}
+
+/* Phones and tablets: full bleed, for the reasons the manual is — a 500px card
+   with the =<480px sheet rules capping it at 60vh leaves About and Diagnostics
+   scrolling a sliver of themselves on a device that has the room. Same shape as
+   the manual's rule: both classes so it outranks that cap, `position: fixed` so
+   the overlay's padding cannot push its footer off the bottom, and the safe-area
+   insets the fixed position gives up. */
+@media (max-width: 1024px), (pointer: coarse) and (max-height: 900px) {
+  .dialog-box.about-dialog {
+    position: fixed; top: 0; left: 0;
+    width: 100vw; min-width: 0; max-width: none;
+    height: var(--vv-height, 100dvh); max-height: var(--vv-height, 100dvh);
+    border-radius: 0; border: none;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* Scrolling belongs to the body, so the header and the buttons stay put. */
+    overflow: hidden;
+  }
+  /* Android under-reports the inset (see the note by .app-container), and a
+     fixed box has no container padding to fall back on. */
+  html.android .dialog-box.about-dialog,
+  html.android .dialog-box.manual-dialog {
+    padding-top: max(env(safe-area-inset-top, 0px), 28px);
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+  }
 }
 .about-body {
   text-align: center;
@@ -2842,6 +3234,212 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   color: var(--fd-text);
 }
 
+/* Compatibility table is collapsed by default — it is diagnostic detail, not
+   something most people opening About are looking for (issue #94). */
+.about-disclosure {
+  width: 100%;
+  display: flex; align-items: center; gap: 8px;
+  background: none; border: none; padding: 0;
+  color: var(--fd-text); font-size: 13px; font-weight: 600;
+  cursor: pointer; text-align: left;
+}
+.about-disclosure:hover { color: var(--fd-accent); }
+.about-disclosure-caret {
+  display: inline-block; font-size: 10px; color: var(--fd-text-muted);
+  transition: transform .15s ease;
+}
+.about-disclosure[aria-expanded="true"] .about-disclosure-caret { transform: rotate(90deg); }
+
+/* ============ USER MANUAL ============ */
+.manual-dialog {
+  min-width: min(1040px, 96vw);
+  max-width: min(1040px, 96vw);
+  width: min(1040px, 96vw);
+  height: min(760px, calc(var(--vv-height, 100dvh) - 48px));
+  max-height: calc(var(--vv-height, 100dvh) - 48px);
+}
+.manual-header {
+  display: flex; align-items: center; gap: 16px;
+  justify-content: space-between;
+}
+.manual-header-title { display: inline-flex; align-items: center; gap: 8px; }
+.manual-header-tools { display: flex; align-items: center; gap: 10px; flex: 0 1 auto; }
+.manual-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: 0 0 auto;
+  background: none; border: 1px solid var(--fd-border); border-radius: 4px;
+  color: var(--fd-text-muted); font-size: 12px; cursor: pointer;
+}
+.manual-icon-btn:hover { color: var(--fd-text); background: var(--fd-menu-hover); }
+.manual-search {
+  position: relative; display: flex; align-items: center;
+  flex: 0 1 320px;
+}
+.manual-search input {
+  width: 100%; height: 30px;
+  background: var(--fd-input-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-border); border-radius: 4px;
+  padding: 0 28px 0 28px; font-size: 13px; font-weight: 400; outline: none;
+}
+.manual-search input:focus { border-color: var(--fd-accent); }
+.manual-search-icon {
+  position: absolute; left: 9px; font-size: 11px;
+  color: var(--fd-text-muted); pointer-events: none;
+}
+.manual-search-clear {
+  position: absolute; right: 6px;
+  background: none; border: none; cursor: pointer;
+  color: var(--fd-text-muted); font-size: 11px; padding: 4px;
+}
+.manual-search-clear:hover { color: var(--fd-text); }
+
+.manual-error {
+  padding: 8px 20px; font-size: 13px;
+  color: #f87171; border-bottom: 1px solid var(--fd-border);
+}
+
+.manual-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; gap: 12px;
+}
+.manual-empty-icon { font-size: 34px; color: var(--fd-text-muted); }
+.manual-empty h3 { margin: 0; font-size: 16px; color: var(--fd-text); }
+.manual-empty p { margin: 0; max-width: 460px; font-size: 13px; color: var(--fd-text-secondary); line-height: 1.6; }
+.manual-empty-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 4px; }
+.manual-empty-actions button { display: inline-flex; align-items: center; gap: 8px; }
+
+.manual-progress { width: min(420px, 100%); }
+.manual-progress-bar {
+  height: 5px; border-radius: 3px; overflow: hidden;
+  background: var(--fd-border);
+}
+.manual-progress-fill {
+  height: 100%; background: var(--fd-accent);
+  transition: width .2s ease;
+}
+.manual-progress-label {
+  margin-top: 6px; font-size: 12px; color: var(--fd-text-muted);
+}
+
+.manual-layout {
+  flex: 1 1 auto; display: flex; min-height: 0;
+  border-bottom: 1px solid var(--fd-border);
+}
+.manual-sidebar-toggle { display: none; }
+/* Shown only when the reader wants it — the header's contents button decides,
+   at every width, so a page can have the whole window when it is being read. */
+.manual-sidebar {
+  display: none;
+  flex: 0 0 232px; overflow-y: auto;
+  border-right: 1px solid var(--fd-border);
+  padding: 12px 0;
+}
+.manual-sidebar--open { display: block; }
+.manual-sidebar-section { margin-bottom: 12px; }
+.manual-sidebar-title {
+  padding: 4px 16px; font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em;
+  color: var(--fd-text-muted);
+}
+.manual-sidebar-link {
+  display: block; width: 100%; text-align: left;
+  padding: 6px 16px; background: none; border: none;
+  color: var(--fd-text-secondary); font-size: 13px; cursor: pointer;
+  border-left: 2px solid transparent;
+}
+.manual-sidebar-link:hover { background: var(--fd-menu-hover); color: var(--fd-text); }
+.manual-sidebar-link.active {
+  color: var(--fd-accent); border-left-color: var(--fd-accent);
+  background: var(--fd-menu-hover);
+}
+
+/* Fixed rather than sized to 100vw/100dvh in place: the overlay pads and
+   centres its child, so a viewport-sized box would start below that padding
+   and push its own footer off the bottom edge. */
+.manual-dialog--full {
+  position: fixed; top: 0; left: 0;
+  width: 100vw; min-width: 0; max-width: none;
+  height: var(--vv-height, 100dvh); max-height: var(--vv-height, 100dvh);
+  border-radius: 0; border: none;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Phones and tablets: full bleed is the only sensible size for a manual, so it
+   is what they get rather than something to opt into. The card is 1040×760
+   because a desktop window has room around it; on a tablet that leaves two
+   thirds of the screen dimmed, and on a phone the ≤480px `.dialog-box` sheet
+   rules cap every dialog at 60vh — right for a two-field dialog, wrong for a
+   document. Written with both classes so it outranks that cap wherever the two
+   rules end up relative to each other, and `position: fixed` for the same
+   reason the toggle above uses it. A tablet in landscape is wider than 1024px
+   and still wants this, hence the second query. */
+@media (max-width: 1024px), (pointer: coarse) and (max-height: 900px) {
+  .dialog-box.manual-dialog {
+    position: fixed; top: 0; left: 0;
+    width: 100vw; min-width: 0; max-width: none;
+    height: var(--vv-height, 100dvh); max-height: var(--vv-height, 100dvh);
+    border-radius: 0; border: none;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* The ≤480px sheet rules scroll the whole box; put scrolling back inside
+       the page so the header and footer stay put. */
+    overflow: hidden;
+  }
+  /* Nothing left to expand into. */
+  .manual-fullscreen-toggle { display: none; }
+}
+.manual-main { flex: 1 1 auto; overflow-y: auto; min-width: 0; }
+
+.manual-shadow-host { display: block; }
+
+.manual-results { padding: 24px 32px; }
+.manual-results h2 { font-size: 15px; color: var(--fd-text); margin: 0 0 14px; }
+.manual-result {
+  display: flex; flex-direction: column; gap: 3px;
+  width: 100%; text-align: left; cursor: pointer;
+  padding: 10px 12px; margin-bottom: 8px;
+  background: none; border: 1px solid var(--fd-border); border-radius: 4px;
+}
+.manual-result:hover { background: var(--fd-menu-hover); border-color: var(--fd-accent); }
+.manual-result-title { font-size: 14px; font-weight: 600; color: var(--fd-text); }
+.manual-result-section { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--fd-text-muted); }
+.manual-result-snippet { font-size: 12.5px; color: var(--fd-text-secondary); line-height: 1.5; }
+
+.manual-actions { flex-wrap: wrap; }
+.manual-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.manual-meta {
+  flex: 1 1 auto; display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--fd-text-muted);
+}
+.manual-update-badge {
+  padding: 1px 7px; border-radius: 10px; font-size: 11px;
+  background: var(--fd-accent); color: #fff;
+}
+
+/* Narrow windows and phones: the contents list collapses into a toggle so the
+   page itself keeps the full width. */
+@media (max-width: 700px) {
+  .manual-layout { flex-direction: column; position: relative; }
+  .manual-sidebar-toggle {
+    display: block; width: 100%; text-align: left;
+    padding: 8px 16px; background: var(--fd-toolbar-bg);
+    border: none; border-bottom: 1px solid var(--fd-border);
+    color: var(--fd-text); font-size: 13px; cursor: pointer;
+  }
+  .manual-sidebar {
+    flex: 0 0 auto; max-height: 45%;
+    border-right: none; border-bottom: 1px solid var(--fd-border);
+  }
+  /* The stacked "Contents" bar is the control here, so the header keeps only
+     the search box. */
+  .manual-nav-toggle { display: none; }
+  .manual-main { padding: 16px 18px; }
+  .manual-header { flex-wrap: wrap; gap: 8px; }
+  .manual-search { flex: 1 1 100%; }
+  .manual-meta { flex: 1 1 100%; order: -1; }
+}
+
 /* ============ PAGE SETUP DIALOG ============ */
 .page-setup-dialog {
   min-width: 380px;
@@ -2873,7 +3471,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   min-width: 80px;
   flex-shrink: 0;
 }
-.page-setup-row select,
+.page-setup-row .od-select,
 .page-setup-row input[type="number"] {
   flex: 1;
   height: 28px;
@@ -2885,7 +3483,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   font-size: 12px;
   outline: none;
 }
-.page-setup-row select:focus,
+.page-setup-row .od-select:focus,
 .page-setup-row input[type="number"]:focus {
   border-color: var(--fd-accent);
 }
@@ -2947,6 +3545,230 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 }
 
 /* ============ HEADER & FOOTER DIALOG ============ */
+/* ── Footnote and Endnote dialog ── */
+.fn-dialog {
+  min-width: 460px;
+  max-width: 520px;
+}
+.fn-section {
+  margin-top: 14px;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.fn-section[disabled] {
+  opacity: 0.45;
+}
+.fn-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--fd-text-muted);
+  margin-bottom: 8px;
+}
+.fn-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fd-text-muted);
+  margin-top: 6px;
+}
+.fn-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.fn-row > label {
+  flex: 0 0 110px;
+  font-size: 12px;
+  color: var(--fd-text);
+}
+.fn-row > .od-select,
+.fn-row > input[type="number"] {
+  flex: 1 1 auto;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 12px;
+  border: 1px solid var(--fd-border);
+  border-radius: 4px;
+  background: var(--fd-input-bg);
+  color: var(--fd-text);
+}
+.fn-row > input[type="number"] {
+  flex: 0 0 80px;
+}
+.fn-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fd-text);
+  cursor: pointer;
+  margin-top: 10px;
+}
+.fn-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fd-text);
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.fn-radio-label {
+  flex: 0 0 90px;
+}
+.fn-radio-value {
+  color: var(--fd-text-muted);
+}
+.fn-segmented {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+}
+.fn-segmented button {
+  flex: 1 1 0;
+  height: 26px;
+  font-size: 11px;
+  border: 1px solid var(--fd-border);
+  border-radius: 4px;
+  background: var(--fd-input-bg);
+  color: var(--fd-text);
+  cursor: pointer;
+}
+.fn-segmented button.active {
+  border-color: var(--fd-accent);
+  color: var(--fd-accent);
+}
+/* The preview is the script's own typeface, so what it shows is what prints. */
+.fn-preview {
+  border: 1px solid var(--fd-border);
+  border-radius: 4px;
+  padding: 12px 14px;
+  background: #fff;
+  color: #000;
+  font-family: var(--screenplay-font, 'Courier Prime', monospace);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.fn-preview-marker {
+  font-size: 0.7em;
+}
+.fn-preview-rule {
+  width: 40%;
+  border-top: 1px solid #000;
+  margin: 14px 0 6px;
+}
+.fn-preview-heading {
+  text-align: center;
+  margin: 14px 0 6px;
+  letter-spacing: 1px;
+}
+.fn-preview-entry {
+  display: flex;
+  gap: 0.6ch;
+}
+.fn-preview-label {
+  flex: 0 0 auto;
+}
+.fn-preview-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+/* ── Script Notes: the print toggle and its number badge ── */
+/* Square, so two of them and a dropdown always fit however narrow the panel. */
+.note-icon-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--fd-border);
+  border-radius: 4px;
+  background: var(--fd-input-bg);
+  color: var(--fd-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.note-icon-btn:hover {
+  border-color: var(--fd-accent);
+  color: var(--fd-accent);
+}
+.note-icon-danger:hover {
+  border-color: #c0392b;
+  color: #ff6b6b;
+}
+
+/* Jumping to a note lands visibly: the annotated words flash, so the writer can
+   see which text the note was about even with highlights turned off. */
+@keyframes script-note-flash {
+  0%, 60% { background-color: var(--fd-accent); color: #fff; }
+  100% { background-color: transparent; }
+}
+.script-note-flash {
+  animation: script-note-flash 1.4s ease-out;
+  border-radius: 2px;
+}
+
+.note-print-select {
+  /* Takes the width the buttons leave, and may shrink: without min-width:0 a
+     select refuses to go below its longest option and pushes them out. */
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  background: var(--fd-input-bg);
+  border: 1px solid var(--fd-border);
+  border-radius: 4px;
+  color: var(--fd-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.note-print-select:hover:not(:disabled) {
+  border-color: var(--fd-accent);
+  color: var(--fd-accent);
+}
+.note-print-select:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.note-print-select.active {
+  border-color: var(--fd-accent);
+  color: var(--fd-accent);
+}
+.note-item-fn-badge {
+  /* Hugs its text: it sits in a flex column, which would otherwise stretch it
+     the full width of the card. */
+  align-self: flex-start;
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--fd-accent);
+  color: var(--fd-accent);
+  white-space: nowrap;
+}
+.note-item-fn-badge.muted {
+  border-color: var(--fd-border);
+  color: var(--fd-text-muted);
+}
+.script-notes-settings {
+  background: none;
+  border: none;
+  color: var(--fd-text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 6px;
+  margin-left: auto;
+}
+.script-notes-settings:hover {
+  color: var(--fd-accent);
+}
+
 .hf-dialog {
   min-width: 460px;
   max-width: 520px;
@@ -3192,12 +4014,38 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 }
 .element-picker-label {
   flex: 1;
+  white-space: nowrap;
 }
+/* Reserved column, wide enough for the longest hint ("blank line"), so the menu
+   is sized by its element labels alone. Without it the menu resized as hints
+   appeared and moved between rows while the writer arrowed through it. */
 .element-picker-hint {
+  flex: 0 0 auto;
+  min-width: 52px;
+  text-align: right;
   font-size: 10px;
   color: var(--fd-text-muted);
   margin-left: 12px;
   font-style: italic;
+}
+/* "Blank Line" escape hatch: Enter opened this menu, so it also has to be able
+   to leave it with the line the writer asked for (issue #100). Sticky so it
+   stays reachable by tap once the element list scrolls. */
+.element-picker-blank {
+  position: sticky;
+  bottom: -4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px 5px;
+  margin-top: 2px;
+  cursor: pointer;
+  color: var(--fd-text-muted);
+  background: var(--fd-dropdown-bg);
+  border-top: 1px solid var(--fd-border);
+}
+.element-picker-blank:hover {
+  color: var(--fd-text);
 }
 
 /* ============ CHARACTER AUTOCOMPLETE ============ */
@@ -4493,6 +5341,13 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   justify-content: space-between;
   align-items: flex-start;
   gap: 6px;
+  min-width: 0;
+}
+.note-item-header > .note-item-context {
+  min-width: 0;
+}
+.note-item-date {
+  flex: 0 0 auto;
 }
 .note-item-context {
   display: flex;
@@ -4581,6 +5436,10 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   border-radius: 3px;
   cursor: pointer;
   min-height: 28px;
+  /* A long citation would otherwise make one card taller than the panel and
+     push its own controls out of reach. It scrolls within the card instead. */
+  max-height: 180px;
+  overflow-y: auto;
   transition: border-color .15s;
 }
 .note-item-preview:hover { border-color: var(--fd-border); }
@@ -4687,14 +5546,25 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 .note-asset-option:hover .note-asset-option-tags,
 .note-asset-option.selected .note-asset-option-tags { color: rgba(255,255,255,.6); }
 /* ── Note actions row ── */
+/* The note's controls, stacked rather than crammed onto one line: six colour
+   dots, a placement dropdown and two buttons do not fit across a 300px panel,
+   and the last of them used to be pushed off its edge entirely. */
 .note-item-actions {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
 }
 .note-item-colors {
   display: flex;
   gap: 4px;
+  flex-wrap: wrap;
+}
+.note-item-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 .note-color-dot {
   width: 14px;
@@ -4717,6 +5587,122 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
 }
 .note-item-delete:hover {
   color: #ff6b6b;
+}
+
+/* ── Printed notes: footnote markers and the block at the page foot ── */
+
+/* The reference number drawn beside a printing note. A widget decoration, so
+   it is never document text; `user-select: none` keeps the caret out of it. */
+.footnote-marker {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  color: inherit;
+}
+sup.footnote-marker {
+  font-size: 0.65em;
+  line-height: 0;
+  vertical-align: super;
+}
+
+/* A printing note's marker is part of the script, so hiding note highlights
+   (View > Note Highlights) must not hide it — only the annotation colour. */
+.notes-hidden .footnote-marker {
+  color: inherit;
+}
+
+/* The block itself, drawn into the whitespace the paginator reserved. Anchored
+   with bottom:100% against the break's bottom band, which puts its foot exactly
+   at the content area's bottom edge — the same place the reserve was taken
+   from, so the height and the gap always agree. */
+.footnote-block {
+  position: absolute;
+  bottom: 100%;
+  left: var(--pl, 1.5in);
+  right: var(--pr, 0.76in);
+  font-family: var(--screenplay-font);
+  font-size: 12pt;
+  line-height: 16px;
+  color: var(--page-ink);
+  /* .page-sep is pointer-events:none, so opt back in to allow the click
+     through to the note in the panel. */
+  pointer-events: auto;
+}
+
+/* Word's convention: a short rule, not a full-width one. */
+.footnote-rule {
+  width: 2in;
+  height: 0;
+  border-top: 1px solid var(--page-ink);
+  /* The blank line above the rule is the second of the two lines the reserve
+     charges for; the rule itself sits on the first. */
+  margin: 8px 0 0;
+}
+
+/* One note's share of this page. The box is exactly as many lines tall as the
+   paginator reserved for it, and the note is slid up inside it — so a note too
+   long for its page is cut at the line the next page continues from, and can
+   never climb up over the script. Word splits a long footnote for the same
+   reason. */
+.footnote-slice {
+  overflow: hidden;
+  cursor: pointer;
+}
+.footnote-slice-inner {
+  display: block;
+}
+/* The label is drawn inline at the head of the first line, NOT in a column of
+   its own: a column would narrow every following line and wrap the note earlier
+   than it was measured, making the drawn block taller than the room reserved. */
+.footnote-entry-label {
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+}
+.footnote-slice:hover .footnote-entry-label {
+  text-decoration: underline;
+}
+.footnote-entry-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.footnote-entry-title {
+  font-weight: 700;
+}
+.footnote-entry-image {
+  display: block;
+}
+.footnote-entry-image img {
+  max-width: 100%;
+  display: block;
+}
+/* The endnote sheets lay a whole note out the same way, in normal flow. */
+.footnote-entry,
+.footnote-entry-body {
+  display: block;
+}
+
+/* The NOTES sheets in endnote mode. Absolutely placed at heights the paginator
+   worked out, inside the same continuous page element as the script. */
+.endnote-page {
+  position: absolute;
+  left: var(--pl, 1.5in);
+  right: var(--pr, 0.76in);
+  font-family: var(--screenplay-font);
+  font-size: 12pt;
+  line-height: 16px;
+  color: var(--page-ink);
+  z-index: 5;
+}
+.endnote-entry-title {
+  display: block;
+  font-weight: 700;
+}
+.endnote-heading {
+  text-align: center;
+  letter-spacing: 1px;
+  /* "NOTES" then two blank lines — the three the packer reserved. */
+  margin-bottom: 32px;
 }
 
 /* ── Script Note inline highlight in editor ── */
@@ -5489,7 +6475,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   gap: 4px;
   margin-bottom: 4px;
 }
-.char-profile-rel-form-row select {
+.char-profile-rel-form-row .od-select {
   flex: 1;
   min-width: 0;
   padding: 4px 6px;
@@ -5644,7 +6630,7 @@ div[data-type="cast-list"].is-empty::before { content: 'Cast...'; color: #ccc; p
   color: var(--fd-text-muted);
   margin-bottom: 3px;
 }
-.rel-map-form-row select,
+.rel-map-form-row .od-select,
 .rel-map-form-row textarea,
 .rel-map-form-row input {
   width: 100%;
@@ -6096,7 +7082,7 @@ html.android .spell-error {
 /* ============ GRAMMAR / WRITING SUGGESTIONS ============ */
 /* Style suggestions (passive voice, weak words, wordy phrases): blue dotted */
 .grammar-issue.grammar-style {
-  text-decoration: underline dotted #2e7dd7;
+  text-decoration: underline dotted var(--page-grammar-style);
   text-decoration-skip-ink: none;
   text-underline-offset: 2px;
 }
@@ -6107,6 +7093,10 @@ html.android .grammar-issue.grammar-style {
   background-position: 0 100%;
   background-size: 4px 2px;
   padding-bottom: 1px;
+}
+/* A data URI can't read a custom property; same dots in --page-grammar-style's dark value. */
+html.android[data-dark-pages="on"]:not([data-theme="light"]) .grammar-issue.grammar-style {
+  background-image: url("data:image/svg+xml;charset=utf-8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 2'><circle cx='1' cy='1.5' r='0.6' fill='%2364a8f5'/></svg>");
 }
 /* Grammar errors (a/an, repeated words): teal wavy — distinct from spelling red */
 .grammar-issue.grammar-grammar {
@@ -6434,6 +7424,124 @@ html.android .version-history-panel {
   border-color: rgba(255,255,255,.5);
 }
 
+/* An explicit caret on the page, so nothing upstream can quietly turn it
+   transparent. It must contrast with the *paper*, not with the app chrome:
+   .screenplay-content sets the text to --page-ink, which is chosen against
+   --page-paper, so the caret follows the text. Using the chrome's --fd-text here
+   painted a #e0e0e0 caret on white paper in the dark theme — present, focused,
+   and invisible. The history-mode rule below is more specific and still wins,
+   so a read-only draft stays caret-free. */
+.page .ProseMirror { caret-color: currentColor; }
+
+/* While the app draws the caret itself, the system one is off. Guessing which
+   of the two was on screen produced moments with both (see PencilCaret.tsx);
+   turning the native one off outright leaves exactly one, always. */
+body.pencil-caret-active .page .ProseMirror { caret-color: transparent; }
+
+/* The stand-in caret (see PencilCaret.tsx). Absolute inside .ProseMirror, so it
+   scrolls and scales with the text, and inert so it can never take a tap. */
+.pencil-caret {
+  position: absolute;
+  width: 2px;
+  background: currentColor;
+  color: var(--page-ink);
+  pointer-events: none;
+  z-index: 40;
+  animation: pencil-caret-blink 1.06s steps(1, end) infinite;
+}
+@keyframes pencil-caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pencil-caret { animation: none; }
+}
+
+/* Draggable selection handles (see SelectionHandles.tsx). iPadOS draws none of
+   its own inside this web view, so the app draws them, in the same blue as the
+   selection highlight above so the three read as one thing.
+
+   Absolute inside .page, like the caret, so they scroll and scale with the
+   text. Unlike the caret they are not inert: each one is the drag target, and
+   `touch-action: none` is what stops a drag along a handle from scrolling the
+   page out from under the gesture instead of moving the selection. */
+.selection-handle {
+  position: absolute;
+  width: 2px;
+  margin-left: -1px;
+  background: #338fff;
+  z-index: 41;
+  touch-action: none;
+}
+
+/* Invisible to hit-testing for as long as a drag is running.
+ *
+ * The drag asks ProseMirror what position is under the finger, and
+ * `posAtCoords` answers by hit-testing that point: `elementFromPoint`, then a
+ * check that the result is inside `.ProseMirror`. These handles are children
+ * of `.page` rather than of the editor — they have to be, ProseMirror replaces
+ * its own children — so a probe that lands on one fails that check and falls
+ * back to `posFromElement`, which measures block rectangles rather than
+ * characters. The probe lands on one constantly: the handle is drawn at
+ * exactly the position being probed, and its grab target is 44px wide. That
+ * coarse fallback is what moved the selection two characters at a time
+ * (issue #108).
+ *
+ * Pointer capture is unaffected — a captured pointer is delivered to its
+ * capture target ahead of any hit test — so the handle keeps receiving the
+ * move and up events that drive the drag. Both handles are neutralised, not
+ * just the one being dragged, because the two ends pass close to each other. */
+.selection-handle.is-dragging { pointer-events: none; }
+
+/* No system highlight while SelectionHandles is drawing its own, so the script
+   never shows two over the same words. The caret has the same arrangement just
+   above. Only inside the page — a search field or a dialog keeps its own. */
+body.selection-bands-active .page .ProseMirror ::selection,
+body.selection-bands-active .page .ProseMirror::selection { background: transparent; }
+
+/* The stand-in selection highlight (see SelectionHandles.tsx). Drawn only when
+   the web view has no focus and so paints none of its own. Behind the text and
+   inert: `posAtCoords` hit-tests the point under the finger during a handle
+   drag, and anything catching that hit test outside .ProseMirror sends the
+   lookup down a coarse fallback path — which is what made dragging jump two
+   characters at a time in the first place. */
+.selection-band {
+  position: absolute;
+  background: rgba(51, 143, 255, 0.30);
+  pointer-events: none;
+  z-index: 39;
+  border-radius: 1px;
+}
+
+/* The knob. Clear of the text — above the start, below the end — so a finger
+   on it is not covering the character the handle is pointing at, which is the
+   character the writer is trying to see. */
+.selection-handle::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  border-radius: 50%;
+  background: inherit;
+}
+.selection-handle-start::before { top: -11px; }
+.selection-handle-end::before { bottom: -11px; }
+
+/* A finger-sized target around a 2px line. Invisible, and wider than the
+   handle in every direction so the knob can be grabbed from slightly off it —
+   the whole point of a handle is that it is caught first time. */
+.selection-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 44px;
+  margin-left: -22px;
+  top: -24px;
+  bottom: -24px;
+}
+
 /* History mode: visual feedback on the editor area */
 .app-container.history-mode .editor-main {
   background: repeating-linear-gradient(
@@ -6691,6 +7799,18 @@ html.android .version-history-panel {
 }
 .source-badge--local {
   color: var(--fd-text-muted);
+}
+/* A file name or folder path: shown as written. Upper-casing it misstates the
+   name on a case-sensitive drive and makes a long path harder to read. */
+.source-badge--path {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 500;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-list-header {
@@ -7898,10 +9018,7 @@ html.android .version-history-panel {
 }
 .welcome-logo {
   width: 48px; height: 48px; margin: 0 auto 12px;
-  background: var(--fd-accent); border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-weight: 700; font-size: 18px; color: #fff;
-  letter-spacing: 1px;
+  border-radius: 10px; display: block;
 }
 .welcome-title {
   font-size: 22px; font-weight: 600; color: #fff; margin: 0 0 4px;
@@ -8612,6 +9729,215 @@ html.android .version-history-panel {
 }
 
 /* Bottom sheet overlay for element picker */
+/* ── Handwriting input (Apple Pencil) ─────────────────────────────────
+   A deliberately large, empty writing area. The size is the point: Scribble
+   sizes its writable region from the blank space around the caret, and the
+   cramped, destructive behaviour in the editor was a symptom of there being
+   almost none mid-script (issue #90). Nothing follows the caret in here, so
+   nothing can be overwritten. */
+/* A floating panel, not a modal sheet. There is no backdrop on purpose: the
+   script behind stays live, and tapping a line in it is how the writer moves
+   where the next insert lands without closing anything (issue #90). It is
+   dragged by its header, because only the writer knows which part of the page
+   it must not cover. */
+.scribble-panel {
+  position: fixed;
+  /* Placed by the component, which measures it and keeps it on screen. */
+  left: 0;
+  top: 0;
+  z-index: 3600;
+  /* Wide enough to write a line of dialogue at hand size, narrow enough to
+     leave the script either side of it readable. */
+  width: min(720px, calc(100vw - 16px));
+  max-height: calc(var(--vv-height, 100dvh) - 16px);
+  /* Resizable, so a width and height set by the writer arrive as inline
+     styles and have to be allowed to win over the defaults above. */
+  min-width: 300px;
+  min-height: 240px;
+  /* See-through by however much the writer asked for. The panel sits over the
+     page it is being used to edit, and how much of that page has to stay
+     readable underneath depends on where they have put it. */
+  background: color-mix(in srgb, var(--fd-dropdown-bg)
+    calc(var(--scribble-panel-alpha, 1) * 100%), transparent);
+  backdrop-filter: blur(2px);
+  border: 1px solid var(--fd-border);
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+[data-theme="light"] .scribble-panel {
+  background: color-mix(in srgb, #fff calc(var(--scribble-panel-alpha, 1) * 100%), transparent);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.22);
+}
+.scribble-header {
+  padding: 10px 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* The drag handle. `touch-action: none` so a Pencil or a fingertip dragging
+     the panel does not scroll the script underneath at the same time. */
+  cursor: grab;
+  touch-action: none;
+  border-bottom: 1px solid var(--fd-border);
+}
+.scribble-header:active { cursor: grabbing; }
+.scribble-header-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.scribble-header-tools { display: flex; align-items: center; gap: 8px; }
+.scribble-title { display: inline-flex; align-items: center; font-weight: 600; }
+/* The grip says "this moves" without a line of instructions. */
+.scribble-grip {
+  width: 18px; height: 10px; margin-right: 9px;
+  background-image: radial-gradient(currentColor 1.2px, transparent 1.3px);
+  background-size: 6px 5px;
+  color: var(--fd-text-muted);
+  opacity: .8;
+}
+.scribble-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px;
+  background: none; border: 1px solid var(--fd-border); border-radius: 8px;
+  color: var(--fd-text-muted); cursor: pointer;
+}
+.scribble-close:hover { color: var(--fd-text); background: var(--fd-menu-hover); }
+.scribble-toggle {
+  display: inline-flex; align-items: center; gap: 7px;
+  min-height: 34px; padding: 0 12px;
+  background: none; border: 1px solid var(--fd-border); border-radius: 8px;
+  color: var(--fd-text-muted); font-size: 13px; cursor: pointer;
+}
+.scribble-toggle:hover { color: var(--fd-text); }
+.scribble-toggle.is-on {
+  color: #fff; background: var(--fd-accent); border-color: var(--fd-accent);
+}
+
+/* Where the text is going: the script either side of the insertion point,
+   drawn with the editor's own element classes so a Character cue sits in the
+   Character column. The page is rendered at full width and scaled down, because
+   element indents are absolute inches and do not survive being re-measured. */
+.scribble-preview {
+  /* Shorter than the modal sheet's: the panel sits over the script, so every
+     pixel it takes is a pixel of the page the writer cannot see. */
+  max-height: 150px;
+  overflow: auto;
+  padding: 10px;
+  background: var(--fd-bg);
+  border: 1px solid var(--fd-border);
+  border-radius: 8px;
+}
+.scribble-preview-page {
+  /* `zoom`, not `transform: scale` — a transform shrinks what is painted but
+     still reserves the full-size layout box, leaving a tall empty gap under a
+     page-width preview. Zoom scales the box as well, and WebKit has supported
+     it for as long as the iPad has existed. 0.85 keeps 12pt Courier legible
+     while fitting the sheet in portrait. */
+  zoom: 0.85;
+  width: 8.26in;
+  color: var(--fd-text);
+  line-height: 1.3;
+}
+.scribble-preview-page .screenplay-element { margin-top: 6pt; }
+.scribble-preview-page .screenplay-element:first-child { margin-top: 0; }
+/* The line being written into, so the eye finds it without hunting. */
+.scribble-preview-page .is-target {
+  background: color-mix(in srgb, var(--fd-accent) 14%, transparent);
+  border-radius: 3px;
+}
+.scribble-preview-empty {
+  font-size: 13px; color: var(--fd-text-muted); font-style: italic;
+}
+.scribble-element {
+  margin-left: 10px;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--fd-accent); color: #fff;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  vertical-align: middle;
+}
+/* The caret marker stands in for the insertion point between the two sides. */
+.scribble-ctx-caret {
+  display: inline-block; width: 3px; height: 1.05em;
+  margin: 0 1px; vertical-align: text-bottom;
+  background: var(--fd-accent);
+}
+.scribble-ctx-replace {
+  background: var(--fd-accent); color: #fff;
+  border-radius: 3px; padding: 0 3px;
+  text-decoration: line-through;
+}
+.scribble-area {
+  margin: 10px 14px 0;
+  /* Still tall enough to write two or three lines at a natural hand size —
+     which is what the Pencil needs and what the page could not give it — while
+     leaving most of the script visible behind the panel. */
+  min-height: max(190px, 26vh);
+  flex: 1 1 auto;
+  resize: none;
+  padding: 14px 16px;
+  font-size: 22px;
+  line-height: 1.7;
+  font-family: inherit;
+  color: var(--fd-text);
+  background: var(--fd-bg);
+  border: 1px solid var(--fd-border);
+  border-radius: 10px;
+}
+/* The field and its drawn caret share a positioned box. When the app draws the
+   caret the native one is off, so there is only ever one. */
+.scribble-area-wrap { position: relative; display: flex; flex: 1 1 auto; min-height: 0; }
+.scribble-area-wrap .scribble-caret { color: var(--scribble-ink, var(--fd-text)); z-index: 2; }
+.scribble-area { caret-color: var(--scribble-ink, var(--fd-accent, #3b82f6)); }
+.scribble-area-wrap:has(.scribble-caret) .scribble-area { caret-color: transparent; }
+.scribble-area:focus {
+  outline: 2px solid var(--fd-accent, #3b82f6);
+  outline-offset: -1px;
+}
+.scribble-tools {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 10px 14px 0;
+}
+.scribble-tool {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 40px; padding: 0 14px;
+  background: var(--fd-toolbar-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-border); border-radius: 8px;
+  font-size: 13px; cursor: pointer;
+}
+.scribble-tool:hover:not(:disabled) { background: var(--fd-menu-hover); }
+.scribble-tool:disabled { opacity: .4; cursor: default; }
+.scribble-tool-key { font-weight: 600; }
+.scribble-tools-gap { flex: 1 1 auto; }
+.scribble-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 10px 14px 12px;
+}
+.scribble-btn {
+  /* A 44pt target: this is reached with a Pencil tip or a fingertip. */
+  min-height: 44px;
+  min-width: 96px;
+  padding: 0 18px;
+  border-radius: 8px;
+  border: 1px solid var(--fd-border);
+  background: var(--fd-bg);
+  color: var(--fd-text);
+  font-size: 15px;
+  cursor: pointer;
+}
+.scribble-btn-primary {
+  background: var(--fd-accent, #3b82f6);
+  border-color: var(--fd-accent, #3b82f6);
+  color: #fff;
+  font-weight: 600;
+}
+.scribble-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .mob-acc-sheet-overlay {
   position: fixed;
   left: 0;
@@ -8725,7 +10051,9 @@ html.android .version-history-panel {
   z-index: 3000;
   min-width: 240px;
   max-height: calc(100vh - 16px);
-  overflow: visible;
+  /* Scrolls when the menu itself is taller than the window. Safe to clip only
+     because submenus are `position: fixed` and so escape this box. */
+  overflow-y: auto;
   background: var(--fd-dropdown-bg);
   border: 1px solid var(--fd-border);
   border-radius: 6px;
@@ -8789,12 +10117,11 @@ html.android .version-history-panel {
 /* Submenus */
 .ctx-has-sub-wrap { position: relative; }
 .ctx-has-sub { position: relative; }
+/* Placed by CtxSubmenu, not by CSS: `left`/`top`/`max-height` are set from the
+   row it hangs off and the space actually available around it. */
 .ctx-submenu {
-  position: absolute;
-  left: 100%;
-  top: -4px;
+  position: fixed;
   min-width: 200px;
-  max-height: 400px;
   overflow-y: auto;
   background: var(--fd-dropdown-bg);
   border: 1px solid var(--fd-border);
@@ -8811,6 +10138,11 @@ html.android .version-history-panel {
   top: 0;
   width: 12px;
   height: 100%;
+}
+/* Opened to the left of the menu instead: the gap to cross is on the other side. */
+.ctx-has-sub-wrap > .ctx-submenu.is-flipped::before {
+  left: auto;
+  right: -12px;
 }
 .ctx-has-sub:hover > .ctx-submenu { display: block; }
 .ctx-submenu .ctx-item { margin: 0 4px; }
@@ -9017,6 +10349,28 @@ html.android .version-history-panel {
     padding-top: max(env(safe-area-inset-top), 28px);
     padding-bottom: max(env(safe-area-inset-bottom), 24px);
   }
+  /* The slide-over panels are `position: fixed`, so they sit outside the
+     app container's padding and their headers land under the status bar —
+     which puts the close and settings buttons out of reach. Give them the
+     same clearance. */
+  html.android .script-notes-panel,
+  html.android .char-profiles-panel,
+  html.android .tags-panel,
+  html.android .location-db-panel {
+    padding-top: max(env(safe-area-inset-top), 28px);
+  }
+
+  /* The scene navigator is the same story on the other side, and was missed:
+     as an overlay drawer its tab row landed in the status bar, which put the
+     tabs and the close button behind the system bar where taps never reached
+     them. Scoped to the breakpoint where it is an overlay — docked, it sits
+     below the menu bar inside the container's padding and wants none of this.
+     iOS has the matching rule further down. */
+  @media (max-width: 1100px) {
+    html.android .scene-navigator {
+      padding-top: max(env(safe-area-inset-top), 28px);
+    }
+  }
 
   /* iOS/iPadOS: the insets above only started reporting real values once
      viewport-fit=cover was added to the viewport tag, so the home indicator
@@ -9036,10 +10390,14 @@ html.android .version-history-panel {
   html.ios.ios-windowed {
     --ios-window-gutter: 76px;
   }
-  html.ios .menu-bar {
+  /* :not(.menu-bar--floating) — the floating menu is a popup that follows the
+     draggable FAB around the window. It is not the bar in the corner, and
+     given the gutter it grew a 76px empty margin wherever it opened. The FAB
+     itself is kept clear of the control in MenuBar.tsx instead. */
+  html.ios .menu-bar:not(.menu-bar--floating) {
     padding-left: calc(6px + var(--ios-window-gutter));
   }
-  html.ios .menu-bar.chrome-comfortable {
+  html.ios .menu-bar.chrome-comfortable:not(.menu-bar--floating) {
     padding-left: calc(10px + var(--ios-window-gutter));
   }
 }
@@ -9062,7 +10420,14 @@ html.android .version-history-panel {
     top: 0;
     bottom: 0;
     z-index: 3400;
-    width: 280px;
+    /* A quarter wider than the 240px it actually rendered at: scene headings
+       are long, and as an overlay this is not competing with the page for room.
+       The rule here used to say 280px and never took effect — the navigator
+       carries an inline width from the desktop resize handle, which no
+       stylesheet rule can outrank, hence `!important`. The right-hand panels
+       override their own inline width the same way below. */
+    width: 300px !important;
+    max-width: 90vw;
     min-width: 0;
     box-shadow: 4px 0 20px rgba(0,0,0,.4);
     transition: transform 0.25s ease;
@@ -9228,7 +10593,6 @@ html.android .version-history-panel {
   .menu-item { padding: 8px 12px; min-height: 40px; gap: 6px; white-space: nowrap; flex-shrink: 0; }
   .menu-label { font-size: 13px; }
   .menu-icon { font-size: 14px; }
-  .menu-item--more { flex-shrink: 0; }
   .menu-spacer { flex: 0 0 4px; }
 
   /* Comfortable mode: bigger than compact, scroll if too wide */
@@ -9242,7 +10606,6 @@ html.android .version-history-panel {
   .menu-bar.chrome-comfortable .menu-item { padding: 10px 14px; min-height: 44px; gap: 7px; }
   .menu-bar.chrome-comfortable .menu-label { font-size: 14px; }
   .menu-bar.chrome-comfortable .menu-icon { font-size: 15px; }
-  .menu-bar.chrome-comfortable .menu-item--more { padding: 10px 12px; min-height: 44px; }
   .menu-bar.chrome-comfortable .menu-spacer { flex: 0 0 auto; width: 0; }
 
   /* Floating menu bar (hidden mode): constrain to viewport, scroll */
@@ -9282,6 +10645,11 @@ html.android .version-history-panel {
     top: auto;
     width: 100%;
     min-width: 0;
+    /* Stacked inline inside the scrolling dropdown, so no scroll box of its
+       own and no height cap — positionSubmenu() clears its inline styles at
+       this width for the same reason. */
+    max-height: none;
+    overflow: visible;
     box-shadow: none;
     border: none;
     border-radius: 0;
@@ -9296,6 +10664,10 @@ html.android .version-history-panel {
     min-height: 40px;
     color: var(--fd-text);
   }
+  /* One more step in for each level, so a stacked three-deep menu still reads
+     as a tree rather than one flat list. */
+  .menu-submenu .menu-submenu .menu-dropdown-item { padding-left: 48px; }
+  .menu-submenu .menu-submenu .menu-submenu .menu-dropdown-item { padding-left: 64px; }
 
   /* Status bar: compact */
   .status-center { display: none; }
@@ -9386,6 +10758,10 @@ html.android .version-history-panel {
     gap: 12px;
     align-items: stretch;
   }
+  /* The stretch above is for the title and the controls; a back control
+     stretched to the full width of the screen reads as a banner rather than a
+     button, so keep it its own size at the leading edge. */
+  .project-list-header > .screen-back-btn { align-self: flex-start; }
   .project-list-title { font-size: 22px; }
   .project-list-controls {
     flex-wrap: wrap;
@@ -9521,7 +10897,6 @@ html.android .version-history-panel {
   .menu-bar.chrome-comfortable .menu-item { padding: 10px 12px; min-height: 42px; gap: 6px; }
   .menu-bar.chrome-comfortable .menu-label { font-size: 13px; }
   .menu-bar.chrome-comfortable .menu-icon { font-size: 14px; }
-  .menu-bar.chrome-comfortable .menu-item--more { padding: 10px 10px; min-height: 42px; }
 
   /* Floating menu bar (hidden mode): full-width on phone, scroll */
   .menu-bar--floating {
@@ -9692,7 +11067,7 @@ html.android .version-history-panel {
 
   /* Inputs: prevent iOS zoom (16px minimum) */
   input[type="text"], input[type="search"], input[type="number"],
-  textarea, select {
+  textarea, .od-select {
     font-size: 16px;
   }
 
@@ -9738,7 +11113,8 @@ html.android .version-history-panel {
   .navigator-close, .script-notes-close, .version-history-close, .search-close-btn,
   .asset-manager-close, .format-panel-close, .ic-close-btn,
   .tags-panel-close, .char-profiles-close, .char-lightbox-close,
-  .location-db-close, .script-diff-close, .version-diff-close {
+  .location-db-close, .script-diff-close, .version-diff-close,
+  .asset-viewer-close, .collab-activity-close {
     min-width: 44px;
     min-height: 44px;
     display: flex;
@@ -9747,12 +11123,27 @@ html.android .version-history-panel {
     font-size: 22px;
   }
 
+  /* The same 44px floor for the two closes that cannot simply grow into it:
+     the zoom control is a small round button inside a compact floating pill,
+     and the save-failure dismiss sits in a thin banner — sizing either one up
+     would reshape the thing it lives in. Grow the touch area instead and
+     leave the drawn button alone. */
+  .zoom-panel-close, .save-failure-dismiss {
+    position: relative;
+  }
+  .zoom-panel-close::after, .save-failure-dismiss::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+
   /* The same floor for the back controls on full-screen routes, which are
      laid out as ordinary text buttons and end up around 30px tall. */
-  .settings-back-btn, .project-back-btn, .treatment-back-btn, .screen-back-btn {
-    min-height: 44px;
-    min-width: 44px;
-  }
+  .settings-back-btn, .project-back-btn, .treatment-back-btn, .screen-back-btn,
 
   /* Larger tap targets for scene navigator items */
   .navigator-scene { padding: 12px; min-height: 44px; }
@@ -9848,7 +11239,38 @@ html.android .version-history-panel {
 
 /* ============ PRINT ============ */
 @media print {
+  /* Print the script and nothing else.
+   *
+   * Browsers draw the date, the document title, the URL and the page number
+   * into the page margin box. None of it is part of the screenplay, none of it
+   * can be styled, and a script is a format where a stray line at the top of
+   * the page is not a small thing. There is no property that turns them off —
+   * but they are drawn in the margin, so a page with no margin has nowhere to
+   * put them.
+   *
+   * Nothing moves as a result: a screenplay's own margins are `.page`'s
+   * padding, set from Page Setup, and they sit inside this box rather than
+   * being made of it. `size` is left alone so the paper chosen in the print
+   * dialog is the paper used. */
+  @page { margin: 0; }
+
+  /* Dark Pages is a screen preference. Paper is white: the same selector as
+     the screen rule, later in the file, so it wins. Without this a dark page
+     printed as near-white text on white, since browsers drop backgrounds. */
+  :root[data-dark-pages="on"]:not([data-theme="light"]) {
+    --page-paper: #ffffff;
+    --page-ink: #000000;
+    --page-ink-muted: #8a8a8a;
+    --page-ink-faint: #b0b0b0;
+    --page-ink-placeholder: #cccccc;
+    --page-grammar-style: #2e7dd7;
+  }
+
   /* Hide all chrome */
+  /* The dropdown is portalled to the body, so hiding .menu-bar never reached
+     it and a print started from the File menu printed the File menu. The FAB
+     and its menu are portalled the same way. */
+  .menu-dropdown, .menu-submenu, .menu-fab,
   .menu-bar, .toolbar, .scene-navigator, .status-bar,
   .search-replace-panel, .dialog-overlay,
   .index-cards, .beat-board, .script-notes-panel, .char-profiles-panel, .tags-panel,
@@ -9867,8 +11289,47 @@ html.android .version-history-panel {
   .page { box-shadow: none !important; margin: 0 !important; width: 100% !important; }
   .page-sep { display: none !important; }
 
-  /* Let the browser handle page breaks */
+  /* Break where the editor breaks.
+   *
+   * On screen the page turns are simulated: one continuous page element with
+   * absolutely positioned separators drawn over it, and a margin pushing the
+   * first element of each page down past the gap. Print used to ignore all of
+   * that and let the browser flow the document itself, so it decided its own
+   * page turns and what came out was paginated differently from what was on
+   * screen — the thing a writer is watching most closely, since where a page
+   * ends is part of how a script reads.
+   *
+   * The pagination plugin already names the element each page starts on, so
+   * that element forces a real page break. Its simulated gap is a top margin,
+   * which is truncated at a forced break, and the padding puts the new sheet's
+   * top margin back — the page box has none of its own, since a margin there
+   * is where browsers draw the URL and the date. */
+  .sp-page-start {
+    break-before: page;
+    page-break-before: always;
+    /* The simulated gap goes: it exists to push this element past the foot of
+       a page that is only drawn, and here the page turn is real. Browsers are
+       supposed to truncate a margin at a forced break and this one does not,
+       so it is taken out rather than relied on. */
+    margin-top: 0 !important;
+    padding-top: var(--page-margin-top);
+  }
+
   .tiptap .ProseMirror > * { page-break-inside: avoid; }
+
+  /* Fountain's non-printing elements. The spec is explicit that a Section and
+     a Note stay in the file and off the page, so print drops them — matching
+     what pagination counted and what the exporters write. */
+  .screenplay-element.section,
+  .screenplay-element.note { display: none !important; }
+
+  /* Format ▸ Title Page ▸ Include title page, turned off. Safe to hide
+     outright: this block
+     has already dropped .page-sep, so print flows the document and nothing
+     depends on the overlays' measured positions. `.sp-title-region` is put on
+     the leading run by measureOverlays, which covers the blank spacers and any
+     title-page image as well as the .title-page nodes (issue #98). */
+  .print-skip-title-page .sp-title-region { display: none !important; }
 }
 
 /* ── Collaboration ────────────────────────────────────────────────── */
@@ -10616,6 +12077,12 @@ html.android .version-history-panel {
   color: var(--fd-text-muted);
 }
 
+.settings-user-provider {
+  margin-top: 3px;
+  color: var(--fd-accent);
+  font-size: 12px;
+}
+
 .settings-email-unverified {
   font-size: 13px;
   color: #ffb74d;
@@ -10671,7 +12138,7 @@ html.android .version-history-panel {
 
 .settings-verify-input:focus { border-color: var(--fd-accent); }
 
-/* ── Google sign-in ── */
+/* ── External sign-in ── */
 
 .collab-remember-section {
   margin-top: 12px;
@@ -10705,8 +12172,11 @@ html.android .version-history-panel {
   border-radius: 4px;
   line-height: 1.4;
 }
-.settings-google-section {
+.settings-sso-section {
   margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .settings-divider {
@@ -10726,7 +12196,7 @@ html.android .version-history-panel {
   background: var(--fd-border);
 }
 
-.settings-google-btn {
+.settings-sso-btn {
   width: 100%;
   display: flex;
   align-items: center;
@@ -10741,8 +12211,51 @@ html.android .version-history-panel {
   cursor: pointer;
 }
 
-.settings-google-btn:hover {
+.settings-sso-btn:hover {
   background: var(--fd-toolbar-hover);
+}
+
+.settings-sso-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-provider-status {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--fd-accent);
+  background: rgba(74, 144, 226, 0.12);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.auth-callback-page {
+  min-height: 70vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-callback-card {
+  width: 100%;
+  max-width: 440px;
+  padding: 24px;
+  border: 1px solid var(--fd-border);
+  border-radius: 8px;
+  background: var(--fd-panel-bg);
+  color: var(--fd-text);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+  text-align: center;
+}
+
+.auth-callback-card h2 {
+  margin-top: 0;
+}
+
+.auth-callback-card p {
+  color: var(--fd-text-muted);
 }
 
 /* ============ ACCOUNT & SECURITY ============ */
@@ -10957,6 +12470,14 @@ html.android .version-history-panel {
 .template-editor-field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 180px; }
 .template-editor-field label { font-size: 11px; color: var(--fd-text-dim, #aaa); text-transform: uppercase; letter-spacing: 0.5px; }
 .template-editor-hint { font-size: 11px; color: var(--fd-text-dim); margin-top: 2px; }
+/* The elements that restart a count, in two columns so a long template still fits. */
+.template-editor-reset-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 4px 12px;
+  margin: 4px 0;
+  font-size: 12px;
+}
 
 .template-editor-mode-toggle { display: flex; gap: 0; }
 .template-mode-btn {
@@ -11236,6 +12757,15 @@ html.android .version-history-panel {
   padding: 1px 6px;
   border-radius: 4px;
 }
+.template-select-default-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--fd-text-dim);
+  background: var(--fd-bg-dim, rgba(255,255,255,0.08));
+  padding: 1px 6px;
+  border-radius: 4px;
+}
 .template-select-mode-badge {
   font-size: 11px;
   padding: 1px 8px;
@@ -11386,6 +12916,52 @@ html.android .version-history-panel {
   color: var(--fd-text-dim);
   margin-top: 3px;
   line-height: 1.4;
+}
+/* The badge on the card the New Screenplay picker opens on. */
+.fmt-card-default {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--fd-accent, #3b82f6);
+  background: var(--fd-accent-bg, rgba(59,130,246,0.15));
+}
+/* "Make default" sits at the trailing edge of a preferences card, quiet until
+   it marks the format the picker opens on. */
+.fmt-card-default-btn {
+  flex-shrink: 0;
+  align-self: center;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--fd-border, #444);
+  background: transparent;
+  color: var(--fd-text-dim);
+  white-space: nowrap;
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+.fmt-card-default-btn:hover {
+  border-color: var(--fd-accent, #3b82f6);
+  color: var(--fd-text);
+}
+.fmt-card-default-btn.is-default {
+  border-color: var(--fd-accent, #3b82f6);
+  background: var(--fd-accent-bg, rgba(59,130,246,0.15));
+  color: var(--fd-accent, #3b82f6);
+}
+/* Heading over the writer's own templates in the preferences dialog. */
+.fmt-dialog-section {
+  margin: 16px 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fd-text-dim);
 }
 .fmt-empty {
   padding: 20px;
@@ -11659,3 +13235,319 @@ html.android .version-history-panel {
     padding: 6px 12px;
   }
 }
+
+/* ── The window's top-leading corner ──────────────────────────────────────
+   iPadOS draws its window-management pill inside the top-leading corner of a
+   windowed app, over the app's own content, and reports it through no
+   safe-area inset. Anything the app puts there is buried; anything
+   interactive it puts there cannot be tapped at all (issue #66).
+
+   The menu bar reserves room for it via --ios-window-gutter, which is 0
+   unless html carries .ios-windowed. Every other surface that can reach that
+   corner has to do the same:
+
+     · the full-screen routes — Projects, a project's files, Settings, the
+       treatment editor — which each put a "back" control there, the one way
+       off the screen;
+     · the scene navigator when it is an overlay drawer rather than a docked
+       column, where the tab strip lands in the corner;
+     · the overlays that cover the menu bar entirely — fullscreen index cards
+       and character profiles, and the version diff.
+
+   The indent goes on the leading child rather than on its container, because
+   these headers set their padding afresh at every breakpoint and a padding
+   rule here would have to restate all of it to avoid flattening it.
+
+   env(safe-area-inset-top/left) is folded in throughout: none of these
+   surfaces sit inside .app-container, so none of them ever picked up the
+   generic inset rules, and full-screen on a notched device they ran their top
+   row under the status bar. */
+@supports (padding: env(safe-area-inset-top)) {
+  html.ios .project-source-bar > .project-source-tab:first-child,
+  /* :first-child — on the projects screen the corner belongs to the source
+     tabs whenever they are shown, and the back control sits below them. It
+     only needs the indent when it is the topmost row itself. */
+  html.ios .project-list-header:first-child > .screen-back-btn,
+  html.ios .project-view-header > .project-back-btn,
+  html.ios .settings-header > .settings-back-btn,
+  html.ios .treatment-header > .treatment-back-btn,
+  html.ios .index-cards-fullscreen .index-cards-header > :first-child,
+  html.ios .char-profiles-fullscreen .char-profiles-header > :first-child,
+  html.ios .script-diff-overlay .script-diff-header > :first-child {
+    margin-left: calc(env(safe-area-inset-left, 0px) + var(--ios-window-gutter, 0px));
+  }
+
+  /* Routes: applied to the topmost child so the page's own padding survives,
+     which matches how .app-container clears the status bar in the editor. */
+  html.ios .project-list-page > :first-child,
+  html.ios .project-view > .project-view-header,
+  html.ios .settings-page > .settings-header,
+  html.ios .treatment-editor-root > .treatment-header {
+    margin-top: env(safe-area-inset-top, 0px);
+  }
+
+  /* Overlays: these have no padding of their own, so the inset can go on the
+     container and let the whole panel start below the status bar. */
+  html.ios .index-cards-fullscreen,
+  html.ios .char-profiles-panel.char-profiles-fullscreen,
+  html.ios .script-diff-overlay {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  /* The index-card header is sticky inside that scroller, and sticky offsets
+     are measured from the scrollport edge — without this it slides back under
+     the status bar the moment the cards are scrolled. */
+  html.ios .index-cards-fullscreen .index-cards-header {
+    top: env(safe-area-inset-top, 0px);
+  }
+
+  /* The navigator only reaches the corner as an overlay drawer; docked, it
+     sits below the menu bar and wants neither inset. */
+  @media (max-width: 1100px) {
+    html.ios .scene-navigator {
+      padding-top: env(safe-area-inset-top, 0px);
+    }
+    html.ios .scene-navigator .navigator-tabs > :first-child {
+      margin-left: calc(env(safe-area-inset-left, 0px) + var(--ios-window-gutter, 0px));
+    }
+  }
+
+  /* Same story on the other side of the screen (issue #96): below 900px the
+     right-hand slide-overs turn into `position: fixed` drawers anchored at
+     top: 0, which takes them out of .app-container and out of the padding
+     that keeps it clear of the status bar. Their header then runs under the
+     clock, and the close button under the battery — where it cannot reliably
+     be tapped. Above 900px they are docked inside the container, already
+     inset, and must not be padded twice, which is why an iPad never showed
+     this and the rule stays inside the query.
+
+     padding-right goes with it: these are pinned to the trailing edge, so in
+     landscape the close button is the control the notch covers. */
+  @media (max-width: 900px) {
+    html.ios .script-notes-panel,
+    html.ios .char-profiles-panel,
+    html.ios .tags-panel {
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-right: env(safe-area-inset-right, 0px);
+    }
+  }
+}
+
+/* ── Font picker ──────────────────────────────────────────────────────────
+   A searchable list with live previews, in place of a native <select>: the
+   library is well over a hundred families, and a writer choosing between
+   Cinzel and Cormorant has to be able to see them. */
+.font-picker-trigger {
+  display: inline-flex; align-items: center; justify-content: space-between; gap: 6px;
+  text-align: left; overflow: hidden; white-space: nowrap;
+}
+.font-picker-trigger-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.font-picker-caret { flex: none; opacity: .6; font-size: 9px; font-family: sans-serif; }
+
+.font-picker-popup {
+  position: fixed; z-index: 4000; min-width: 260px; max-width: 380px;
+  background: var(--fd-dropdown-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-overlay-medium); border-radius: 6px;
+  box-shadow: 0 8px 28px var(--fd-shadow);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.font-picker-search-row { padding: 6px; border-bottom: 1px solid var(--fd-overlay-light); }
+.font-picker-search {
+  width: 100%; box-sizing: border-box; height: 26px; padding: 0 8px;
+  background: var(--fd-input-bg); color: var(--fd-text);
+  border: 1px solid var(--fd-overlay-medium); border-radius: 4px;
+  font-size: 12px; font-family: inherit; outline: none;
+}
+.font-picker-search:focus { border-color: var(--fd-accent); }
+
+/* max-height comes from the anchor, which measures the real visual viewport;
+   this is only a ceiling for the desktop case. */
+.font-picker-list { overflow-y: auto; flex: 1; min-height: 0; padding: 4px 0; -webkit-overflow-scrolling: touch; }
+.font-picker-group {
+  padding: 6px 10px 3px; font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--fd-text-muted); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.font-picker-option {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 5px 10px; font-size: 15px; line-height: 1.35; cursor: pointer;
+}
+.font-picker-option-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.font-picker-option.is-active { background: var(--fd-menu-hover); }
+.font-picker-option.is-selected { color: var(--fd-accent); }
+.font-picker-option.is-missing .font-picker-option-name { opacity: .55; }
+.font-picker-missing-tag {
+  flex: none; font-size: 9.5px; letter-spacing: .03em; color: var(--fd-text-muted);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.font-picker-empty {
+  padding: 12px 10px; font-size: 12px; color: var(--fd-text-muted);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.font-picker-manage {
+  border: none; border-top: 1px solid var(--fd-overlay-light);
+  background: transparent; color: var(--fd-accent); text-align: left;
+  padding: 8px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+}
+.font-picker-manage:hover { background: var(--fd-menu-hover); }
+
+/* ── Fonts dialog ── */
+.fonts-dialog-intro, .fonts-dialog-note {
+  font-size: 12.5px; line-height: 1.55; opacity: .8; margin: 0 0 16px;
+}
+.fonts-dialog-note { margin: 18px 0 0; }
+.fonts-dialog-heading {
+  margin: 22px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--fd-text-muted); font-weight: 600;
+}
+.fonts-dropzone {
+  border: 1px dashed var(--fd-overlay-medium); border-radius: 8px;
+  padding: 18px; text-align: center;
+}
+.fonts-dropzone.is-dragging { border-color: var(--fd-accent); background: var(--fd-overlay-subtle); }
+.fonts-dropzone > p { margin: 0 0 10px; font-size: 13px; opacity: .8; }
+.fonts-dropzone-hint { margin: 10px 0 0 !important; font-size: 11.5px; opacity: .6; }
+.fonts-dialog-status { margin: 12px 0 0; font-size: 12.5px; color: var(--fd-accent); }
+.fonts-dialog-errors {
+  margin: 12px 0 0; padding-left: 18px; font-size: 12.5px; color: #e06c6c; line-height: 1.5;
+}
+.fonts-dialog-empty { margin: 0; font-size: 12.5px; opacity: .7; }
+.fonts-list { list-style: none; margin: 0 0 12px; padding: 0; }
+.fonts-list-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--fd-overlay-light);
+}
+.fonts-list-sample { font-size: 17px; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fonts-list-meta { flex: 1; min-width: 0; font-size: 11.5px; opacity: .6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fonts-list-remove { flex: none; font-size: 11.5px; }
+.fonts-named-row { margin-top: 12px; }
+.fonts-named-input-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.fonts-named-input-row .props-input { flex: 1; min-width: 0; }
+
+/* ── Touch targets ────────────────────────────────────────────────────────
+   The toolbar and the font picker were laid out for a mouse: 22px controls
+   and 5px-padded rows are comfortable under a cursor and cramped under a
+   finger. Apple and Google both put the floor at around 44px, and an iPad
+   writer picking a font from a list of 185 is doing it repeatedly.
+
+   Keyed on pointer, not width: an 11" iPad is wider than a small laptop, and
+   it is the finger that needs the room. */
+@media (pointer: coarse) {
+  .element-selector, .font-selector, .font-size-selector { height: 34px; font-size: 13px; }
+  .toolbar.toolbar-comfortable .element-selector,
+  .toolbar.toolbar-comfortable .font-selector,
+  .toolbar.toolbar-comfortable .font-size-selector { height: 36px; font-size: 13.5px; }
+  .font-selector { min-width: 132px; }
+  .font-size-selector { min-width: 72px; }
+  .element-selector { min-width: 150px; }
+
+  .font-picker-option { padding: 11px 14px; font-size: 17px; }
+  .font-picker-group { padding: 10px 14px 5px; font-size: 11px; }
+  .font-picker-search { height: 38px; font-size: 16px; }
+  .font-picker-search-row { padding: 8px; }
+  .font-picker-manage { padding: 14px; font-size: 14px; }
+  .font-picker-missing-tag { font-size: 11px; }
+
+  .fonts-list-row { padding: 12px 0; }
+  .fonts-list-remove { padding: 8px 14px; font-size: 13px; }
+  .fonts-named-input-row .props-input { height: 38px; font-size: 16px; }
+  .fonts-named-input-row button { padding: 9px 14px; font-size: 14px; }
+  .fonts-dropzone button { padding: 12px 18px; font-size: 15px; }
+}
+
+/* ============ SHORTCUT CAPTURE (Settings → Editing) ============ */
+.shortcut-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.shortcut-capture {
+  min-width: 140px;
+  text-align: center;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.shortcut-capture.is-listening {
+  border-color: var(--fd-accent);
+  color: var(--fd-accent);
+}
+.shortcut-clear {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  color: var(--fd-text-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.shortcut-clear:hover:not(:disabled) { color: var(--fd-text); }
+.shortcut-clear:disabled { opacity: .4; cursor: default; }
+
+/* ── Handwriting panel: resize, transparency, ink, narrow widths ────────── */
+
+/* The writing field, see-through by its own amount so the line of script the
+   writer is about to add to can be read straight through where they write it.
+   Its own control rather than the panel's: the chrome and the field want very
+   different amounts of it. */
+.scribble-area {
+  background: color-mix(in srgb, var(--fd-input-bg, rgba(255, 255, 255, 0.06))
+    calc(var(--scribble-area-alpha, 1) * 100%), transparent);
+  color: var(--scribble-ink, var(--fd-text));
+}
+
+/* Grab the corner to resize. Sized for a fingertip rather than a pointer, and
+   `touch-action: none` so the drag does not scroll the script underneath. */
+.scribble-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 26px;
+  height: 26px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.scribble-resize::after {
+  content: '';
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 11px;
+  height: 11px;
+  border-right: 2px solid var(--fd-text-dim, #8a8a8a);
+  border-bottom: 2px solid var(--fd-text-dim, #8a8a8a);
+  border-bottom-right-radius: 3px;
+  opacity: 0.7;
+}
+
+/* Narrow: the buttons keep their icons and drop their words. Their accessible
+   names stay on the button, so nothing is lost to a screen reader. */
+.scribble-panel.is-compact .scribble-tool-label { display: none; }
+.scribble-panel.is-compact .scribble-tool { padding-left: 10px; padding-right: 10px; }
+.scribble-panel.is-compact .scribble-header { padding: 8px 10px 6px; }
+
+.scribble-settings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  padding: 8px 2px 2px;
+  border-top: 1px solid var(--fd-border);
+  /* Its own controls, not the header's drag surface. */
+  cursor: default;
+  touch-action: auto;
+}
+.scribble-setting { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--fd-text-dim, #9aa0a6); }
+.scribble-setting input[type="range"] { width: 108px; accent-color: var(--fd-accent, #3b82f6); }
+.scribble-ink-row { display: flex; gap: 6px; }
+.scribble-ink {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  box-shadow: 0 0 0 1px var(--fd-border);
+  padding: 0;
+  cursor: pointer;
+}
+.scribble-ink.is-default { background: linear-gradient(135deg, #d4d4d4 50%, #6b6b6b 50%); }
+.scribble-ink.is-on { border-color: var(--fd-accent, #3b82f6); }
+.scribble-close.is-on { color: var(--fd-accent, #3b82f6); }

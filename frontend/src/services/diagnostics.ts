@@ -92,13 +92,13 @@ export async function collectDiagnostics(): Promise<DiagnosticsReport> {
   };
 }
 
-function getAppVersion(): string {
+export function getAppVersion(): string {
   // Version is hard-coded in MenuBar/About; pull from a global if exposed,
   // otherwise rely on what the Tauri build embeds.
   if (typeof window !== 'undefined' && (window as any).__OPENDRAFT_VERSION__) {
     return (window as any).__OPENDRAFT_VERSION__;
   }
-  return '0.24.1';
+  return '2.5.4';
 }
 
 /** Format a report as plain text suitable for pasting into a GitHub issue. */

@@ -77,7 +77,14 @@ client = TestClient(app)
 
 def _token(user_id: str, email: str, ttl_sec: int = 120) -> str:
     return jwt.encode(
-        {"sub": user_id, "email": email, "type": "access", "exp": int(time.time()) + ttl_sec},
+        {
+            "iss": "opendraft-collab",
+            "aud": "opendraft-backend",
+            "sub": user_id,
+            "email": email,
+            "type": "access",
+            "exp": int(time.time()) + ttl_sec,
+        },
         "test-secret-xyz",
         algorithm="HS256",
     )
@@ -151,11 +158,57 @@ def test_same_slug_different_users():
     print("  ok: same slug across users isolated")
 
 
+def test_formatting_templates_are_isolated():
+    endpoint = "/api/formatting-templates/"
+    template_id = "shared-template"
+    alice_headers = _auth("alice-id", "alice@example.com")
+    bob_headers = _auth("bob-id", "bob@example.com")
+
+    response = client.post(
+        endpoint,
+        json={"id": template_id, "name": "Alice Template"},
+        headers=alice_headers,
+    )
+    assert response.status_code == 200, response.text
+    response = client.get(f"{endpoint}{template_id}", headers=bob_headers)
+    assert response.status_code == 404
+
+    response = client.post(
+        endpoint,
+        json={"id": template_id, "name": "Bob Template"},
+        headers=bob_headers,
+    )
+    assert response.status_code == 200, response.text
+    response = client.put(
+        f"{endpoint}{template_id}",
+        json={"name": "Alice Revised"},
+        headers=alice_headers,
+    )
+    assert response.status_code == 200, response.text
+    bob = client.get(f"{endpoint}{template_id}", headers=bob_headers)
+    assert bob.status_code == 200 and bob.json()["name"] == "Bob Template"
+
+    response = client.delete(f"{endpoint}{template_id}", headers=alice_headers)
+    assert response.status_code == 200, response.text
+    assert client.get(
+        f"{endpoint}{template_id}", headers=alice_headers
+    ).status_code == 404
+    bob = client.get(f"{endpoint}{template_id}", headers=bob_headers)
+    assert bob.status_code == 200 and bob.json()["name"] == "Bob Template"
+    print("  ok: formatting templates with the same ID are isolated per user")
+
+
 def test_directory_layout():
     users_dir = _data_dir / "projects" / "users"
     assert (users_dir / "alice-id" / "alice-movie" / "project.json").exists()
     assert (users_dir / "alice-id" / "my-film" / "project.json").exists()
     assert (users_dir / "bob-id" / "my-film" / "project.json").exists()
+    assert not (
+        users_dir / "alice-id" / "_formatting_templates" / "shared-template.json"
+    ).exists()
+    assert (
+        users_dir / "bob-id" / "_formatting_templates" / "shared-template.json"
+    ).exists()
     # Bob should NOT have an alice-movie dir
     assert not (users_dir / "bob-id" / "alice-movie").exists()
     print("  ok: directory layout is users/<id>/<slug>/...")
@@ -169,6 +222,7 @@ if __name__ == "__main__":
         test_alice_creates_project()
         test_bob_cannot_see_alice()
         test_same_slug_different_users()
+        test_formatting_templates_are_isolated()
         test_directory_layout()
         print("All tests passed.")
     finally:

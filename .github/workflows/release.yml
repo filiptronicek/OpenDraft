@@ -15,6 +15,16 @@ on:
         description: 'Existing release tag to rebuild, e.g. v0.21.0'
         required: true
         type: string
+      stores:
+        description: 'Upload to App Store Connect and Google Play. Untick for a fix that only touches desktop or Linux.'
+        required: false
+        default: true
+        type: boolean
+      skip_platforms:
+        description: 'Platforms to leave out, e.g. "android ios mas". Empty uses the tag message; "none" builds everything.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -30,25 +40,92 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # ── Which platforms this release builds ─────────────────────────────────
+  # Every platform by default. A release can leave some out — a fix that only
+  # matters on Windows, say, without putting a build through Apple and Google
+  # review — by carrying a line in its annotated tag message:
+  #
+  #     skip-platforms: android ios macos
+  #
+  # release.sh writes that line from SKIP_PLATFORMS. It lives in the tag and
+  # not in a file because the tag is what a push hands this workflow, and a
+  # manual re-run of the same tag reads the same message, so the two cannot
+  # disagree. Platforms: macos (the three dmgs on the GitHub release), mas
+  # (the Mac App Store), ios, android, windows, linux. The Docker image always
+  # builds.
+  plan:
+    runs-on: ubuntu-latest
+    name: Plan platforms
+    outputs:
+      desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      macos: ${{ steps.plan.outputs.macos }}
+      mas: ${{ steps.plan.outputs.mas }}
+      ios: ${{ steps.plan.outputs.ios }}
+      android: ${{ steps.plan.outputs.android }}
+      windows: ${{ steps.plan.outputs.windows }}
+      linux: ${{ steps.plan.outputs.linux }}
+      stores: ${{ steps.plan.outputs.stores }}
+    steps:
+      - name: Read the platforms to leave out
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SKIP_INPUT: ${{ inputs.skip_platforms }}
+        run: |
+          set -euo pipefail
+          SKIP="${SKIP_INPUT:-}"
+          if [ -z "$SKIP" ]; then
+            # Only an annotated tag has a message; a lightweight one points
+            # straight at a commit and skips nothing.
+            REF=$(gh api "repos/${REPO}/git/ref/tags/${RELEASE_TAG}")
+            if [ "$(echo "$REF" | jq -r .object.type)" = "tag" ]; then
+              MSG=$(gh api "repos/${REPO}/git/tags/$(echo "$REF" | jq -r .object.sha)" --jq .message)
+              SKIP=$(printf '%s\n' "$MSG" | sed -n 's/^skip-platforms:[[:space:]]*//p' | head -1)
+            fi
+          fi
+          SKIP=$(echo "$SKIP" | tr ',[:upper:]' ' [:lower:]' | xargs || true)
+          [ "$SKIP" = "none" ] && SKIP=""
+
+          for p in $SKIP; do
+            case "$p" in
+              macos|mas|ios|android|windows|linux) ;;
+              *) echo "::error::Unknown platform '$p' in skip-platforms (use macos mas ios android windows linux)"; exit 1 ;;
+            esac
+          done
+
+          echo "Leaving out: ${SKIP:-nothing}"
+          for p in macos mas ios android windows linux; do
+            if [[ " $SKIP " == *" $p "* ]]; then echo "$p=false"; else echo "$p=true"; fi >> "$GITHUB_OUTPUT"
+          done
+          if [[ " $SKIP " == *" mas "* && " $SKIP " == *" ios "* && " $SKIP " == *" android "* ]]; then
+            echo "stores=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stores=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # macOS-arm64 is pinned to macos-15 for the same reason as
+          # build-mac-appstore: codesign/notarize hangs on macos-26 until the
+          # step times out. In v0.20.0 all three notarizing macOS jobs burned
+          # 60 minutes and retried for 60 more, while the macos-15 App Store
+          # job finished in under five. Revisit when that is fixed.
+          ALL='[
+            {"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"Linux-x64","key":"linux"},
+            {"platform":"windows-latest","target":"x86_64-pc-windows-msvc","label":"Windows-x64","key":"windows"},
+            {"platform":"macos-15","target":"aarch64-apple-darwin","label":"macOS-arm64","key":"macos"}
+          ]'
+          MATRIX=$(echo "$ALL" | jq -c --arg skip " $SKIP " '{include: map(. as $e | select(($skip | contains(" " + $e.key + " ")) | not))}')
+          if [ "$(echo "$MATRIX" | jq '.include | length')" = "0" ]; then
+            echo "::error::Every desktop platform is skipped — there would be no release to publish"
+            exit 1
+          fi
+          echo "desktop_matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   build-desktop:
+    needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            label: Linux-x64
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            label: Windows-x64
-          # Pinned to macos-15 for the same reason as build-mac-appstore:
-          # codesign/notarize hangs on macos-26 until the step times out. In
-          # v0.20.0 all three notarizing macOS jobs burned 60 minutes and
-          # retried for 60 more, while the macos-15 App Store job finished in
-          # under five. Revisit when the macos-26 codesign issue is fixed.
-          - platform: macos-15
-            target: aarch64-apple-darwin
-            label: macOS-arm64
+      matrix: ${{ fromJSON(needs.plan.outputs.desktop_matrix) }}
 
     runs-on: ${{ matrix.platform }}
     name: Build (${{ matrix.label }})
@@ -81,7 +158,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            squashfs-tools
 
       - name: Install frontend dependencies
         run: |
@@ -92,8 +170,6 @@ jobs:
         run: |
           cd frontend
           npm run build
-        env:
-          VITE_API_BASE: http://localhost:18321/api
 
       - name: Import Windows signing certificate
         if: matrix.platform == 'windows-latest'
@@ -129,6 +205,14 @@ jobs:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+          # A keychain locks itself again after five minutes of inactivity.
+          # The arm64 build compiles for longer than that, so codesign reached
+          # a re-locked keychain and blocked forever waiting for an unlock no
+          # headless runner can answer: the job hit its 90-minute timeout with
+          # codesign still running, and every retry did the same. The jobs that
+          # signed within five minutes were unaffected, which is why only this
+          # one failed. Six hours is longer than any build here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import $RUNNER_TEMP/certificate.p12 -k build.keychain \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
@@ -253,6 +337,27 @@ jobs:
           prerelease: false
           includeUpdaterJson: false
 
+      # tauri-action has already uploaded the AppImage linuxdeploy produced,
+      # and that one is broken on any distro newer than this runner: it carries
+      # a bundled libwayland-client the host's libEGL then resolves against,
+      # failing with EGL_BAD_PARAMETER and leaving a blank white window
+      # (issue #113). Strip those libraries out and overwrite the draft asset.
+      - name: Strip bundled Wayland libraries from the AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        run: .github/scripts/fix-appimage-wayland.sh
+
+      - name: Verify the AppImage bundles no Wayland libraries
+        if: matrix.platform == 'ubuntu-22.04'
+        run: .github/scripts/verify-appimage-wayland.sh
+
+      - name: Upload repacked AppImage to release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: src-tauri/target/release/bundle/appimage/*.AppImage
+          draft: true
+
       # macOS calls the Tauri CLI directly instead of going through
       # tauri-action. In v0.20.0 both tauri-action macOS jobs hung inside
       # codesign until the step timed out — twice each, on two different runner
@@ -294,6 +399,8 @@ jobs:
           draft: true
 
   build-android:
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
     runs-on: ubuntu-latest
     name: Build (Android)
 
@@ -502,6 +609,31 @@ jobs:
               content = content.replace("</application>", extra + "\n    </application>", 1)
               print("Android manifest patched with 3 extra window activities")
 
+          # ── Table Read (issue #131) ──────────────────────────────────────
+          # From Android 11 an app sees only the packages it declares it will
+          # talk to. Without this query no text-to-speech engine is visible,
+          # TextToSpeech never binds, and Table Read finds no voices.
+          tts_query = (
+              '<intent>\n'
+              '            <action android:name="android.intent.action.TTS_SERVICE" />\n'
+              '        </intent>'
+          )
+          if "android.intent.action.TTS_SERVICE" not in content:
+              if "<queries>" in content:
+                  content = content.replace("<queries>", "<queries>\n        " + tts_query, 1)
+              elif "<application" in content:
+                  content = content.replace(
+                      "<application", "<queries>\n        " + tts_query + "\n    </queries>\n\n    <application", 1
+                  )
+              else:
+                  sys.exit(
+                      "::error::No <application> in the generated AndroidManifest.xml — "
+                      "the text-to-speech query cannot be declared, and Table Read "
+                      "would find no voices. The Tauri template has changed shape; "
+                      "update this patch."
+                  )
+              print("Android manifest patched with the TTS_SERVICE query")
+
           with open(manifest_path, "w") as f:
               f.write(content)
 
@@ -635,6 +767,104 @@ jobs:
           fi
           echo "Verified: WindowActivity1-3 and file associations are in $(basename "$APK")"
 
+      # Google Play blocks updates whose native libraries are not laid out for
+      # 16 KB memory pages — mandatory for anything targeting Android 15+ since
+      # November 2025. The linker flag that does it is emitted by the android
+      # branch of src-tauri/build.rs, which a Tauri or NDK upgrade could quietly
+      # stop applying: the Tauri CLI passes its own rustflags for Android, and
+      # nothing here would fail. The rejection would land days later in the Play
+      # Console, on a release that is already tagged. So read the alignment back
+      # off the APK that actually ships.
+      - name: Verify native libraries are 16 KB page aligned
+        run: |
+          set -euo pipefail
+          APK=$(find src-tauri/gen/android -name "*.apk" -path "*/release/*" ! -name "*unsigned*" | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find src-tauri/gen/android -name "*.apk" -path "*/release/*" | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::No release APK found to check for 16 KB page alignment"
+            exit 1
+          fi
+
+          # -type f would miss it: llvm-readelf ships as a symlink to llvm-readobj.
+          READELF=$(find "$NDK_HOME/toolchains/llvm/prebuilt" -name llvm-readelf \( -type f -o -type l \) | head -1)
+          if [ -z "$READELF" ]; then
+            echo "::error::llvm-readelf not found under $NDK_HOME — cannot verify 16 KB page alignment"
+            exit 1
+          fi
+
+          WORK=$(mktemp -d)
+          unzip -q "$APK" 'lib/*' -d "$WORK"
+          SOS=$(find "$WORK/lib" -name "*.so" | sort)
+          if [ -z "$SOS" ]; then
+            echo "::error::No native libraries inside $(basename "$APK") — the Rust library did not make it into the APK."
+            exit 1
+          fi
+
+          FAILED=0
+          for SO in $SOS; do
+            NAME="${SO#"$WORK"/lib/}"
+            MIN=""
+            for ALIGN in $("$READELF" -l "$SO" | awk '$1 == "LOAD" { print $NF }'); do
+              BYTES=$((ALIGN))
+              if [ -z "$MIN" ] || [ "$BYTES" -lt "$MIN" ]; then
+                MIN=$BYTES
+              fi
+            done
+            if [ -z "$MIN" ]; then
+              echo "::error::$NAME has no LOAD segments — it is not a loadable library."
+              FAILED=1
+            elif [ "$MIN" -lt 16384 ]; then
+              echo "::error::$NAME is aligned to $MIN bytes, not 16384 — Google Play will reject this bundle, and the app would not load on a 16 KB device. See the android branch of src-tauri/build.rs."
+              FAILED=1
+            else
+              echo "  $NAME: aligned to $MIN bytes"
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+          # Alignment inside the ELF only helps if the library is also stored
+          # uncompressed at a page boundary inside the APK, so the loader can
+          # map it straight out of the archive. `zipalign -c -P 16` is not the
+          # check for that: it has nothing to say about entries that are
+          # compressed, so an APK that deflates its libraries passes it.
+          APK="$APK" python3 << 'PYEOF'
+          import os, struct, sys, zipfile
+
+          apk = os.environ["APK"]
+          bad = []
+          with zipfile.ZipFile(apk) as z, open(apk, "rb") as raw:
+              libs = [i for i in z.infolist()
+                      if i.filename.startswith("lib/") and i.filename.endswith(".so")]
+              if not libs:
+                  sys.exit("::error::No lib/*.so entries in %s" % os.path.basename(apk))
+              for info in libs:
+                  if info.compress_type != zipfile.ZIP_STORED:
+                      bad.append("%s is compressed, so it cannot be mapped from the APK "
+                                 "(set jniLibs useLegacyPackaging = false)" % info.filename)
+                      continue
+                  # The central directory records where the local header starts;
+                  # the payload sits past that header's name and extra fields.
+                  raw.seek(info.header_offset)
+                  header = raw.read(30)
+                  name_len, extra_len = struct.unpack("<HH", header[26:30])
+                  data_offset = info.header_offset + 30 + name_len + extra_len
+                  if data_offset % 16384:
+                      bad.append("%s starts at offset %d, which is not a 16 KB boundary"
+                                 % (info.filename, data_offset))
+
+          for problem in bad:
+              print("::error::%s" % problem)
+          if bad:
+              sys.exit("%d native librar%s not packaged for 16 KB pages."
+                       % (len(bad), "y is" if len(bad) == 1 else "ies are"))
+          print("Verified: every native library in %s is stored uncompressed on a "
+                "16 KB boundary" % os.path.basename(apk))
+          PYEOF
+
       - name: Build Android AAB
         env:
           KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}
@@ -684,6 +914,8 @@ jobs:
           path: android-artifacts/*.aab
 
   build-intel-mac:
+    needs: plan
+    if: needs.plan.outputs.macos == 'true'
     # Pinned to macos-15 — see build-mac-appstore. codesign/notarize
     # hangs on macos-26 until the step times out.
     runs-on: macos-15
@@ -726,8 +958,6 @@ jobs:
 
       - name: Build frontend
         run: cd frontend && npm run build
-        env:
-          VITE_API_BASE: http://localhost:18321/api
 
       - name: Import Apple Developer certificate
         env:
@@ -742,6 +972,14 @@ jobs:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+          # A keychain locks itself again after five minutes of inactivity.
+          # The arm64 build compiles for longer than that, so codesign reached
+          # a re-locked keychain and blocked forever waiting for an unlock no
+          # headless runner can answer: the job hit its 90-minute timeout with
+          # codesign still running, and every retry did the same. The jobs that
+          # signed within five minutes were unaffected, which is why only this
+          # one failed. Six hours is longer than any build here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import $RUNNER_TEMP/certificate.p12 -k build.keychain \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
@@ -798,6 +1036,8 @@ jobs:
           draft: true
 
   build-intel-mac-legacy:
+    needs: plan
+    if: needs.plan.outputs.macos == 'true'
     # Pinned to macos-15 — see build-mac-appstore. codesign/notarize
     # hangs on macos-26 until the step times out.
     runs-on: macos-15
@@ -844,7 +1084,6 @@ jobs:
       - name: Build frontend (targeting Safari 13 for Catalina compatibility)
         run: cd frontend && npm run build
         env:
-          VITE_API_BASE: http://localhost:18321/api
           BUILD_TARGET: es2019
 
       - name: Import Apple Developer certificate
@@ -860,6 +1099,14 @@ jobs:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+          # A keychain locks itself again after five minutes of inactivity.
+          # The arm64 build compiles for longer than that, so codesign reached
+          # a re-locked keychain and blocked forever waiting for an unlock no
+          # headless runner can answer: the job hit its 90-minute timeout with
+          # codesign still running, and every retry did the same. The jobs that
+          # signed within five minutes were unaffected, which is why only this
+          # one failed. Six hours is longer than any build here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import $RUNNER_TEMP/certificate.p12 -k build.keychain \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
@@ -932,6 +1179,8 @@ jobs:
           draft: true
 
   build-ios:
+    needs: plan
+    if: needs.plan.outputs.ios == 'true'
     runs-on: macos-26
     name: Build (iOS)
 
@@ -982,6 +1231,14 @@ jobs:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+          # A keychain locks itself again after five minutes of inactivity.
+          # The arm64 build compiles for longer than that, so codesign reached
+          # a re-locked keychain and blocked forever waiting for an unlock no
+          # headless runner can answer: the job hit its 90-minute timeout with
+          # codesign still running, and every retry did the same. The jobs that
+          # signed within five minutes were unaffected, which is why only this
+          # one failed. Six hours is longer than any build here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import $RUNNER_TEMP/certificate.p12 -k build.keychain \
             -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
@@ -1265,6 +1522,8 @@ jobs:
           path: ios-artifacts/*.ipa
 
   build-mac-appstore:
+    needs: plan
+    if: needs.plan.outputs.mas == 'true'
     # Pinned to macos-15 — codesign on macos-26 hangs ~24 min on cert-chain
     # validation (likely OCSP/CRL network calls). The same job ran in 2-4 min
     # on macos-26 in v0.16.0/v0.16.1, then started hanging mid-Apr 2026 after
@@ -1310,6 +1569,12 @@ jobs:
         run: cd frontend && npm ci
 
       - name: Build frontend
+        # The App Store build and the .dmg are the same binary on the same OS,
+        # so the update notice cannot tell them apart at runtime and its OS
+        # fallback would offer an App Store copy a .dmg download — wrong, and
+        # something Apple objects to. This is the one job that has to say.
+        env:
+          VITE_OPENDRAFT_CHANNEL: mas
         run: cd frontend && npm run build
 
       - name: Import Apple Distribution certificate
@@ -1325,6 +1590,14 @@ jobs:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+          # A keychain locks itself again after five minutes of inactivity.
+          # The arm64 build compiles for longer than that, so codesign reached
+          # a re-locked keychain and blocked forever waiting for an unlock no
+          # headless runner can answer: the job hit its 90-minute timeout with
+          # codesign still running, and every retry did the same. The jobs that
+          # signed within five minutes were unaffected, which is why only this
+          # one failed. Six hours is longer than any build here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import $RUNNER_TEMP/distribution.p12 -k build.keychain \
             -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
           security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: -s -k "" build.keychain
@@ -1511,21 +1784,28 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ── Submit to App Stores ────────────────────────────────────────────────
-  # Runs only after ALL build jobs succeed. Downloads built artifacts and
+  # Runs only after every build job that ran has succeeded — a platform left
+  # out by the plan is skipped, not failed. Downloads built artifacts and
   # submits them to the iOS App Store, macOS App Store, and Google Play Store.
   submit-stores:
-    needs: [build-desktop, build-android, build-ios, build-mac-appstore, build-intel-mac, build-intel-mac-legacy, build-docker]
+    needs: [plan, build-desktop, build-android, build-ios, build-mac-appstore, build-intel-mac, build-intel-mac-legacy, build-docker]
+    if: >-
+      always() && !cancelled()
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      && needs.plan.outputs.stores == 'true'
     runs-on: macos-latest
     name: Submit to App Stores
 
     steps:
       - name: Download iOS IPA artifact
+        if: needs.plan.outputs.ios == 'true'
         uses: actions/download-artifact@v5
         with:
           name: ios-ipa
           path: ios-artifacts
 
       - name: Download macOS pkg artifact
+        if: needs.plan.outputs.mas == 'true'
         uses: actions/download-artifact@v5
         continue-on-error: true
         with:
@@ -1533,12 +1813,17 @@ jobs:
           path: macos-artifacts
 
       - name: Download Android AAB artifact
+        if: needs.plan.outputs.android == 'true'
         uses: actions/download-artifact@v5
         with:
           name: android-aab
           path: android-artifacts
 
       - name: Upload iOS IPA to App Store Connect
+        # A tag push has no inputs and always uploads. Not `inputs.stores != false`:
+        # GitHub coerces both sides to numbers, so null equals false and a tag push
+        # would skip the stores.
+        if: (github.event_name != 'workflow_dispatch' || inputs.stores) && needs.plan.outputs.ios == 'true'
         env:
           APPSTORE_API_KEY: ${{ secrets.APPSTORE_API_KEY }}
           APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
@@ -1579,7 +1864,7 @@ jobs:
 
       - name: Upload macOS pkg to App Store Connect
         # Always run, even if iOS upload above failed — they're independent.
-        if: always() && !cancelled()
+        if: always() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.stores) && needs.plan.outputs.mas == 'true'
         continue-on-error: true
         env:
           APPSTORE_API_KEY: ${{ secrets.APPSTORE_API_KEY }}
@@ -1616,6 +1901,7 @@ jobs:
           fi
 
       - name: Upload Android AAB to Google Play (production)
+        if: (github.event_name != 'workflow_dispatch' || inputs.stores) && needs.plan.outputs.android == 'true'
         # Don't fail the release if the Play Store credentials are stale or
         # the AAB version was already uploaded — submit-stores must still
         # complete so publish-release can flip the GitHub release out of draft.
@@ -1660,8 +1946,14 @@ jobs:
   # Runs only after ALL build jobs succeed. Verifies assets exist on the
   # draft release, publishes it, then updates download links in README.md
   # and landing/index.html so they always point to verified files.
+  # submit-stores is skipped outright when no store platform was built, so
+  # this waits on the builds directly as well, and runs unless something
+  # actually failed or was cancelled.
   publish-release:
-    needs: [submit-stores]
+    needs: [plan, build-desktop, build-android, build-ios, build-mac-appstore, build-intel-mac, build-intel-mac-legacy, build-docker, submit-stores]
+    if: >-
+      always() && !cancelled()
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     name: Publish Release & Update Links
 
@@ -1683,17 +1975,24 @@ jobs:
           TAG="${{ env.RELEASE_TAG }}"
           REPO="${{ github.repository }}"
 
-          EXPECTED_ASSETS=(
-            "OpenDraft_${VERSION}_aarch64.dmg"
-            "OpenDraft_${VERSION}_x64-setup.exe"
-            "OpenDraft_${VERSION}_x64_en-US.msi"
-            "OpenDraft_${VERSION}_amd64.deb"
-            "OpenDraft_${VERSION}_amd64.AppImage"
-            "OpenDraft_${VERSION}_android.apk"
-            "OpenDraft_${VERSION}_ios.ipa"
-            "OpenDraft_${VERSION}_x64.dmg"
-            "OpenDraft_${VERSION}_x86_64-legacy.dmg"
-          )
+          # Only what the plan built. A platform left out keeps advertising the
+          # previous version's files, which release.sh carries into this release.
+          EXPECTED_ASSETS=()
+          if [ "${{ needs.plan.outputs.macos }}" = "true" ]; then
+            EXPECTED_ASSETS+=("OpenDraft_${VERSION}_aarch64.dmg" "OpenDraft_${VERSION}_x64.dmg" "OpenDraft_${VERSION}_x86_64-legacy.dmg")
+          fi
+          if [ "${{ needs.plan.outputs.windows }}" = "true" ]; then
+            EXPECTED_ASSETS+=("OpenDraft_${VERSION}_x64-setup.exe" "OpenDraft_${VERSION}_x64_en-US.msi")
+          fi
+          if [ "${{ needs.plan.outputs.linux }}" = "true" ]; then
+            EXPECTED_ASSETS+=("OpenDraft_${VERSION}_amd64.deb" "OpenDraft_${VERSION}_amd64.AppImage")
+          fi
+          if [ "${{ needs.plan.outputs.android }}" = "true" ]; then
+            EXPECTED_ASSETS+=("OpenDraft_${VERSION}_android.apk")
+          fi
+          if [ "${{ needs.plan.outputs.ios }}" = "true" ]; then
+            EXPECTED_ASSETS+=("OpenDraft_${VERSION}_ios.ipa")
+          fi
 
           echo "Checking release assets for ${TAG}..."
           ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')
@@ -1723,6 +2022,25 @@ jobs:
             --repo "${{ github.repository }}" \
             --draft=false
           echo "Release ${{ env.RELEASE_TAG }} published"
+
+      # The update notice's store channels cannot move yet: Apple and Google
+      # are still reviewing, so their listings still offer the old build and a
+      # manifest naming the new one would send people to a page with nothing
+      # new on it. Hand that to the store watch, which asks the stores until
+      # they are actually serving it and then switches itself off. Enabling is
+      # separate from dispatching because a disabled workflow ignores every
+      # trigger, including this one.
+      # Armed even when no store build shipped: it is also what copies the
+      # download channels onto the manifest branch the app reads, and it
+      # times each channel against the release that last shipped it, so a
+      # store left out of this release does not keep it waiting.
+      - name: Start the store watch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow enable  store-watch.yml --repo "${{ github.repository }}" || true
+          gh workflow run     store-watch.yml --repo "${{ github.repository }}" || true
+          echo "Store watch armed — it will move the store channels as each store goes live."
 
       # Download links are updated in the version bump commit (release.sh)
       # before the tag is pushed, so they're already on main by this point.

@@ -1,9 +1,17 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { ELEMENT_LABELS, type ElementType } from '../stores/editorStore';
-import { ELEMENT_DESCRIPTIONS } from '../stores/formattingTypes';
+import { ELEMENT_DESCRIPTIONS, AV_BLOCK_RULE_ID } from '../stores/formattingTypes';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
+import { AV_SCRIPT_TEMPLATE } from '../stores/templates/avScriptTemplate';
 
 // Context-aware element ordering: most likely choices first per current type
+// The two non-printing elements sit at the end of every list: they are
+// structure, not script, so they should never be the first thing offered.
+// AV Columns joins them there: it inserts a two-column body rather than
+// restyling the line, so it is never the answer to "what comes next?" either.
+const OUTLINE_TYPES: ElementType[] = ['section', 'note'];
+const TAIL_TYPES: ElementType[] = [...OUTLINE_TYPES, AV_BLOCK_RULE_ID];
+
 const ELEMENT_ORDER: Record<string, ElementType[]> = {
   sceneHeading: ['action', 'character', 'general', 'transition', 'shot', 'sceneHeading', 'dialogue', 'parenthetical', 'newAct', 'endOfAct', 'lyrics', 'showEpisode', 'castList'],
   action:       ['action', 'character', 'dialogue', 'general', 'sceneHeading', 'transition', 'shot', 'parenthetical', 'newAct', 'endOfAct', 'lyrics', 'showEpisode', 'castList'],
@@ -18,11 +26,17 @@ const ELEMENT_ORDER: Record<string, ElementType[]> = {
   lyrics:       ['lyrics', 'dialogue', 'action', 'character', 'general', 'sceneHeading', 'parenthetical', 'transition', 'shot', 'newAct', 'endOfAct', 'showEpisode', 'castList'],
   showEpisode:  ['action', 'sceneHeading', 'showEpisode', 'general', 'character', 'dialogue', 'parenthetical', 'transition', 'shot', 'newAct', 'endOfAct', 'lyrics', 'castList'],
   castList:     ['castList', 'action', 'character', 'general', 'sceneHeading', 'dialogue', 'parenthetical', 'transition', 'shot', 'newAct', 'endOfAct', 'lyrics', 'showEpisode'],
+  section:      ['action', 'sceneHeading', 'section', 'general', 'character', 'dialogue', 'parenthetical', 'transition', 'shot', 'newAct', 'endOfAct', 'lyrics', 'showEpisode', 'castList'],
+  note:         ['action', 'note', 'sceneHeading', 'general', 'character', 'dialogue', 'parenthetical', 'transition', 'shot', 'newAct', 'endOfAct', 'lyrics', 'showEpisode', 'castList'],
 };
+for (const [type, order] of Object.entries(ELEMENT_ORDER)) {
+  ELEMENT_ORDER[type] = [...order, ...TAIL_TYPES.filter((t) => !order.includes(t))];
+}
 
 const DEFAULT_ORDER: ElementType[] = [
   'action', 'character', 'dialogue', 'general', 'sceneHeading', 'parenthetical',
   'transition', 'shot', 'newAct', 'endOfAct', 'lyrics', 'showEpisode', 'castList',
+  ...TAIL_TYPES,
 ];
 
 interface ElementPickerProps {
@@ -31,11 +45,25 @@ interface ElementPickerProps {
   /** When provided, overrides the template-derived element list (used inside AV cells). */
   availableTypes?: ElementType[];
   onSelect: (type: ElementType) => void;
+  /**
+   * "Never mind the type — just give me another blank line." (issue #100)
+   * Absent when the menu was opened on a line that already has text, where a
+   * blank line is not what any of these rows could mean: Enter then accepts
+   * the highlighted row straight away, as an ordinary menu does.
+   */
+  onInsertBlankLine?: () => void;
+  /**
+   * "Start the next AV row." Present only when the menu opened inside an AV
+   * cell, where the list above offers the cell's paragraph types but says
+   * nothing about rows — the gap issue #116 reported. Enter and Tab still do
+   * this on a hardware keyboard; on an iPhone or iPad this row is the way.
+   */
+  onInsertAvRow?: () => void;
   onDismiss: () => void;
 }
 
 const ElementPicker: React.FC<ElementPickerProps> = ({
-  position, defaultType, availableTypes, onSelect, onDismiss,
+  position, defaultType, availableTypes, onSelect, onInsertBlankLine, onInsertAvRow, onDismiss,
 }) => {
   const activeTemplate = useFormattingTemplateStore((s) => s.getActiveTemplate());
   const orderedTypes = useMemo<ElementType[]>(
@@ -52,11 +80,27 @@ const ElementPicker: React.FC<ElementPickerProps> = ({
   );
 
   // Resolve a display label: built-in label first, then template-rule label,
-  // finally the raw id. Custom-element ids (avShot, sceneCharacters, etc.) only
-  // have labels in the template rules.
+  // then the AV template's, and only then the raw id. Custom-element ids
+  // (avShot, sceneCharacters, etc.) only have labels in template rules — and
+  // the AV paragraph types have them ONLY in the AV template, so an AV body
+  // inside a screenplay listed four rows reading "avPara", "avShot",
+  // "avDirection", "avGraphic". `Insert AV Columns` works in any script, so
+  // that was the ordinary case, not an exotic one.
   const labelFor = (type: ElementType): string =>
-    ELEMENT_LABELS[type] || activeTemplate.rules[type]?.label || String(type);
+    ELEMENT_LABELS[type]
+    || activeTemplate.rules[type]?.label
+    || AV_SCRIPT_TEMPLATE.rules[type]?.label
+    || String(type);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  // Enter opened this menu, so Enter cannot also mean "accept the highlighted
+  // row" — that left the writer no keystroke for "just another blank line"
+  // (issue #100). Until an arrow key or the pointer picks a row, Enter still
+  // means what it means everywhere else: insert a line.
+  const [hasNavigated, setHasNavigated] = useState(!onInsertBlankLine);
+  // Pointer hover is highlight only, never navigation: on iPad an Apple Pencil
+  // hovering over the menu raises mouseenter without the writer choosing
+  // anything, and that must not quietly turn Enter back into "accept".
+  const [hoverIndex, setHoverIndex] = useState(-1);
   const menuRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -91,17 +135,22 @@ const ElementPicker: React.FC<ElementPickerProps> = ({
       case 'ArrowDown':
         e.preventDefault();
         e.stopPropagation();
-        setSelectedIndex(i => Math.min(i + 1, orderedTypes.length - 1));
+        setHasNavigated(true);
+        setHoverIndex(-1);
+        setSelectedIndex(i => (hasNavigated ? Math.min(i + 1, orderedTypes.length - 1) : i));
         break;
       case 'ArrowUp':
         e.preventDefault();
         e.stopPropagation();
-        setSelectedIndex(i => Math.max(i - 1, 0));
+        setHasNavigated(true);
+        setHoverIndex(-1);
+        setSelectedIndex(i => (hasNavigated ? Math.max(i - 1, 0) : i));
         break;
       case 'Enter':
         e.preventDefault();
         e.stopPropagation();
-        onSelect(orderedTypes[selectedIndex]);
+        if (hasNavigated || !onInsertBlankLine) onSelect(orderedTypes[selectedIndex]);
+        else onInsertBlankLine();
         break;
       case 'Escape':
         e.preventDefault();
@@ -113,7 +162,7 @@ const ElementPicker: React.FC<ElementPickerProps> = ({
         onDismiss();
         break;
     }
-  }, [selectedIndex, orderedTypes, onSelect, onDismiss]);
+  }, [selectedIndex, hasNavigated, orderedTypes, onSelect, onInsertBlankLine, onDismiss]);
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyDown, true);
@@ -138,18 +187,51 @@ const ElementPicker: React.FC<ElementPickerProps> = ({
       style={{ top: adjustedPos.top, left: adjustedPos.left }}
     >
       <div className="element-picker-header">Element Type</div>
-      {orderedTypes.map((type, i) => (
+      {orderedTypes.map((type, i) => {
+        // The menu only opens on a blank line, so the row the line is already
+        // on cannot mean "convert" — it means one more line of this element.
+        // Say so, rather than leaving it to be discovered (issue #100).
+        const hint = [
+          type === defaultType && onInsertBlankLine ? 'blank line' : '',
+          hasNavigated && i === selectedIndex ? '\u23CE' : '',
+        ].filter(Boolean).join(' ');
+        return (
         <div
           key={type}
           ref={el => { itemRefs.current[i] = el; }}
-          className={`element-picker-item${i === selectedIndex ? ' selected' : ''}`}
+          className={`element-picker-item${(hasNavigated && i === selectedIndex) || i === hoverIndex ? ' selected' : ''}`}
           onMouseDown={(e) => { e.preventDefault(); onSelect(type); }}
-          onMouseEnter={() => setSelectedIndex(i)}
+          onMouseEnter={() => setHoverIndex(i)}
+          onMouseLeave={() => setHoverIndex(h => (h === i ? -1 : h))}
           title={ELEMENT_DESCRIPTIONS[type]}
         >
           <span className="element-picker-label">{labelFor(type)}</span>
+          {/* Always rendered, even empty: the hint column is reserved width, so
+              a hint appearing or moving between rows never resizes the menu. */}
+          <span className="element-picker-hint">{hint}</span>
         </div>
-      ))}
+        );
+      })}
+      {onInsertBlankLine && (
+        <div
+          className="element-picker-blank"
+          onMouseDown={(e) => { e.preventDefault(); onInsertBlankLine(); }}
+          title="Add another blank line instead of changing the element type"
+        >
+          <span className="element-picker-label">Blank Line</span>
+          <span className="element-picker-hint">{hasNavigated ? '' : '\u23CE'}</span>
+        </div>
+      )}
+      {onInsertAvRow && (
+        <div
+          className="element-picker-blank"
+          onMouseDown={(e) => { e.preventDefault(); onInsertAvRow(); }}
+          title="Start a new AV row instead of changing the element type"
+        >
+          <span className="element-picker-label">New AV Row</span>
+          <span className="element-picker-hint" />
+        </div>
+      )}
     </div>
   );
 };

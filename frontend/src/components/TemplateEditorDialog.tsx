@@ -12,10 +12,53 @@ import {
   FaAlignLeft, FaAlignCenter, FaAlignRight, FaAlignJustify,
   FaPlus, FaTrash,
 } from 'react-icons/fa';
-import type { FormattingTemplate, FormattingElementRule } from '../stores/formattingTypes';
-import { createDefaultRule } from '../stores/formattingTypes';
-import { FONT_CATEGORIES, getFontsByCategory } from '../utils/fonts';
-import type { FontEntry } from '../utils/fonts';
+import type { FormattingTemplate, FormattingElementRule, ElementNumbering } from '../stores/formattingTypes';
+import { isNumberableElementId, resetElementIds } from '../utils/elementNumbers';
+import { createDefaultRule, AV_BLOCK_RULE_ID, type AvCellPlacement } from '../stores/formattingTypes';
+import { avPlacementOf } from '../utils/avCellElements';
+import { AV_BASE_CELL_ELEMENT_IDS, AV_SCREENPLAY_CELL_ELEMENT_IDS } from '../editor/extensions/AvBlock';
+import Select from './Select';
+
+/** The four AV paragraph types: always offered in both columns, so the control
+ *  shows what they are rather than pretending it is a choice. */
+const AV_BASE_IDS = new Set<string>(AV_BASE_CELL_ELEMENT_IDS);
+
+/** Elements that CAN be placed in an AV column. A template's own custom
+ *  elements ride in on `customElement`, so they qualify too; the document-level
+ *  furniture an `avCell` will not hold (act breaks, cast lists, the title page)
+ *  does not, and gets no control. */
+function avPlaceable(rule: { id: string; isBuiltIn: boolean }): boolean {
+  if (AV_BASE_IDS.has(rule.id)) return true;
+  if (!rule.isBuiltIn) return true;
+  return (AV_SCREENPLAY_CELL_ELEMENT_IDS as readonly string[]).includes(rule.id);
+}
+import FontPicker from './FontPicker';
+
+/** Rules whose numbering no longer names an element the template has lost. */
+function withoutStaleResets(rules: Record<string, FormattingElementRule>): Record<string, FormattingElementRule> {
+  const out: Record<string, FormattingElementRule> = {};
+  for (const [id, rule] of Object.entries(rules)) {
+    const n = rule.numbering;
+    out[id] = n && n.resetOn.some((r) => !rules[r])
+      ? { ...rule, numbering: { ...n, resetOn: n.resetOn.filter((r) => rules[r]) } }
+      : rule;
+  }
+  return out;
+}
+
+/** "SFX 1, SFX 2, SFX 3 … starting again at every Scene Heading." */
+function numberingSummary(n: ElementNumbering, rules: Record<string, FormattingElementRule>): string {
+  const start = n.startAt ?? 1;
+  const sample = [start, start + 1, start + 2]
+    .map((k) => `${n.prefix ?? ''}${n.style === 'scene' ? `12.${k}` : k}`)
+    .join(', ');
+  const resets = n.resetOn.filter((id) => rules[id]).map((id) => rules[id].label);
+  const when = resets.length === 0
+    ? 'counting through the whole script.'
+    : `starting again at every ${resets.join(' or ')}.`;
+  const scene = n.style === 'scene' ? ' Plain numbers where there is no scene number to show.' : '';
+  return `${sample} … ${when}${scene}`;
+}
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 48, 60, 72, 96];
 
@@ -93,16 +136,27 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
       name,
       description,
       mode,
-      rules,
+      rules: withoutStaleResets(rules),
       // Only keep break rules for elements that still exist in the template.
       forceBreakBefore: forceBreakBefore.filter((id) => rules[id]),
       updatedAt: new Date().toISOString(),
     });
   };
 
+  const numbering: ElementNumbering | undefined = selectedRule?.numbering;
+  const updateNumbering = (updates: Partial<ElementNumbering>) => {
+    if (!selectedId) return;
+    const base: ElementNumbering = numbering ?? { enabled: false, resetOn: [] };
+    updateRule(selectedId, { numbering: { ...base, ...updates } });
+  };
+  const toggleReset = (id: string, on: boolean) => {
+    const current = numbering?.resetOn ?? [];
+    updateNumbering({ resetOn: on ? (current.includes(id) ? current : [...current, id]) : current.filter((x) => x !== id) });
+  };
+
   // Build element options for dropdowns (for nextOnEnter/nextOnTab)
   const elementOptions = Object.values(rules)
-    .filter((r) => r.enabled)
+    .filter((r) => r.enabled && r.id !== AV_BLOCK_RULE_ID)
     .map((r) => ({ id: r.id, label: r.label }));
 
   return (
@@ -208,7 +262,28 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
 
           {/* Right: element detail */}
           <div className="template-editor-detail">
-            {selectedRule ? (
+            {selectedRule && selectedRule.id === AV_BLOCK_RULE_ID ? (
+              /* An AV body is a table, not a paragraph: the formatting lives on
+                 the elements inside its cells, which are edited on their own
+                 rows in this list. The only decision here is the tick box
+                 beside it — whether the element menu offers it at all. */
+              <div className="template-editor-empty">
+                <p><strong>{selectedRule.label}</strong></p>
+                <p>
+                  Inserts a two-column Audio/Video body &mdash; Video on the left,
+                  Audio on the right, one row per shot.
+                </p>
+                <p>
+                  It has no formatting of its own. Style the elements that go in
+                  its columns instead, and use <em>In AV columns</em> on each of
+                  them to say which column offers it.
+                </p>
+                <p>
+                  Untick it in the list to keep it out of the element menu; the
+                  Format menu&rsquo;s own AV commands are unaffected.
+                </p>
+              </div>
+            ) : selectedRule ? (
               <>
                 {/* Label */}
                 <div className="template-editor-field">
@@ -226,28 +301,16 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                 <div className="template-editor-field-row">
                   <div className="template-editor-field">
                     <label>Font Family</label>
-                    <select
+                    <FontPicker
                       className="dialog-input"
+                      emptyLabel="Default"
                       value={selectedRule.fontFamily || ''}
-                      onChange={(e) => updateRule(selectedId!, { fontFamily: e.target.value || null })}
-                    >
-                      <option value="">Default</option>
-                      {FONT_CATEGORIES.map((category) => {
-                        const fonts = getFontsByCategory()[category];
-                        if (!fonts || fonts.length === 0) return null;
-                        return (
-                          <optgroup key={category} label={category}>
-                            {fonts.map((font: FontEntry) => (
-                              <option key={font.name} value={font.name}>{font.name}</option>
-                            ))}
-                          </optgroup>
-                        );
-                      })}
-                    </select>
+                      onChange={(name) => updateRule(selectedId!, { fontFamily: name || null })}
+                    />
                   </div>
                   <div className="template-editor-field">
                     <label>Font Size</label>
-                    <select
+                    <Select
                       className="dialog-input"
                       value={selectedRule.fontSize ?? ''}
                       onChange={(e) => updateRule(selectedId!, { fontSize: e.target.value ? Number(e.target.value) : null })}
@@ -256,7 +319,7 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                       {FONT_SIZES.map((s) => (
                         <option key={s} value={s}>{s}pt</option>
                       ))}
-                    </select>
+                    </Select>
                   </div>
                 </div>
 
@@ -290,7 +353,7 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                 {/* Text transform */}
                 <div className="template-editor-field">
                   <label>Text Transform</label>
-                  <select
+                  <Select
                     className="dialog-input"
                     value={selectedRule.textTransform}
                     onChange={(e) => updateRule(selectedId!, { textTransform: e.target.value as any })}
@@ -298,7 +361,7 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                     <option value="none">None</option>
                     <option value="uppercase">Uppercase</option>
                     <option value="lowercase">Lowercase</option>
-                  </select>
+                  </Select>
                 </div>
 
                 {/* Alignment */}
@@ -422,7 +485,7 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                 <div className="template-editor-field-row">
                   <div className="template-editor-field">
                     <label>Next on Enter</label>
-                    <select
+                    <Select
                       className="dialog-input"
                       value={selectedRule.nextOnEnter}
                       onChange={(e) => updateRule(selectedId!, { nextOnEnter: e.target.value })}
@@ -430,11 +493,11 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                       {elementOptions.map((opt) => (
                         <option key={opt.id} value={opt.id}>{opt.label}</option>
                       ))}
-                    </select>
+                    </Select>
                   </div>
                   <div className="template-editor-field">
                     <label>Next on Tab</label>
-                    <select
+                    <Select
                       className="dialog-input"
                       value={selectedRule.nextOnTab || ''}
                       onChange={(e) => updateRule(selectedId!, { nextOnTab: e.target.value || null })}
@@ -443,9 +506,33 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                       {elementOptions.map((opt) => (
                         <option key={opt.id} value={opt.id}>{opt.label}</option>
                       ))}
-                    </select>
+                    </Select>
                   </div>
                 </div>
+
+                {/* AV placement — which column of a two-column AV body offers
+                    this element. The schema accepts every one of them in either
+                    cell; this is what the writer is OFFERED, and it is the whole
+                    of the "what may an AV script contain" decision. */}
+                {avPlaceable(selectedRule) && (
+                  <div className="template-editor-field">
+                    <label>In AV columns</label>
+                    <Select
+                      className="dialog-input"
+                      value={avPlacementOf(selectedRule)}
+                      disabled={AV_BASE_IDS.has(selectedRule.id)}
+                      title={AV_BASE_IDS.has(selectedRule.id)
+                        ? 'The four AV paragraph types are offered in both columns in every document — only their formatting is a template choice.'
+                        : 'Which column of a two-column AV body offers this element.'}
+                      onChange={(e) => updateRule(selectedId!, { avCell: e.target.value as AvCellPlacement })}
+                    >
+                      <option value="none">Not offered</option>
+                      <option value="video">Video column</option>
+                      <option value="audio">Audio column</option>
+                      <option value="both">Both columns</option>
+                    </Select>
+                  </div>
+                )}
 
                 {/* Placeholder */}
                 <div className="template-editor-field">
@@ -474,6 +561,79 @@ const TemplateEditorDialog: React.FC<TemplateEditorDialogProps> = ({
                       : 'This element flows with the rest of the page.'}
                   </span>
                 </div>
+
+                {/* Numbering — running numbers beside this element (utils/elementNumbers). */}
+                {isNumberableElementId(selectedRule.id) && (
+                  <div className="template-editor-field">
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={numbering?.enabled === true}
+                        onChange={(e) => updateNumbering({ enabled: e.target.checked })}
+                      />
+                      Number this element
+                    </label>
+                    {numbering?.enabled ? (
+                      <>
+                        <div className="template-editor-field-row">
+                          <div className="template-editor-field">
+                            <label>Prefix</label>
+                            <input
+                              className="dialog-input"
+                              value={numbering.prefix ?? ''}
+                              maxLength={12}
+                              placeholder="None"
+                              onChange={(e) => updateNumbering({ prefix: e.target.value })}
+                            />
+                          </div>
+                          <div className="template-editor-field">
+                            <label>Start at</label>
+                            <input
+                              className="dialog-input"
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={numbering.startAt ?? 1}
+                              onChange={(e) => {
+                                const n = Number.parseInt(e.target.value, 10);
+                                updateNumbering({ startAt: Number.isFinite(n) && n >= 0 ? n : 1 });
+                              }}
+                            />
+                          </div>
+                          <div className="template-editor-field">
+                            <label>Style</label>
+                            <Select
+                              className="dialog-input"
+                              value={numbering.style ?? 'plain'}
+                              onChange={(e) => updateNumbering({ style: e.target.value as 'plain' | 'scene' })}
+                            >
+                              <option value="plain">Plain (3)</option>
+                              <option value="scene">With scene number (12.3)</option>
+                            </Select>
+                          </div>
+                        </div>
+                        <label>Restart numbering at</label>
+                        <div className="template-editor-reset-list">
+                          {resetElementIds(rules).filter((id) => id !== selectedRule.id).map((id) => (
+                            <label key={id} style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                              <input
+                                type="checkbox"
+                                checked={(numbering.resetOn ?? []).includes(id)}
+                                onChange={(e) => toggleReset(id, e.target.checked)}
+                              />
+                              {rules[id].label}
+                            </label>
+                          ))}
+                        </div>
+                        <span className="template-editor-hint">{numberingSummary(numbering, rules)}</span>
+                      </>
+                    ) : (
+                      <span className="template-editor-hint">
+                        Numbers every “{selectedRule.label}” in the margin, on screen and in PDF, Word and Final Draft exports.
+                      </span>
+                    )}
+                  </div>
+                )}
 
                 {/* Format override */}
                 {mode === 'enforce' && (

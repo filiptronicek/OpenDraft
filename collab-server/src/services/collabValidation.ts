@@ -1,6 +1,6 @@
 import { getDB } from '../db';
 import type { CollabSessionRow } from '../db';
-import { config } from '../config';
+import { inviteTokenDigest } from './connectionIdentity';
 
 export interface CollabSession {
   token: string;
@@ -14,17 +14,69 @@ export interface CollabSession {
   expires_at?: string;
 }
 
+type RoomIdentity = Pick<CollabSession, 'project_id' | 'script_id' | 'session_nonce'>;
+
+export interface CanonicalRoom {
+  projectId: string;
+  scriptId: string;
+  sessionNonce: string;
+}
+
+function isSafeRoomSegment(value: unknown, maxLength = 128): value is string {
+  if (
+    typeof value !== 'string'
+    || value.length < 1
+    || value.length > maxLength
+    || value !== value.trim()
+  ) {
+    return false;
+  }
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if (char === '/' || char === '\\' || code < 32 || code === 127) return false;
+  }
+  return true;
+}
+
+/** Return the one and only Yjs room name represented by an invite. */
+export function canonicalDocumentName(session: RoomIdentity): string | null {
+  if (!isSafeRoomSegment(session.project_id) || !isSafeRoomSegment(session.script_id)) {
+    return null;
+  }
+  const nonce = session.session_nonce || '';
+  if (nonce && !isSafeRoomSegment(nonce, 128)) return null;
+  return nonce
+    ? `${session.project_id}/${session.script_id}/${nonce}`
+    : `${session.project_id}/${session.script_id}`;
+}
+
+export function isSessionBoundToDocument(
+  session: RoomIdentity,
+  documentName: string,
+): boolean {
+  return canonicalDocumentName(session) === documentName;
+}
+
+export function parseCanonicalDocumentName(documentName: string): CanonicalRoom | null {
+  const parts = documentName.split('/');
+  if (parts.length !== 2 && parts.length !== 3) return null;
+  const room = { projectId: parts[0], scriptId: parts[1], sessionNonce: parts[2] || '' };
+  const canonical = canonicalDocumentName({
+    project_id: room.projectId,
+    script_id: room.scriptId,
+    session_nonce: room.sessionNonce,
+  });
+  return canonical === documentName ? room : null;
+}
+
 /**
  * Validate an invite token.
- *
- * Checks the collab server's own database first (for invites created by
- * desktop/mobile Tauri clients). Falls back to the Python backend for
- * invites created via the web app.
+ * The collab database is the sole invite authority.
  */
 export async function validateInviteToken(token: string): Promise<CollabSession | null> {
-  const preview = token.slice(0, 8) + '...';
+  const tokenId = inviteTokenDigest(token).slice(0, 12);
 
-  // 1. Check our own database first
+  // Check the authoritative collaboration database.
   try {
     const db = getDB();
     const session = await db.get<CollabSessionRow>(
@@ -32,7 +84,7 @@ export async function validateInviteToken(token: string): Promise<CollabSession 
       [token],
     );
     if (session && new Date(session.expires_at) > new Date()) {
-      console.log(`[validateToken] ${preview} → found in collab-server DB`);
+      console.log(`[validateToken] ${tokenId} → found in collab-server DB`);
       return {
         token: session.token,
         project_id: session.project_id,
@@ -45,23 +97,9 @@ export async function validateInviteToken(token: string): Promise<CollabSession 
         expires_at: session.expires_at,
       };
     }
-    console.log(`[validateToken] ${preview} → not in collab-server DB, trying Python backends`);
+    console.log(`[validateToken] ${tokenId} → not found in collab-server DB`);
   } catch (err) {
-    console.log(`[validateToken] ${preview} → DB query failed:`, err);
+    console.log(`[validateToken] ${tokenId} → DB query failed:`, err);
   }
-
-  // 2. Fall back to configured backend URLs (Python web backend)
-  for (const url of config.backendUrls) {
-    const backendUrl = `${url}/collab/session/${token}`;
-    console.log(`[validateToken] ${preview} → trying ${url}`);
-    try {
-      const res = await fetch(backendUrl);
-      console.log(`[validateToken] ${preview} → ${url} responded ${res.status}`);
-      if (res.ok) return await res.json() as CollabSession;
-    } catch (err) {
-      console.log(`[validateToken] ${preview} → ${url} unreachable:`, (err as Error).message);
-    }
-  }
-  console.log(`[validateToken] ${preview} → not found in any backend`);
   return null;
 }

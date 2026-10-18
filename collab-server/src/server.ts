@@ -3,16 +3,18 @@ import type {
   onAuthenticatePayload,
   onConnectPayload,
   onDisconnectPayload,
+  connectedPayload,
+  beforeHandleMessagePayload,
   onLoadDocumentPayload,
   onStoreDocumentPayload,
   onChangePayload,
 } from '@hocuspocus/server';
 import * as fs from 'fs';
-import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
 import * as Y from 'yjs';
 import express from 'express';
+import { z } from 'zod';
 import helmet from 'helmet';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
@@ -25,6 +27,13 @@ import * as auditService from './services/auditService';
 import authRoutes from './routes/auth';
 import collabRoutes from './routes/collab';
 import { standardLimiter } from './middleware/rateLimit';
+import { requireVerifiedAuth } from './middleware/auth';
+import { documentPath } from './services/documentPath';
+import { closeAndAwaitDocumentUnload } from './services/documentLifecycle';
+import { compileTrustedProxy, resolveClientIp } from './services/clientIp';
+import { connectionLimitKey, inviteTokenDigest } from './services/connectionIdentity';
+import { inviteConnections } from './services/inviteConnectionRegistry';
+import { applyCollaborationRole } from './services/collaborationAccess';
 
 // ── Data directory for Yjs documents ──
 const DATA_DIR = config.dataDir;
@@ -33,20 +42,18 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 function docPath(documentName: string): string {
-  const safeName = documentName.replace(/[/\\]/g, '--');
-  const basename = path.basename(safeName);
-  const resolved = path.resolve(DATA_DIR, `${basename}.yjs`);
-  if (!resolved.startsWith(path.resolve(DATA_DIR) + path.sep)) {
-    throw new Error('Invalid document name');
-  }
-  return resolved;
+  return documentPath(DATA_DIR, documentName);
 }
 
 // ── Invite token validation ──
 // Extracted to services/collabValidation.ts to avoid circular imports
 // (routes/collab.ts also needs it).
 
-import { validateInviteToken } from './services/collabValidation';
+import {
+  isSessionBoundToDocument,
+  parseCanonicalDocumentName,
+  validateInviteToken,
+} from './services/collabValidation';
 import type { CollabSession } from './services/collabValidation';
 export { validateInviteToken, type CollabSession };
 
@@ -73,6 +80,9 @@ function decrementCounter(map: Map<string, number>, key: string): void {
 // ── Document activity tracking for eviction ──
 
 const docLastActivity = new Map<string, number>();
+const unavailableDocuments = new Set<string>();
+const resettingDocuments = new Set<string>();
+const trustedProxy = compileTrustedProxy(config.trustedProxyIps);
 
 function touchDocument(documentName: string): void {
   docLastActivity.set(documentName, Date.now());
@@ -112,6 +122,9 @@ const hocuspocus = new Hocuspocus({
     if (!rawToken) {
       throw new Error('No authentication token provided');
     }
+    if (unavailableDocuments.has(data.documentName)) {
+      throw new Error('Document is temporarily unavailable');
+    }
 
     let userId: string | null = null;
     let userEmail: string | null = null;
@@ -149,15 +162,31 @@ const hocuspocus = new Hocuspocus({
       throw new Error('No invite token provided');
     }
 
+    const inviteDigest = inviteTokenDigest(inviteToken);
+
     // Validate invite token against backend
     const session = await validateInviteToken(inviteToken);
     if (!session) {
-      console.error(`[onAuthenticate] Invalid or expired invite token: ${inviteToken.slice(0, 12)}... for doc: ${data.documentName}`);
+      console.error(`[onAuthenticate] Invalid or expired invite ${inviteDigest.slice(0, 12)} for doc: ${data.documentName}`);
       throw new Error('Invalid or expired invite token');
     }
+    if (!isSessionBoundToDocument(session, data.documentName)) {
+      console.error(`[onAuthenticate] Invite is not valid for document: ${data.documentName}`);
+      throw new Error('Invite is not valid for this document');
+    }
+    if (inviteConnections.isRevoked(inviteDigest)) {
+      throw new Error('Invite was revoked during authentication');
+    }
+    if (unavailableDocuments.has(data.documentName)) {
+      throw new Error('Document is temporarily unavailable');
+    }
+
+    // Hocuspocus rejects document updates at the protocol boundary when this
+    // flag is set. UI editable=false is not an authorization control.
+    applyCollaborationRole(data.connectionConfig, session.role);
 
     // Per-user connection limit check
-    const userKey = userId || session.collaborator_name;
+    const userKey = connectionLimitKey(userId, inviteToken);
     if (config.wsMaxConnectionsPerUser > 0) {
       const userCount = connectionsPerUser.get(userKey) || 0;
       if (userCount >= config.wsMaxConnectionsPerUser) {
@@ -176,6 +205,8 @@ const hocuspocus = new Hocuspocus({
       scriptId: session.script_id,
       role: session.role || 'editor',
       _connKey: userKey, // internal: for tracking disconnections
+      _inviteDigest: inviteDigest,
+      _inviteExpiresAt: session.expires_at,
     };
 
     await auditService.logEvent('connect', userId, data.documentName, {
@@ -190,7 +221,20 @@ const hocuspocus = new Hocuspocus({
     touchDocument(data.documentName);
   },
 
+  async connected(data: connectedPayload) {
+    const user = data.context?.user;
+    if (user?._inviteDigest) {
+      inviteConnections.register(
+        data.socketId,
+        data.connection,
+        user._inviteDigest,
+        user._inviteExpiresAt,
+      );
+    }
+  },
+
   async onDisconnect(data: onDisconnectPayload) {
+    inviteConnections.unregister(data.socketId);
     const user = data.context?.user;
     console.log(`Client disconnected from document: ${data.documentName} (${user?.name || 'unknown'})`);
 
@@ -204,6 +248,13 @@ const hocuspocus = new Hocuspocus({
     });
   },
 
+  async beforeHandleMessage(data: beforeHandleMessagePayload) {
+    const inviteDigest = data.context?.user?._inviteDigest;
+    if (inviteDigest && inviteConnections.isRevoked(inviteDigest)) {
+      throw { code: 4403, reason: 'Invite revoked or expired' };
+    }
+  },
+
   async onChange(data: onChangePayload) {
     // Viewers may trigger onChange during initial Yjs sync (the Collaboration
     // extension seeds the fragment even with editable:false).  Silently ignore
@@ -215,6 +266,13 @@ const hocuspocus = new Hocuspocus({
   },
 
   async onLoadDocument(data: onLoadDocumentPayload) {
+    const inviteDigest = data.context?.user?._inviteDigest;
+    if (inviteDigest && inviteConnections.isRevoked(inviteDigest)) {
+      throw new Error('Invite revoked or expired');
+    }
+    if (unavailableDocuments.has(data.documentName)) {
+      throw new Error('Document is temporarily unavailable');
+    }
     const filePath = docPath(data.documentName);
 
     if (fs.existsSync(filePath)) {
@@ -236,6 +294,11 @@ const hocuspocus = new Hocuspocus({
   },
 
   async onStoreDocument(data: onStoreDocumentPayload) {
+    // Reset deliberately discards this room. Suppress the final close-triggered
+    // store, then wait for the store lifecycle to settle before unlinking.
+    if (resettingDocuments.has(data.documentName)) {
+      return;
+    }
     const filePath = docPath(data.documentName);
 
     try {
@@ -254,16 +317,9 @@ const hocuspocus = new Hocuspocus({
 
 const app = express();
 
-// Trust proxy headers. In production (Cloud Run / load balancer) we trust
-// every hop; in development the Python backend proxies /auth/* to us from
-// the loopback interface, so we trust only loopback there. Without this,
-// express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR whenever the
-// backend forwards X-Forwarded-For.
-if (process.env.NODE_ENV === 'production') {
-  app.set('trust proxy', true);
-} else {
-  app.set('trust proxy', 'loopback');
-}
+// HTTP and WebSocket paths share the same explicit proxy trust boundary.
+// Never trust X-Forwarded-For merely because NODE_ENV is production.
+app.set('trust proxy', trustedProxy);
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
@@ -299,7 +355,11 @@ app.use(express.json());
 
 // Request logger — logs all incoming HTTP requests
 app.use((req, _res, next) => {
-  console.log(`[http] ${req.method} ${req.path} from ${req.ip} origin=${req.headers.origin || 'none'}`);
+  const safePath = req.path.replace(
+    /^\/api\/collab\/session\/[^/]+$/,
+    '/api/collab/session/[REDACTED]',
+  );
+  console.log(`[http] ${req.method} ${safePath} from ${req.ip} origin=${req.headers.origin || 'none'}`);
   next();
 });
 
@@ -339,65 +399,116 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Reset a document's persisted Yjs state (called by host before starting a new collab session)
-app.post('/api/reset-document', async (req, res) => {
-  const { documentName, token } = req.body;
-  if (!documentName || !token) {
-    res.status(400).json({ error: 'documentName and token are required' });
-    return;
-  }
-
-  // Validate the invite token to ensure the caller is authorized
-  const session = await validateInviteToken(token);
-  if (!session) {
-    res.status(403).json({ error: 'Invalid or expired token' });
-    return;
-  }
-
-  // If the document is still in Hocuspocus memory, close connections to force unload.
-  // This triggers onStoreDocument (which re-writes the file), so we must delete the file AFTER.
-  const doc = hocuspocus.documents?.get(documentName);
-  if (doc) {
-    hocuspocus.closeConnections(documentName);
-    // Brief wait for cleanup to complete
-    await new Promise((r) => setTimeout(r, 100));
-    console.log(`Document reset (connections closed): ${documentName}`);
-  }
-
-  // Delete the persisted .yjs file so the next connection starts fresh
-  const filePath = docPath(documentName);
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-    console.log(`Document reset (file deleted): ${documentName}`);
-  }
-
-  docLastActivity.delete(documentName);
-  res.json({ status: 'ok' });
+const resetDocumentSchema = z.object({
+  documentName: z.string().min(1).max(400),
+  token: z.string().min(16).max(256),
+});
+const closeDocumentSchema = z.object({
+  documentName: z.string().min(1).max(400),
 });
 
-// Close all connections for a document (called by host after revoking all sessions)
-app.post('/api/close-document', async (req, res) => {
-  const { documentName } = req.body;
-  if (!documentName) {
-    res.status(400).json({ error: 'documentName is required' });
-    return;
+async function userOwnsDocument(
+  userId: string,
+  documentName: string,
+  token?: string,
+  activeOnly = false,
+): Promise<boolean> {
+  const room = parseCanonicalDocumentName(documentName);
+  if (!room) return false;
+
+  const params: unknown[] = [room.projectId, room.scriptId, room.sessionNonce, userId];
+  let sql = `SELECT token FROM collab_sessions
+    WHERE project_id = ? AND script_id = ? AND session_nonce = ? AND created_by = ?`;
+  if (token) {
+    sql += ' AND token = ?';
+    params.push(token);
   }
-
-  // Close all active WebSocket connections for this document.
-  // Guests will try to reconnect — their revoked tokens will fail auth,
-  // triggering onAuthenticationFailed on the client which exits collab mode.
-  hocuspocus.closeConnections(documentName);
-  console.log(`Document closed (all connections kicked): ${documentName}`);
-
-  // Also clean up the persisted Yjs file
-  const filePath = docPath(documentName);
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-    console.log(`Document file deleted: ${documentName}`);
+  if (activeOnly) {
+    sql += ' AND active = 1 AND expires_at > ?';
+    params.push(new Date().toISOString());
   }
+  sql += ' LIMIT 1';
+  return Boolean(await getDB().get<{ token: string }>(sql, params));
+}
 
-  docLastActivity.delete(documentName);
-  res.json({ status: 'ok' });
+app.post('/api/reset-document', requireVerifiedAuth, async (req, res) => {
+  try {
+    const parsed = resetDocumentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid input' });
+      return;
+    }
+    const { documentName, token } = parsed.data;
+    if (!(await userOwnsDocument(req.user!.id, documentName, token, true))) {
+      res.status(403).json({ error: 'Not authorized to reset this document' });
+      return;
+    }
+
+    if (unavailableDocuments.has(documentName)) {
+      res.status(409).json({ error: 'Document operation already in progress' });
+      return;
+    }
+
+    unavailableDocuments.add(documentName);
+    resettingDocuments.add(documentName);
+    try {
+      const unloaded = await closeAndAwaitDocumentUnload(hocuspocus, documentName);
+      if (!unloaded) {
+        res.status(503).json({ error: 'Document did not close in time; reset was not applied' });
+        return;
+      }
+
+      const filePath = docPath(documentName);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+      docLastActivity.delete(documentName);
+      res.json({ status: 'ok' });
+    } finally {
+      resettingDocuments.delete(documentName);
+      unavailableDocuments.delete(documentName);
+    }
+  } catch (err) {
+    console.error('Reset document error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/close-document', requireVerifiedAuth, async (req, res) => {
+  try {
+    const parsed = closeDocumentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid input' });
+      return;
+    }
+    const { documentName } = parsed.data;
+    if (!(await userOwnsDocument(req.user!.id, documentName))) {
+      res.status(403).json({ error: 'Not authorized to close this document' });
+      return;
+    }
+    if (unavailableDocuments.has(documentName)) {
+      res.status(409).json({ error: 'Document operation already in progress' });
+      return;
+    }
+
+    unavailableDocuments.add(documentName);
+    try {
+      const unloaded = await closeAndAwaitDocumentUnload(hocuspocus, documentName);
+      if (!unloaded) {
+        res.status(503).json({ error: 'Document did not close in time' });
+        return;
+      }
+      console.log(`Document closed and unloaded: ${documentName}`);
+      // Retain final Yjs state as recovery data; new sessions use new nonces.
+      docLastActivity.delete(documentName);
+      res.json({ status: 'ok' });
+    } finally {
+      unavailableDocuments.delete(documentName);
+    }
+  } catch (err) {
+    console.error('Close document error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── Bootstrap: init DB then start HTTP(S) server ──
@@ -427,7 +538,7 @@ async function main(): Promise<void> {
 
   httpServer.on('upgrade', (request, socket, head) => {
     // Per-IP connection limit check
-    const ip = request.socket.remoteAddress || 'unknown';
+    const ip = resolveClientIp(request, trustedProxy);
     if (config.wsMaxConnectionsPerIp > 0) {
       const ipCount = connectionsPerIp.get(ip) || 0;
       if (ipCount >= config.wsMaxConnectionsPerIp) {
@@ -452,13 +563,17 @@ async function main(): Promise<void> {
 
   // Start document eviction timer
   startDocumentEviction();
+  const inviteExpirySweep = setInterval(() => {
+    inviteConnections.closeExpired();
+  }, 30_000);
+  inviteExpirySweep.unref();
 
   httpServer.listen(PORT, HOST, () => {
     const protocol = config.tlsCert ? 'wss' : 'ws';
     console.log(`OpenDraft Collaboration Server running on ${HOST}:${PORT}`);
     console.log(`  WebSocket: ${protocol}://${HOST}:${PORT}`);
     console.log(`  REST API:  ${config.tlsCert ? 'https' : 'http'}://${HOST}:${PORT}`);
-    console.log(`  Backend:   ${config.backendUrl}`);
+    console.log(`  Proxies:   ${config.trustedProxyIps.join(', ')}`);
     console.log(`  Database:  ${config.dbType}`);
     console.log(`  WS limits: ${config.wsMaxConnectionsPerIp}/IP, ${config.wsMaxConnectionsPerUser}/user`);
   });
