@@ -1,3 +1,5 @@
+import { sharedProjectPath } from '../services/sharing';
+import SharedProjects from './SharedProjects';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -277,6 +279,7 @@ const SortableCard: React.FC<SortableCardProps> = ({
 const ProjectList: React.FC = () => {
   const navigate = useNavigate();
   const goBack = useGoBack();
+  const [sharedProjects, setSharedProjects] = useState<ProjectInfo[]>([]);
   const [projects, setProjects] = useState<ProjectWithCount[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNewDialog, setShowNewDialog] = useState(false);
@@ -301,6 +304,8 @@ const ProjectList: React.FC = () => {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
 
+  const userId = useSettingsStore(s => s.collabAuth.user?.id);
+  const projectFetchId = useRef(0);
   const accessToken = useSettingsStore((s) => s.collabAuth.accessToken);
   const authVerified = useSettingsStore((s) => s.authVerified);
   const signedIn = Boolean(accessToken && authVerified);
@@ -321,8 +326,10 @@ const ProjectList: React.FC = () => {
   }, [source]);
 
   const fetchProjects = useCallback(async () => {
+    const fetchId = ++projectFetchId.current;
     setLoading(true);
     setErrorMsg('');
+    setSharedProjects([]);
     try {
       // Cloud listing requires a verified login. Empty state with a hint is
       // better than a confusing "no projects" when the user just hasn't
@@ -333,7 +340,11 @@ const ProjectList: React.FC = () => {
         return;
       }
       const client = source === 'cloud' ? cloudApi : api;
-      const projectList = await client.listProjects();
+      const accessible = source === 'cloud' ? await cloudApi.listProjects(true) : await client.listProjects();
+      const projectList = accessible.filter(p => p.access !== 'shared');
+      const shared = accessible.filter(p => p.access === 'shared');
+      if (fetchId !== projectFetchId.current || userId !== useSettingsStore.getState().collabAuth.user?.id) return;
+      setSharedProjects(shared);
       // Keep the cloud-project marker set in sync with what the server
       // currently returns. ProjectView reads this to dispatch reads/writes
       // to cloudApi.
@@ -350,13 +361,14 @@ const ProjectList: React.FC = () => {
           }
         }),
       );
+      if (fetchId !== projectFetchId.current) return;
       setProjects(withCounts);
     } catch (err) {
       setProjects([]);
       setErrorMsg(err instanceof Error ? err.message : 'Could not load projects');
     }
     setLoading(false);
-  }, [source, signedIn, syncCloudProjects]);
+  }, [source, signedIn, userId, syncCloudProjects]);
 
   useEffect(() => {
     fetchProjects();
@@ -704,7 +716,7 @@ const ProjectList: React.FC = () => {
           <div className="project-list-empty-icon">&#9888;</div>
           <div>{errorMsg}</div>
         </div>
-      ) : projects.length === 0 ? (
+      ) : projects.length === 0 && sharedProjects.length === 0 ? (
         <div className="project-list-empty">
           <div className="project-list-empty-icon">&#128209;</div>
           <div>
@@ -747,7 +759,7 @@ const ProjectList: React.FC = () => {
               </SortableContext>
             </>
           )}
-          {unpinnedProjects.length > 0 && (
+          {(unpinnedProjects.length > 0 || sharedProjects.length > 0) && (
             <>
               <div className="section-header">All Projects</div>
               <SortableContext
@@ -769,12 +781,21 @@ const ProjectList: React.FC = () => {
                       formatDate={formatDate}
                     />
                   ))}
+                  {sharedProjects.map(project => <button
+                    key={`${project.owner_id}/${project.id}`} className="project-card shared-project-card"
+                    onClick={() => navigate(sharedProjectPath(project))}>
+                    <h2>{project.name}</h2>
+                    <p>Shared · {project.owner_name}</p>
+                    <span>{project.accessible_document_count} accessible screenplay{project.accessible_document_count === 1 ? '' : 's'}</span>
+                  </button>)}
                 </div>
               </SortableContext>
             </>
           )}
         </DndContext>
       )}
+
+      {source === 'cloud' && <SharedProjects />}
 
       {/* New Project Dialog */}
       {showNewDialog && (

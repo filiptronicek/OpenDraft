@@ -27,9 +27,13 @@ import Select from './Select';
 
 export type OpenSource = 'local' | 'cloud';
 
+type OpenScript = Pick<ScriptMeta, 'id' | 'title' | 'created_at' | 'updated_at'> & {sharedId?: string; role?: string};
 interface ProjectWithScripts {
-  project: ProjectInfo;
-  scripts: ScriptMeta[];
+  key: string;
+  project: Pick<ProjectInfo, 'id' | 'name'>;
+  ownedProject?: ProjectInfo;
+  ownerName?: string;
+  scripts: OpenScript[];
 }
 
 interface OpenFileProps {
@@ -40,6 +44,7 @@ interface OpenFileProps {
     scriptTitle: string,
     source: OpenSource,
   ) => void;
+  onOpenShared: (id: string, title: string) => void;
   onClose: () => void;
 }
 
@@ -58,7 +63,7 @@ const SORT_LABELS: Record<SortKey, string> = {
   name_desc: 'Name (Z → A)',
 };
 
-function compareScripts(a: ScriptMeta, b: ScriptMeta, sort: SortKey): number {
+function compareScripts(a: OpenScript, b: OpenScript, sort: SortKey): number {
   switch (sort) {
     case 'name_asc':
       return a.title.localeCompare(b.title);
@@ -77,10 +82,11 @@ function compareScripts(a: ScriptMeta, b: ScriptMeta, sort: SortKey): number {
 /** Web is always cloud. Desktop/mobile apps let the user pick. */
 const WEB_ONLY_CLOUD = isWeb();
 
-const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onClose }) => {
+const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onOpenShared, onClose }) => {
   // Only treat the user as signed in once the token has been verified against
   // the server this session. A stale localStorage token shouldn't let us hit
   // the cloud API — the request would fail anyway.
+  const userId = useSettingsStore(s => s.collabAuth.user?.id);
   const accessToken = useSettingsStore((s) => s.collabAuth.accessToken);
   const authVerified = useSettingsStore((s) => s.authVerified);
   const signedIn = Boolean(accessToken && authVerified);
@@ -115,14 +121,15 @@ const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onClose }) => {
     (async () => {
       try {
         const client = source === 'cloud' ? cloudApi : api;
-        const projects = await client.listProjects();
-        const all = await Promise.all(
+        const projects = source === 'cloud' ? await cloudApi.listProjects(true) : await client.listProjects();
+        const all: ProjectWithScripts[] = await Promise.all(
           projects.map(async (project) => {
             try {
-              const scripts = await client.listScripts(project.id);
-              return { project, scripts };
+              const scripts = source === 'cloud' ? await cloudApi.listScripts(project.id, false, project.owner_id || undefined) : await client.listScripts(project.id);
+              if (project.access === 'shared') return {key: `${project.owner_id}/${project.id}`, project, ownerName: project.owner_name || '', scripts: scripts.map(s => ({...s, sharedId: s.shared_document_id || undefined, role: s.access_role || undefined}))};
+              return { key: `owned/${project.id}`, project, ownedProject: project, scripts };
             } catch {
-              return { project, scripts: [] };
+              return { key: `owned/${project.id}`, project, ownedProject: project, scripts: [] };
             }
           }),
         );
@@ -137,7 +144,7 @@ const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onClose }) => {
     })();
 
     return () => { cancelled = true; };
-  }, [source, signedIn]);
+  }, [source, signedIn, userId]);
 
   const visibleGroups = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -148,7 +155,7 @@ const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onClose }) => {
           .filter((s) => !q || projectMatch || s.title.toLowerCase().includes(q))
           .slice()
           .sort((a, b) => compareScripts(a, b, sort));
-        return { project: g.project, scripts };
+        return { ...g, scripts };
       })
       .filter((g) => g.scripts.length > 0);
     return filtered;
@@ -238,17 +245,17 @@ const OpenFile: React.FC<OpenFileProps> = ({ onOpen, onClose }) => {
             </div>
           ) : (
             visibleGroups.map((g) => (
-              <div key={g.project.id} style={{ marginBottom: 12 }}>
-                <div className="open-project-group-header">{g.project.name}</div>
+              <div key={g.key} style={{ marginBottom: 12 }}>
+                <div className="open-project-group-header">{g.project.name}{g.ownerName && ` · Shared by ${g.ownerName}`}</div>
                 {g.scripts.map((s) => (
                   <div
                     key={s.id}
                     className="open-project-item"
-                    onClick={() => onOpen(g.project.id, g.project, s.id, s.title, source)}
+                    onClick={() => s.sharedId ? onOpenShared(s.sharedId, s.title) : g.ownedProject && onOpen(g.project.id, g.ownedProject, s.id, s.title, source)}
                   >
                     <span className="open-project-name">{s.title}</span>
                     <span className="open-project-date">
-                      {new Date(s.updated_at).toLocaleDateString()}
+                      {s.sharedId ? (s.role === 'editor' ? 'Co-editor' : 'Viewer') : new Date(s.updated_at).toLocaleDateString()}
                     </span>
                   </div>
                 ))}

@@ -212,6 +212,27 @@ const SCHEMA_SQL = `
     expires_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS shared_documents (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    script_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    script_title TEXT NOT NULL,
+    initial_state TEXT NOT NULL,
+    snapshot_extras TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(owner_id, project_id, script_id)
+  );
+  CREATE TABLE IF NOT EXISTS document_members (
+    document_id TEXT NOT NULL REFERENCES shared_documents(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('editor', 'viewer')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(document_id, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_document_members_user ON document_members(user_id);
+
   CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
   CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
   CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);

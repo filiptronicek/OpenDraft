@@ -220,6 +220,7 @@ interface MenuBarProps {
   onJoinCollab?: () => void;
   isCollabActive?: boolean;
   isCollabGuest?: boolean;
+  canBrowseProjects?: boolean;
   /**
    * Called with the payload that was just written, so the editor's own idea of
    * "what is on disk" keeps up. Without it a document saved from this menu
@@ -268,6 +269,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
   onJoinCollab,
   isCollabActive,
   isCollabGuest,
+  canBrowseProjects,
   onDocumentSaved,
 }) => {
   const navigate = useNavigate();
@@ -796,6 +798,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
   // editor's session stash, so it needs no question.
   useEffect(() => {
     return setLeaveGuard((go) => {
+      if (canBrowseProjects) { go(); return; }
       const libraryScript =
         Boolean(currentProject && currentScriptId) && !useEditorStore.getState().documentOrigin;
       if (libraryScript && !autoSaveAppliesToOpenDocument(useSettingsStore.getState(), false) && editorHasUnsavedChanges()) {
@@ -804,7 +807,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
       }
       void flushPendingSave().then(go);
     });
-  }, [currentProject, currentScriptId, editorHasUnsavedChanges, confirmOrRun]);
+  }, [currentProject, currentScriptId, editorHasUnsavedChanges, confirmOrRun, canBrowseProjects]);
 
   // ── Auto-save for a file opened from disk ──
   // Opt-in (Settings → Saving): it rewrites the writer's own file unasked, and
@@ -2398,7 +2401,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
         // directly above "Open from Files…" and claim the very thing that item
         // does. Naming the object rather than the source keeps the common action
         // short and lets the qualified one below carry the explanation.
-        { icon: <FaFolderOpen />, label: 'Open Script…', action: () => confirmOrRun(() => setOpenFileOpen(true)), disabled: isCollabGuest },
+        { icon: <FaFolderOpen />, label: 'Open Script…', action: () => confirmOrRun(() => setOpenFileOpen(true)), disabled: isCollabGuest && !canBrowseProjects },
         // Mobile only: edit a screenplay where it lives — Files/iCloud/Dropbox
         // on iOS, the Storage Access Framework on Android — instead of
         // importing a copy and exporting it back afterwards.
@@ -2849,7 +2852,7 @@ const MenuBar: React.FC<MenuBarProps> = ({
           ],
         },
         { separator: true, label: '' },
-        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: goToProjects, disabled: isCollabGuest },
+        { icon: <FaProjectDiagram />, label: 'Manage Projects…', action: goToProjects, disabled: isCollabGuest && !canBrowseProjects },
         { icon: <FaBoxes />, label: 'Asset Manager', action: () => useAssetStore.getState().toggleAssetManager() },
         { separator: true, label: '' },
         {

@@ -65,6 +65,10 @@ class ReorderRequest(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    access: str = "owner"
+    owner_id: str | None = None
+    owner_name: str | None = None
+    accessible_document_count: int | None = None
     id: str
     name: str
     created_at: str

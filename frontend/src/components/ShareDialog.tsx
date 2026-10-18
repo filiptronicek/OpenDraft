@@ -1,3 +1,5 @@
+import PeopleSharing from './PeopleSharing';
+import type { SharedDocument } from '../services/sharing';
 import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { CollabSession } from '../services/api';
@@ -15,6 +17,7 @@ interface ShareDialogProps {
   isCollabActive: boolean;
   onStartCollab: (session: CollabSession) => void;
   onClose: () => void;
+  preparePersistent?: () => Promise<SharedDocument>;
 }
 
 const EXPIRY_OPTIONS = [
@@ -48,12 +51,15 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
   isCollabActive,
   onStartCollab,
   onClose,
+  preparePersistent,
 }) => {
   const [name, setName] = useState('');
   const [role, setRole] = useState<'editor' | 'viewer'>('editor');
   const [expiryHours, setExpiryHours] = useState(
     useSettingsStore.getState().defaultInviteExpiry || 1,
   );
+  const [linksError, setLinksError] = useState('');
+  const [linksLoading, setLinksLoading] = useState(true);
   const [sessions, setSessions] = useState<CollabSession[]>([]);
   const [generating, setGenerating] = useState(false);
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
@@ -65,13 +71,13 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
 
   useEffect(() => {
     inputRef.current?.focus();
-    // Only load existing sessions if collab is already active (host inviting more guests).
-    // When starting a fresh session, don't show stale invitations from previous sessions.
-    if (isCollabActive) {
-      api.listCollabSessions(projectId, scriptId)
-        .then(setSessions)
-        .catch(() => {});
-    }
+    let alive = true;
+    setLinksLoading(true); setLinksError('');
+    api.listCollabSessions(projectId, scriptId)
+      .then(s => { if (alive) setSessions(s); })
+      .catch(() => { if (alive) setLinksError('Unable to load existing link access. Please reopen Share to retry.'); })
+      .finally(() => { if (alive) setLinksLoading(false); });
+    return () => { alive = false; };
   }, [projectId, scriptId, isCollabActive]);
 
   const handleGenerate = async () => {
@@ -136,13 +142,19 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
     }
   };
 
-  const copyLink = async (token: string) => {
+  const copyLink = async (token: string, documentId?: string) => {
     const isTauri = Boolean((window as any).__TAURI_INTERNALS__);
-    const link = buildCollabInviteUrl(token, {
+    let link = buildCollabInviteUrl(token, {
       isTauri,
       browserOrigin: window.location.origin,
       apiBase: getApiBase(),
     });
+    if (documentId) {
+      const url = new URL(link);
+      url.pathname = url.pathname.replace(/\/collab$/, `/shared/${encodeURIComponent(documentId)}`);
+      url.hash = '';
+      link = url.toString();
+    }
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(link);
@@ -189,6 +201,64 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
         </div>
 
         <div className="dialog-body">
+          {preparePersistent && <PeopleSharing projectId={projectId} scriptId={scriptId} prepare={preparePersistent} />}
+          {preparePersistent && <div style={{marginBottom: 20}}>
+            <p>Restricted link · Only people with access can open it.</p>
+            <button className="dialog-btn" onClick={async () => {
+              try { const d = await preparePersistent(); await copyLink('member', d.id); }
+              catch (e) { showToast((e as Error).message, 'error'); }
+            }}>{copiedToken === 'member' ? 'Copied!' : 'Copy restricted link'}</button>
+          </div>}
+          <h3>Link access</h3>
+          {linksLoading && <p>Loading existing links…</p>}
+          {linksError && <p role="alert">{linksError}</p>}
+          {sessions.length > 0 && (
+            <div className="collab-sessions-list">
+              <label className="dialog-label" style={{ fontSize: 14, marginTop: 16 }}>
+                Active invites ({sessions.length})
+              </label>
+              {sessions.map((s) => (
+                <div key={s.token} className="collab-session-item">
+                  <div className="collab-session-info">
+                    <span className="collab-session-name">
+                      {s.collaborator_name}
+                      <span className={`collab-role-badge collab-role-${s.role || 'editor'}`}>
+                        {s.role === 'viewer' ? 'Read Only' : 'Co-Edit'}
+                      </span>
+                    </span>
+                    <span className="collab-session-date">
+                      {new Date(s.created_at).toLocaleString()}
+                      {s.expires_at && (
+                        <span className="collab-session-expiry"> · {formatExpiry(s.expires_at)}</span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="collab-session-actions">
+                    <button
+                      className="collab-copy-btn"
+                      onClick={() => copyLink(s.token)}
+                      title="Copy invite link"
+                      aria-label={
+                        copiedToken === s.token
+                          ? `Copied invite link for ${s.collaborator_name}`
+                          : `Copy invite link for ${s.collaborator_name}`
+                      }
+                    >
+                      {copiedToken === s.token ? 'Copied!' : 'Copy Link'}
+                    </button>
+                    <button
+                      className="collab-revoke-btn"
+                      onClick={() => handleRevoke(s.token)}
+                      title="Revoke this invite"
+                      aria-label={`Revoke invite for ${s.collaborator_name}`}
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           {isCollabActive && (
             <div className="collab-status-badge">
               <span className="collab-dot" /> Live collaboration active
@@ -196,7 +266,7 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
           )}
 
           <p style={{ margin: '0 0 12px', fontSize: 14, color: 'var(--fd-text-muted)' }}>
-            Generate a link for each collaborator. They can open the link to join a live editing session.
+            Anyone with one of these links can join with its assigned role until it expires.
           </p>
 
           <label className="dialog-label" style={{ fontSize: 14 }}>Invite a collaborator</label>
@@ -265,53 +335,6 @@ const ShareDialog: React.FC<ShareDialogProps> = ({
             </div>
           </div>
 
-          {sessions.length > 0 && (
-            <div className="collab-sessions-list">
-              <label className="dialog-label" style={{ fontSize: 14, marginTop: 16 }}>
-                Active invites ({sessions.length})
-              </label>
-              {sessions.map((s) => (
-                <div key={s.token} className="collab-session-item">
-                  <div className="collab-session-info">
-                    <span className="collab-session-name">
-                      {s.collaborator_name}
-                      <span className={`collab-role-badge collab-role-${s.role || 'editor'}`}>
-                        {s.role === 'viewer' ? 'Read Only' : 'Co-Edit'}
-                      </span>
-                    </span>
-                    <span className="collab-session-date">
-                      {new Date(s.created_at).toLocaleString()}
-                      {s.expires_at && (
-                        <span className="collab-session-expiry"> · {formatExpiry(s.expires_at)}</span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="collab-session-actions">
-                    <button
-                      className="collab-copy-btn"
-                      onClick={() => copyLink(s.token)}
-                      title="Copy invite link"
-                      aria-label={
-                        copiedToken === s.token
-                          ? `Copied invite link for ${s.collaborator_name}`
-                          : `Copy invite link for ${s.collaborator_name}`
-                      }
-                    >
-                      {copiedToken === s.token ? 'Copied!' : 'Copy Link'}
-                    </button>
-                    <button
-                      className="collab-revoke-btn"
-                      onClick={() => handleRevoke(s.token)}
-                      title="Revoke this invite"
-                      aria-label={`Revoke invite for ${s.collaborator_name}`}
-                    >
-                      Revoke
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
 
         <div className="dialog-footer">

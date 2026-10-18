@@ -1,0 +1,17 @@
+.project-card.shared-project-card {
+  color: var(--fd-text);
+  font: inherit;
+  text-align: left;
+  white-space: normal;
+  min-width: 0;
+}
+.shared-project-card h2 { font-size: 16px; margin: 0 0 8px; }
+.shared-project-card p, .shared-project-card span { color: var(--fd-text-muted); font-size: 13px; }
+.shared-project-content { padding: 20px 40px; overflow-y: auto; }
+.shared-project-content > p { margin: 0 0 16px; color: var(--fd-text-muted); }
+.shared-project-content .project-list-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 16px;
+}
+@media (max-width: 600px) { .shared-project-content { padding: 16px; } }
