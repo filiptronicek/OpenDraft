@@ -3,7 +3,7 @@ import { z } from 'zod';
 import * as crypto from 'crypto';
 import { getDB } from '../db';
 import type { CollabSessionRow } from '../db';
-import { validateInviteToken } from '../services/collabValidation';
+import { validateInviteToken, canonicalDocumentName } from '../services/collabValidation';
 import { requireVerifiedAuth } from '../middleware/auth';
 import { inviteConnections } from '../services/inviteConnectionRegistry';
 import { inviteTokenDigest } from '../services/connectionIdentity';
@@ -77,7 +77,8 @@ router.post('/invite', requireVerifiedAuth, async (req, res) => {
        ORDER BY created_at DESC LIMIT 1`,
       [project_id, script_id, createdBy, now.toISOString()],
     );
-    const nonce = existing?.session_nonce || generateNonce();
+    const shared = await db.get<{id:string}>('SELECT id FROM shared_documents WHERE owner_id = ? AND project_id = ? AND script_id = ?', [createdBy,project_id,script_id]);
+    const nonce = shared ? `shared-${shared.id}` : existing?.session_nonce || generateNonce();
 
     // This owner-checked insert is the cross-process backstop for a deletion
     // racing a request that already passed requireVerifiedAuth.
@@ -107,6 +108,7 @@ router.post('/invite', requireVerifiedAuth, async (req, res) => {
       role,
       active: true,
       session_nonce: nonce,
+      document_name: canonicalDocumentName({project_id,script_id,session_nonce:nonce}),
       created_at: now.toISOString(),
       expires_at: expiresAt.toISOString(),
     };

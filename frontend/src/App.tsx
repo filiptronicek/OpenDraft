@@ -1,3 +1,5 @@
+import SharedProjectView from './components/SharedProjectView';
+import OwnedEditorRoute from './components/OwnedEditorRoute';
 import { Routes, Route } from 'react-router-dom';
 import ScreenplayEditor from './components/ScreenplayEditor';
 import TreatmentEditor from './components/TreatmentEditor';
@@ -18,6 +20,7 @@ import ResetPasswordRoute from './components/ResetPasswordRoute';
 import OidcCallbackRoute from './components/OidcCallbackRoute';
 import { pluginRegistry } from './plugins/registry';
 import './styles/screenplay.css';
+import './styles/sharedNavigation.css';
 import './styles/avScript.css';
 import './styles/tableRead.css';
 
@@ -44,8 +47,10 @@ function App() {
         <Route path="/reset-password" element={<ResetPasswordRoute />} />
         <Route path="/auth/oidc/callback" element={<OidcCallbackRoute />} />
         <Route path="/projects" element={<ProjectListC />} />
+        <Route path="/project/:projectId/shared-by/:ownerId" element={<SharedProjectView />} />
         <Route path="/project/:projectId" element={<ProjectViewC />} />
-        <Route path="/project/:projectId/edit/:scriptId" element={<ScreenplayEditor />} />
+        <Route path="/project/:projectId/edit/:scriptId" element={<OwnedEditorRoute />} />
+        <Route path="/shared/:sharedId" element={<ScreenplayEditor />} />
         <Route path="/project/:projectId/treatment/:scriptId" element={<TreatmentEditor />} />
         <Route path="/project/:projectId/history/:scriptId/:commitHash" element={<ScreenplayEditor />} />
         <Route path="/collab" element={<ScreenplayEditor />} />

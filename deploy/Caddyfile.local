@@ -1,0 +1,16 @@
+{
+    auto_https off
+}
+
+:80 {
+    handle_path /collab-server/* {
+        reverse_proxy collab:8080
+    }
+    handle /collab-server {
+        rewrite * /
+        reverse_proxy collab:8080
+    }
+    handle {
+        reverse_proxy backend:8080
+    }
+}

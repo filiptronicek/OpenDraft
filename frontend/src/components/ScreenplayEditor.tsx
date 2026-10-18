@@ -1,3 +1,6 @@
+import { sharingApi, type SharedDocument } from '../services/sharing';
+import { rememberGuestShare } from '../services/guestShares';
+import { prosemirrorJSONToYDoc } from 'y-prosemirror';
 import React, { useEffect, useCallback, useRef, useState, useMemo } from 'react';
 import { useEditor, EditorContent, type Editor } from '@tiptap/react';
 import Document from '@tiptap/extension-document';
@@ -147,7 +150,7 @@ import VersionHistory from './VersionHistory';
 import AssetManager from './AssetManager';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGoBack, useGoBackTo } from '../hooks/useGoBack';
-import { setPendingSaveFlush } from '../services/pendingSave';
+import { setPendingSaveFlush, leaveEditor } from '../services/pendingSave';
 import OpenFile from './OpenFile';
 import type { OpenSource } from './OpenFile';
 import WelcomeDialog, { type WelcomeChoice } from './WelcomeDialog';
@@ -507,6 +510,8 @@ const ScreenplayEditor: React.FC = () => {
   const { currentProject, currentScriptId, setCurrentProject, setCurrentScriptId, scriptReloadKey, markCloudScript, isCloudScript } = useProjectStore();
 
   // ── Collaboration state ──
+  const { sharedId } = useParams<{sharedId?:string}>();
+  const [sharedDocument,setSharedDocument] = useState<SharedDocument|null>(null);
   const [collabMode, setCollabMode] = useState(false);
   const [collabUserName, setCollabUserName] = useState('Owner');
   const [isCollabHost, setIsCollabHost] = useState(false);
@@ -657,7 +662,13 @@ const ScreenplayEditor: React.FC = () => {
       url: wsUrl,
       name: docName,
       document: ydoc,
-      token,
+      token: docName.startsWith('shared/') && !inviteToken ? async () => {
+        const status = await ensureCollabAuthenticated();
+        if (status !== 'ok') {
+          throw new Error(status === 'signed-out' ? 'Sign in to open shared screenplays' : 'Authentication unavailable');
+        }
+        return `member:${useSettingsStore.getState().collabAuth.accessToken || ''}`;
+      } : token,
       onConnect: () => {
         console.log(`[Collab] Connected to room "${docName}" (${isHost ? 'host' : 'guest'})`);
         setCollabConnectionState('connected');
@@ -759,7 +770,7 @@ const ScreenplayEditor: React.FC = () => {
           }
           setEditorKey((k) => k + 1);
           // replace: the collab route no longer leads anywhere (see above).
-          if (!isHost) navigate('/', { replace: true });
+          if (!isHost || docName.startsWith('shared/')) navigate('/projects', { replace: true });
         }, 0);
       },
       onAwarenessUpdate: ({ states }) => {
@@ -799,7 +810,7 @@ const ScreenplayEditor: React.FC = () => {
         // handles these itself via handleStopCollab / switchCollabDocument.
         // Without this guard the host processes its OWN awareness broadcast,
         // causing a second setupCollab that fights with the first.
-        if (isHost) return;
+        if (isHost || docName.startsWith('shared/')) return;
         if (sessionEnded) {
           handleSessionEndedRef.current();
         }
@@ -812,7 +823,7 @@ const ScreenplayEditor: React.FC = () => {
     providerRef.current = provider;
 
     // Start syncing metadata (characters, notes, tags, beats) via Yjs
-    startCollabSync(ydoc, isHost);
+    startCollabSync(ydoc, isHost && !docName.startsWith('shared/'));
   }, [destroyCollab]);
 
   // Called when host broadcasts document-switch — guest auto-follows
@@ -862,7 +873,7 @@ const ScreenplayEditor: React.FC = () => {
       const tplId = (content as any)?._templateId;
       useFormattingTemplateStore.getState().setActiveTemplateId(typeof tplId === 'string' ? tplId : null);
 
-      const docName = `${projectId}/${scriptId}${nonce ? `/${nonce}` : ''}`;
+      const docName = session.document_name || `${projectId}/${scriptId}${nonce ? `/${nonce}` : ''}`;
       setupCollab(docName, sharedToken, collabUserName, false, collabWs);
 
       const docTitle = scriptResp?.meta?.title || title || 'Untitled';
@@ -994,7 +1005,7 @@ const ScreenplayEditor: React.FC = () => {
   // ── Handle /collab/:token route — resolve token to project/script, then enter collab mode ──
   const collabInitDone = useRef(false);
   const collabInitialContent = useRef<Record<string, unknown> | null>(null);
-  const [collabLoading, setCollabLoading] = useState(Boolean(routeCollabToken));
+  const [collabLoading, setCollabLoading] = useState(Boolean(routeCollabToken || sharedId));
   useEffect(() => {
     if (!routeCollabToken || collabInitDone.current) return;
     collabInitDone.current = true;
@@ -1017,10 +1028,11 @@ const ScreenplayEditor: React.FC = () => {
         }
 
 
+        rememberGuestShare(session, routeCollabToken);
         // Setup provider synchronously before triggering editor rebuild
         // Include session_nonce so guest joins the exact same Yjs room as the host
         const nonce = session.session_nonce || '';
-        const docName = `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
+        const docName = session.document_name || `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
         setupCollab(docName, routeCollabToken, session.collaborator_name);
 
         setCollabUserName(session.collaborator_name);
@@ -1046,9 +1058,41 @@ const ScreenplayEditor: React.FC = () => {
     })();
   }, [routeCollabToken, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle, setupCollab]);
 
+  useEffect(() => {
+    if (!sharedId) return;
+    let cancelled = false;
+    setCollabLoading(true);
+    (async () => {
+      try {
+        await ensureCollabAuthenticated();
+        const d = await sharingApi.document(sharedId);
+        if (cancelled) return;
+        setSharedDocument(d);
+        setCurrentProject({id:d.project_id,name:d.project_name} as any);
+        setCurrentScriptId(d.script_id);
+        setDocumentTitle(d.script_title);
+        setCollabUserName(useSettingsStore.getState().collabAuth.user?.displayName || 'Collaborator');
+        setCollabRole(d.role === 'viewer' ? 'viewer' : 'editor');
+        setIsCollabHost(d.role === 'owner');
+        setupCollab(`shared/${d.id}`, '', '', d.role === 'owner');
+        setCollabMode(true);
+        setEditorKey(k=>k+1);
+      } catch (e) {
+        if (!cancelled) { showToast((e as Error).message,'error'); navigate('/projects',{replace:true}); }
+      } finally { if (!cancelled) setCollabLoading(false); }
+    })();
+    return () => { cancelled=true; };
+  }, [sharedId,setupCollab,navigate,setCurrentProject,setCurrentScriptId,setDocumentTitle]);
+
   // handleStartCollab is defined after the editor — see below useEditor
 
   const handleStopCollab = useCallback(async () => {
+    if (sharedId) {
+      destroyCollab(); setCollabMode(false); setIsCollabHost(false);
+      setCurrentProject(null); setCurrentScriptId(null);
+      navigate('/projects');
+      return;
+    }
     const isHost = isCollabHost;
 
     // Host: save the latest editor content before tearing down collab so it's not lost
@@ -1131,11 +1175,15 @@ const ScreenplayEditor: React.FC = () => {
       setEditorKey((k) => k + 1);
       navigate('/', { replace: true });
     }
-  }, [destroyCollab, collabUserName, collabColor, currentProject, currentScriptId, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
+  }, [sharedId, destroyCollab, collabUserName, collabColor, currentProject, currentScriptId, navigate, setCurrentProject, setCurrentScriptId, setDocumentTitle]);
 
   // Host switches to a different document while collab is active
   const switchCollabDocument = useCallback(async (newProjectId: string, newScriptId: string) => {
     if (!providerRef.current) return;
+    if (providerRef.current.configuration.name.startsWith('shared/')) {
+      navigate(`/project/${encodeURIComponent(newProjectId)}/edit/${encodeURIComponent(newScriptId)}`);
+      return;
+    }
 
     // 1. Load the new script before telling anyone: its title travels with
     //    the switch (guests usually cannot read the host's project), and a
@@ -1211,7 +1259,7 @@ const ScreenplayEditor: React.FC = () => {
       // Connect to the collab WebSocket immediately — Yjs will sync content from the host.
       // Do NOT wait for backend content loading (which may hang on unreachable ports).
       const nonce = session.session_nonce || '';
-      const docName = `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
+      const docName = session.document_name || `${session.project_id}/${session.script_id}${nonce ? `/${nonce}` : ''}`;
       setupCollab(docName, token, session.collaborator_name, false, collabWs);
 
       setCollabUserName(session.collaborator_name);
@@ -1269,7 +1317,7 @@ const ScreenplayEditor: React.FC = () => {
 
   // Welcome dialog — show on first visit
   const [showWelcome, setShowWelcome] = useState(() => {
-    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !routeCollabToken;
+    return !localStorage.getItem('opendraft:welcomed') && !urlScriptId && !routeCollabToken && !sharedId;
   });
 
   // ── Drag-and-drop file import state ──
@@ -1977,6 +2025,10 @@ const ScreenplayEditor: React.FC = () => {
   const handleStartCollab = useCallback(async (guestSession: import('../services/api').CollabSession) => {
     if (!editor || !currentProject || !currentScriptId) return;
 
+    if (guestSession.document_name?.startsWith('shared/')) {
+      navigate(`/shared/${guestSession.document_name.slice(7)}`);
+      return;
+    }
     // Save current editor content so it can seed the Yjs doc
     const doc = editor.getJSON();
     const { _notes, _generalNotes: _gn3, _tags, _tagCategories, _characterProfiles, _characterRelationships, _templateId: _tpl3, _pageLayout: _pl3, ...pmDoc } = doc as Record<string, unknown>;
@@ -2567,7 +2619,7 @@ const ScreenplayEditor: React.FC = () => {
   // auto-save closure still holds the OLD project/script IDs.  Without this
   // guard the auto-save would overwrite the old script with empty metadata.
   const scriptSwitchingRef = useRef(false);
-  const isCollabGuest = collabMode && !isCollabHost;
+  const isCollabGuest = collabMode && (!isCollabHost || Boolean(sharedId));
 
   // Subscribed (not getState) so a rename is reflected in the next snapshot's
   // filename without waiting for an unrelated re-render.
@@ -3226,7 +3278,7 @@ const ScreenplayEditor: React.FC = () => {
   // come back blank. TipTap schedules the destroy a tick after unmount, so the
   // document is still readable from this cleanup.
   useEffect(() => {
-    if (!editor || collabMode || isHistoryMode) return;
+    if (!editor || collabMode || sharedId || isHistoryMode) return;
     return () => {
       if (editor.isDestroyed) return;
       try {
@@ -3255,7 +3307,7 @@ const ScreenplayEditor: React.FC = () => {
   // script that has since been loaded from the library.
   const sessionRestoreDoneRef = useRef(false);
   useEffect(() => {
-    if (!editor || collabMode || isHistoryMode) return;
+    if (!editor || collabMode || sharedId || isHistoryMode) return;
     if (sessionRestoreDoneRef.current) return;
     sessionRestoreDoneRef.current = true;
     if (urlScriptId || urlCommitHash) return;
@@ -3287,7 +3339,7 @@ const ScreenplayEditor: React.FC = () => {
   // cannot re-acquire on the writer's behalf.
   const lastSessionRestoreRef = useRef(false);
   useEffect(() => {
-    if (!editor || collabMode || isHistoryMode) return;
+    if (!editor || collabMode || sharedId || isHistoryMode) return;
     if (lastSessionRestoreRef.current) return;
     lastSessionRestoreRef.current = true;
     if (urlScriptId || urlCommitHash || currentScriptId) return;
@@ -3900,6 +3952,11 @@ const ScreenplayEditor: React.FC = () => {
       // and subsequent saves to cloudApi rather than the local SQLite.
       if (source === 'cloud') markCloudScript(projectId, scriptId);
 
+      if (sharedId) {
+        navigate(`/project/${encodeURIComponent(projectId)}/edit/${encodeURIComponent(scriptId)}`);
+        return;
+      }
+
       // Host switching documents during collab
       if (collabMode && isCollabHost) {
         await switchCollabDocument(projectId, scriptId);
@@ -4073,7 +4130,7 @@ const ScreenplayEditor: React.FC = () => {
         scriptSwitchingRef.current = false;
       }
     },
-    [editor, collabMode, collabUserName, switchCollabDocument, setCurrentProject, setCurrentScriptId, setDocumentTitle, updateScenes, currentProject, currentScriptId, buildSaveContent, markCloudScript],
+    [editor, sharedId, collabMode, collabUserName, switchCollabDocument, setCurrentProject, setCurrentScriptId, setDocumentTitle, updateScenes, currentProject, currentScriptId, buildSaveContent, markCloudScript],
   );
 
   /**
@@ -5008,7 +5065,7 @@ const ScreenplayEditor: React.FC = () => {
             )}
           </div>
           <button className="collab-banner-btn collab-banner-btn-stop" onClick={handleStopCollab}>
-            {isCollabHost ? 'End Session' : 'Disconnect'}
+            {sharedId ? 'Leave screenplay' : isCollabHost ? 'End Session' : 'Disconnect'}
           </button>
         </div>
       )}
@@ -5092,7 +5149,7 @@ const ScreenplayEditor: React.FC = () => {
           return;
         }
         setShareDialogOpen(true);
-      }} onJoinCollab={() => setJoinCollabOpen(true)} isCollabActive={collabMode} isCollabGuest={collabMode && !isCollabHost} />}
+      }} onJoinCollab={() => setJoinCollabOpen(true)} isCollabActive={collabMode} canBrowseProjects={Boolean(sharedId)} isCollabGuest={collabMode && !isCollabHost} />}
       {!isHistoryMode && <Toolbar editor={editor} />}
       <div className="editor-layout">
         {!isHistoryMode && <SceneNavigator editor={editor} scrollContainer={editorMainRef.current} style={{ width: navWidth, minWidth: navWidth }} />}
@@ -5394,6 +5451,10 @@ const ScreenplayEditor: React.FC = () => {
       {!isHistoryMode && openFileOpen && (
         <OpenFile
           onOpen={handleOpenFile}
+          onOpenShared={async (id, title) => {
+            setOpenFileOpen(false);
+            await leaveEditor(() => { void guardOpen(`shared/${id}`, title, () => { navigate(`/shared/${id}`); }); });
+          }}
           onClose={() => setOpenFileOpen(false)}
         />
       )}
@@ -5481,8 +5542,27 @@ const ScreenplayEditor: React.FC = () => {
           scriptId={currentScriptId}
           scriptTitle={useEditorStore.getState().documentTitle}
           isCollabActive={collabMode}
+          preparePersistent={async () => {
+            if (sharedDocument) return sharedDocument;
+            if (!editor || !currentProject || !currentScriptId) throw new Error('Open a screenplay first');
+            if (collabMode) throw new Error('End the guest session before enabling persistent sharing');
+            const content = buildSaveContent();
+            if (!content) throw new Error('Screenplay is not ready');
+            await scriptApi.saveScript(currentProject.id,currentScriptId,{content});
+            const seed = prosemirrorJSONToYDoc(editor.schema, editor.getJSON(), 'default');
+            const metadata=seed.getMap<string>('metadata');
+            const store=useEditorStore.getState() as unknown as Record<string,unknown>;
+            for(const key of ['notes','generalNotes','tags','tagCategories','characterProfiles','characterRelationships','beats','beatColumns','beatArrangeMode','revisionMode','revisionColor','revisionHistory','revisionSettings','scriptProfile']) {
+              if(store[key]!==undefined) metadata.set(key,JSON.stringify(store[key]));
+            }
+            const bytes=Y.encodeStateAsUpdate(seed);seed.destroy();
+            let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);
+            const d=await sharingApi.create({project_id:currentProject.id,script_id:currentScriptId,initial_state:btoa(binary),snapshot_extras:content});
+            setSharedDocument(d);
+            return d;
+          }}
           onStartCollab={handleStartCollab}
-          onClose={() => setShareDialogOpen(false)}
+          onClose={() => { setShareDialogOpen(false); if (sharedDocument && !sharedId) navigate(`/shared/${sharedDocument.id}`); }}
         />
       )}
       {collabLoginOpen && (

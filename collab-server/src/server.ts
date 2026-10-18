@@ -26,6 +26,8 @@ import { verifyAccessToken } from './services/tokenService';
 import * as auditService from './services/auditService';
 import authRoutes from './routes/auth';
 import collabRoutes from './routes/collab';
+import sharingRoutes from './routes/sharing';
+import { authenticateMember, registerMemberSocket, unregisterMemberSocket, storeOwnerSnapshot, refreshSharedDocument } from './services/sharingService';
 import { standardLimiter } from './middleware/rateLimit';
 import { requireVerifiedAuth } from './middleware/auth';
 import { documentPath } from './services/documentPath';
@@ -126,6 +128,20 @@ const hocuspocus = new Hocuspocus({
       throw new Error('Document is temporarily unavailable');
     }
 
+    if (data.documentName.startsWith('shared/') && rawToken.startsWith('member:')) {
+      const id = data.documentName.slice(7);
+      if (!/^[a-f0-9-]{36}$/.test(id) || !rawToken.startsWith('member:')) throw new Error('Member login required');
+      const token = rawToken.slice(7);
+      const { doc, user } = await authenticateMember(id, token);
+      if (!await refreshSharedDocument(id)) throw new Error('Shared screenplay unavailable');
+      applyCollaborationRole(data.connectionConfig, doc.role === 'viewer' ? 'viewer' : 'editor');
+      const key = `user:${user.id}`;
+      if (config.wsMaxConnectionsPerUser > 0 && (connectionsPerUser.get(key) || 0) >= config.wsMaxConnectionsPerUser) throw new Error('Connection limit reached');
+      connectionsPerUser.set(key, (connectionsPerUser.get(key) || 0) + 1);
+      return { user: { id:user.id, name:user.display_name, role:doc.role === 'viewer' ? 'viewer' : 'editor',
+        _memberId:id, _memberToken:token, _memberExpiresAt: ((verifyAccessToken(token) as any).exp as number) * 1000, _connKey:key } };
+    }
+
     let userId: string | null = null;
     let userEmail: string | null = null;
     let inviteToken: string;
@@ -181,6 +197,10 @@ const hocuspocus = new Hocuspocus({
       throw new Error('Document is temporarily unavailable');
     }
 
+    if (data.documentName.startsWith('shared/') && !await refreshSharedDocument(data.documentName.slice(7))) {
+      throw new Error('Shared screenplay unavailable');
+    }
+
     // Hocuspocus rejects document updates at the protocol boundary when this
     // flag is set. UI editable=false is not an authorization control.
     applyCollaborationRole(data.connectionConfig, session.role);
@@ -223,6 +243,14 @@ const hocuspocus = new Hocuspocus({
 
   async connected(data: connectedPayload) {
     const user = data.context?.user;
+    if (user?._memberId) {
+      // Recheck after socket registration to close authorization/grant races.
+      registerMemberSocket(data.socketId, user._memberId, user.id, () => data.connection.webSocket.close(4403, 'Access changed'), user._memberExpiresAt);
+      try {
+        const { doc } = await authenticateMember(user._memberId, user._memberToken);
+        if ((doc.role === 'viewer' ? 'viewer' : 'editor') !== user.role) throw new Error('Role changed');
+      } catch { data.connection.webSocket.close(4403, 'Access changed'); }
+    }
     if (user?._inviteDigest) {
       inviteConnections.register(
         data.socketId,
@@ -235,6 +263,7 @@ const hocuspocus = new Hocuspocus({
 
   async onDisconnect(data: onDisconnectPayload) {
     inviteConnections.unregister(data.socketId);
+    unregisterMemberSocket(data.socketId);
     const user = data.context?.user;
     console.log(`Client disconnected from document: ${data.documentName} (${user?.name || 'unknown'})`);
 
@@ -249,6 +278,11 @@ const hocuspocus = new Hocuspocus({
   },
 
   async beforeHandleMessage(data: beforeHandleMessagePayload) {
+    const user = data.context?.user;
+    if (user?._memberId) {
+      const { doc } = await authenticateMember(user._memberId, user._memberToken);
+      if ((doc.role === 'viewer' ? 'viewer' : 'editor') !== user.role) throw { code:4403, reason:'Access changed' };
+    }
     const inviteDigest = data.context?.user?._inviteDigest;
     if (inviteDigest && inviteConnections.isRevoked(inviteDigest)) {
       throw { code: 4403, reason: 'Invite revoked or expired' };
@@ -283,8 +317,14 @@ const hocuspocus = new Hocuspocus({
         console.log(`Document loaded from disk: ${data.documentName}`);
       } catch (err) {
         console.error(`Failed to load document ${data.documentName}:`, err);
+        if (data.documentName.startsWith('shared/')) throw err;
       }
     } else {
+      if (data.documentName.startsWith('shared/')) {
+        const room = await getDB().get<{initial_state:string}>('SELECT initial_state FROM shared_documents WHERE id = ?', [data.documentName.slice(7)]);
+        if (!room) throw new Error('Shared document unavailable');
+        Y.applyUpdate(data.document, Buffer.from(room.initial_state, 'base64'));
+      }
       console.log(`New document (no persisted state): ${data.documentName}`);
     }
 
@@ -309,6 +349,9 @@ const hocuspocus = new Hocuspocus({
       console.error(`Failed to store document ${data.documentName}:`, err);
     }
 
+    if (data.documentName.startsWith('shared/')) {
+      await storeOwnerSnapshot(data.documentName.slice(7), data.document);
+    }
     await auditService.logEvent('document_store', null, data.documentName);
   },
 });
@@ -351,6 +394,7 @@ app.use(cors({
   },
   credentials: true,
 }));
+app.use('/api/sharing', express.json({limit:'16mb'}));
 app.use(express.json());
 
 // Request logger — logs all incoming HTTP requests
@@ -371,6 +415,7 @@ app.use('/auth', authRoutes);
 // Collab invite management (create, validate, list, revoke)
 // Used by both Tauri desktop/mobile clients and the web frontend.
 app.use('/api/collab', collabRoutes);
+app.use('/api/sharing', sharingRoutes);
 
 // Health check with memory & connection stats
 app.get('/health', (_req, res) => {
@@ -563,6 +608,19 @@ async function main(): Promise<void> {
 
   // Start document eviction timer
   startDocumentEviction();
+  let checkingSharedRooms = false;
+  setInterval(async () => {
+    if (checkingSharedRooms) return;
+    checkingSharedRooms = true;
+    try {
+      for (const name of hocuspocus.documents.keys()) {
+        if (!name.startsWith('shared/')) continue;
+        try {
+          if (!await refreshSharedDocument(name.slice(7))) hocuspocus.closeConnections(name);
+        } catch { hocuspocus.closeConnections(name); }
+      }
+    } finally { checkingSharedRooms = false; }
+  }, 15000).unref();
   const inviteExpirySweep = setInterval(() => {
     inviteConnections.closeExpired();
   }, 30_000);

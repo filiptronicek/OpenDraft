@@ -44,13 +44,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const cloudApi = {
-  listProjects: (): Promise<ProjectInfo[]> =>
-    request<{ projects: ProjectInfo[] }>('/projects/').then((r) => r.projects),
+  listProjects: (includeShared = false): Promise<ProjectInfo[]> =>
+    request<{ projects: ProjectInfo[] }>(`/projects/${includeShared ? '?include_shared=true' : ''}`).then((r) => r.projects),
 
   createProject: (name: string) =>
     request<ProjectInfo>('/projects/', { method: 'POST', body: JSON.stringify({ name }) }),
 
-  getProject: (id: string) => request<ProjectInfo>(`/projects/${id}`),
+  getProject: (id: string, ownerId?: string) => request<ProjectInfo>(`/projects/${encodeURIComponent(id)}${ownerId ? `?owner_id=${encodeURIComponent(ownerId)}` : ""}`),
 
   updateProject: (
     id: string,
@@ -66,9 +66,9 @@ export const cloudApi = {
       body: JSON.stringify({ items }),
     }),
 
-  listScripts: (projectId: string, includePreview: boolean = false) =>
+  listScripts: (projectId: string, includePreview: boolean = false, ownerId?: string) =>
     request<ScriptMeta[]>(
-      `/projects/${projectId}/scripts/${includePreview ? '?include_preview=true' : ''}`,
+      `/projects/${encodeURIComponent(projectId)}/scripts/?${new URLSearchParams({...(includePreview ? {include_preview: "true"} : {}), ...(ownerId ? {owner_id: ownerId} : {})})}`,
     ),
 
   createScript: (projectId: string, data: { title: string; content?: any; format?: string }) =>

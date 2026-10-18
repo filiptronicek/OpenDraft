@@ -179,6 +179,10 @@ export interface ProjectProperties {
 }
 
 export interface ProjectInfo {
+  access?: "owner" | "shared";
+  owner_id?: string | null;
+  owner_name?: string | null;
+  accessible_document_count?: number | null;
   id: string;
   name: string;
   created_at: string;
@@ -190,6 +194,8 @@ export interface ProjectInfo {
 }
 
 export interface ScriptMeta {
+  shared_document_id?: string | null;
+  access_role?: "editor" | "viewer" | null;
   id: string;
   title: string;
   author: string;
@@ -229,6 +235,7 @@ export interface DiffResponse {
 }
 
 export interface CollabSession {
+  document_name?: string;
   token: string;
   project_id: string;
   script_id: string;

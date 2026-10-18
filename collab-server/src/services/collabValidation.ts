@@ -4,6 +4,7 @@ import { inviteTokenDigest } from './connectionIdentity';
 
 export interface CollabSession {
   token: string;
+  document_name?: string;
   project_id: string;
   script_id: string;
   collaborator_name: string;
@@ -44,6 +45,7 @@ export function canonicalDocumentName(session: RoomIdentity): string | null {
     return null;
   }
   const nonce = session.session_nonce || '';
+  if (/^shared-[a-f0-9-]{36}$/.test(nonce)) return `shared/${nonce.slice(7)}`;
   if (nonce && !isSafeRoomSegment(nonce, 128)) return null;
   return nonce
     ? `${session.project_id}/${session.script_id}/${nonce}`
@@ -84,9 +86,15 @@ export async function validateInviteToken(token: string): Promise<CollabSession 
       [token],
     );
     if (session && new Date(session.expires_at) > new Date()) {
+      if (session.session_nonce?.startsWith('shared-')) {
+        const shared = await db.get('SELECT id FROM shared_documents WHERE id = ? AND owner_id = ? AND project_id = ? AND script_id = ?',
+          [session.session_nonce.slice(7), session.created_by, session.project_id, session.script_id]);
+        if (!shared) return null;
+      }
       console.log(`[validateToken] ${tokenId} → found in collab-server DB`);
       return {
         token: session.token,
+        document_name: canonicalDocumentName(session) || undefined,
         project_id: session.project_id,
         script_id: session.script_id,
         collaborator_name: session.collaborator_name,

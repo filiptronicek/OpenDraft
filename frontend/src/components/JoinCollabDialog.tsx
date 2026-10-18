@@ -1,3 +1,4 @@
+import { rememberGuestShare } from '../services/guestShares';
 import React, { useState, useRef, useEffect } from 'react';
 import { api } from '../services/api';
 import type { CollabSession } from '../services/api';
@@ -71,6 +72,7 @@ const JoinCollabDialog: React.FC<JoinCollabDialogProps> = ({ onJoin, onClose }) 
         }
       }
 
+      if (wsUrl === configuredCollabUrl) rememberGuestShare(session, token);
       onJoin(session, token, collabServerUrl || undefined);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

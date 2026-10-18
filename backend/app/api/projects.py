@@ -1,12 +1,12 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.dependencies import require_verified_user
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectList, ReorderRequest
 from app.schemas.script import ScriptCreate, ScriptUpdate, ScriptMeta, ScriptResponse
 from app.plugins import run_hooks, run_gate_hooks
-from app.services import project_service, script_service
+from app.services import project_service, script_service, sharing_service
 from app.services.auth_service import AuthUser
 from app.services.quota_service import QUOTA_CHECK_CREATE_SCRIPT
 
@@ -29,13 +29,17 @@ async def create_project(body: ProjectCreate):
 
 
 @router.get("/", response_model=ProjectList)
-async def list_projects():
+async def list_projects(request: Request, include_shared: bool = False):
     projects = project_service.list_projects()
+    if include_shared:
+        projects += await sharing_service.list_projects(request)
     return {"projects": projects}
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
-async def get_project(project_id: str):
+async def get_project(project_id: str, request: Request, owner_id: str | None = None):
+    if owner_id:
+        return sharing_service.project_metadata(await sharing_service.project(request, owner_id, project_id))
     try:
         return project_service.get_project(project_id)
     except project_service.InvalidResourceIdError as exc:
@@ -108,7 +112,10 @@ async def create_script(
 
 
 @router.get("/{project_id}/scripts/", response_model=list[ScriptMeta])
-async def list_scripts(project_id: str, include_preview: bool = False):
+async def list_scripts(project_id: str, request: Request, include_preview: bool = False, owner_id: str | None = None):
+    if owner_id:
+        project = await sharing_service.project(request, owner_id, project_id)
+        return [sharing_service.script_metadata(d) for d in project["documents"]]
     try:
         return script_service.list_scripts(project_id, include_preview=include_preview)
     except project_service.InvalidResourceIdError as exc:

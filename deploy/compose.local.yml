@@ -1,0 +1,51 @@
+name: opendraft-local
+
+services:
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - backend
+      - collab
+
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      OPENDRAFT_DATA_DIR: /app/data
+      COLLAB_JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in deploy/.env.local}
+      COLLAB_SERVER_URL: http://collab:8080
+      COLLAB_DB_PATH: /app/collab-data/collab.sqlite3
+      FORWARDED_ALLOW_IPS: "*"
+      CORS_ORIGINS: http://localhost:8080
+      OPENDRAFT_GIT_BACKUP_ENABLED: "false"
+    volumes:
+      - projects:/app/data
+      - identities:/app/collab-data:ro
+
+  collab:
+    build:
+      context: ../collab-server
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      HOST: 0.0.0.0
+      DATA_DIR: /app/data
+      DB_TYPE: sqlite
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in deploy/.env.local}
+      BACKEND_URL: http://backend:8080
+      APP_URL: http://localhost:8080
+      CORS_ORIGINS: http://localhost:8080
+      TRUSTED_PROXY_IPS: loopback,linklocal,uniquelocal
+      LOCAL_LOGIN_ENABLED: "true"
+      LOCAL_REGISTRATION_ENABLED: "true"
+    volumes:
+      - identities:/app/data
+
+volumes:
+  projects:
+  identities:

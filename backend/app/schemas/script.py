@@ -19,6 +19,8 @@ class ScriptUpdate(BaseModel):
 
 
 class ScriptMeta(BaseModel):
+    shared_document_id: str | None = None
+    access_role: str | None = None
     id: str
     title: str
     author: str

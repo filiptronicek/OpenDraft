@@ -8,6 +8,7 @@ src-tauri/
 venv/
 
 # Node dependencies (rebuilt in container)
+node_modules/
 frontend/node_modules
 collab-server/
 
@@ -23,6 +24,8 @@ dist/
 # Data & env
 backend/data
 .env
+.env.*
+**/.env.*
 *.env
 
 # Git & IDE
