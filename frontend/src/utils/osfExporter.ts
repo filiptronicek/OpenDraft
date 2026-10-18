@@ -19,6 +19,11 @@
  */
 import JSZip from 'jszip';
 import type { JSONContent } from '@tiptap/react';
+import { sanitizeExportFilename } from './exportFilename';
+import { titlePageAttrsCarryData } from './titlePageRegion';
+import { isNonPrintingType } from './nonPrinting';
+import { blockRevision, osfRevisionColors, osfRevisionIndex } from './revisionExport';
+import { latestRevision, type RevisionSettings } from '../editor/revisionColors';
 
 /** Element type → the OSF style a paragraph is based on. */
 const NODE_TO_OSF_STYLE: Record<string, string> = {
@@ -53,7 +58,14 @@ const BUILTIN_STYLES: { name: string; index: number; extra?: string }[] = [
   { name: 'Shot', index: 7, extra: ' spacebefore="1.0" allcaps="1"' },
 ];
 
-/** Title-page field → the bookmark the parser reads it back from. */
+/** Title-page field → the bookmark the parser reads it back from.
+ *
+ *  OSF has no bookmark for the credit label or the WGA registration, so those
+ *  two cannot be carried — see the Format Compatibility page in the manual.
+ *  The draft date is not missing, though: it has no bookmark of its own but
+ *  belongs with the draft, and joining them is what the FDX exporter and the
+ *  title page itself already do. Left out, a dated draft exported to Fade In
+ *  came back undated. */
 const TP_ATTR_TO_BOOKMARK: [string, string][] = [
   ['tpTitle', 'title'],
   ['tpBasedOn', 'subtitle'],
@@ -67,6 +79,11 @@ const TP_ATTR_TO_BOOKMARK: [string, string][] = [
 export interface OSFExportOptions {
   /** Typeface the document is written in; goes on the styles, as OSF wants. */
   font?: { family?: string; size?: string };
+  /** Revision Mode's state: the active colour and the marks. Revised
+   *  paragraphs are marked whether or not this is given. */
+  revisions?: { color: string; settings?: RevisionSettings | null } | null;
+  /** Scene numbering, for Fade In's own scene_numbering / scenes_locked. */
+  sceneNumbers?: { visible: boolean; locked: boolean } | null;
 }
 
 function esc(value: string): string {
@@ -214,23 +231,27 @@ function styleElement(node: JSONContent, styleName: string, dual: boolean): stri
   return `${out}/>`;
 }
 
-function paragraph(node: JSONContent, dual = false): string {
+function paragraph(node: JSONContent, dual = false, sceneNumbers = true): string {
   const type = node.type ?? 'action';
   const styleName = NODE_TO_OSF_STYLE[type] ?? 'Normal Text';
 
   const attrs = node.attrs ?? {};
   let paraAttrs = '';
-  if (type === 'sceneHeading' && typeof attrs.sceneNumber === 'string' && attrs.sceneNumber !== '') {
+  if (sceneNumbers && type === 'sceneHeading' && typeof attrs.sceneNumber === 'string' && attrs.sceneNumber !== '') {
     paraAttrs += ` scene_number="${esc(attrs.sceneNumber)}"`;
   }
   if (typeof attrs.synopsis === 'string' && attrs.synopsis.trim() !== '') {
     paraAttrs += ` synopsis="${esc(attrs.synopsis.trim())}"`;
   }
 
+  const revision = blockRevision(node);
   return [
     `      <para${paraAttrs}>`,
     styleElement(node, styleName, dual),
     textRuns(node, type === 'parenthetical'),
+    ...(revision !== null
+      ? [`        <marks><mark at="0" revision="${osfRevisionIndex(revision)}"/></marks>`]
+      : []),
     '      </para>',
   ].join('\n');
 }
@@ -251,8 +272,15 @@ function titlePageBlock(node: JSONContent | null): string {
   const attrs = (node.attrs ?? {}) as Record<string, unknown>;
 
   const paras: string[] = [];
+  // The draft and its date share one bookmark, so they share one paragraph.
+  const resolved: Record<string, unknown> = {
+    ...attrs,
+    tpDraft: [attrs.tpDraft, attrs.tpDraftDate]
+      .filter((v) => typeof v === 'string' && v.trim() !== '')
+      .join(' - '),
+  };
   for (const [key, bookmark] of TP_ATTR_TO_BOOKMARK) {
-    const value = attrs[key];
+    const value = resolved[key];
     if (typeof value !== 'string' || value.trim() === '') continue;
     // One <para> per field, with any line breaks kept inside its <text>.
     //
@@ -296,18 +324,29 @@ export function exportOSF(doc: JSONContent, options: OSFExportOptions = {}): str
     `    <style name="Lyrics" label="Lyrics" basestylename="Normal Text"${fontAttrs} italic="1"/>`,
   );
 
+  // The title page is a *run* of nodes — spacers, the title, the credit, the
+  // bottom block — and only one of them carries the structured fields
+  // `titlePageBlock` writes out. Taking the last `titlePage` node, as this used
+  // to, picked up a trailing spacer with no data on it and wrote an empty
+  // <titlepage>, silently dropping the title page from the exported file.
   let titlePageNode: JSONContent | null = null;
   const body: string[] = [];
   for (const node of doc.content ?? []) {
+    // Sections and Notes are not printed, and OSF has no paragraph style that
+    // isn't — see utils/nonPrinting.ts.
+    if (isNonPrintingType(node.type)) continue;
     if (node.type === 'titlePage') {
-      titlePageNode = node;
+      if (!titlePageNode && titlePageAttrsCarryData(node.attrs as Record<string, unknown> | undefined)) {
+        titlePageNode = node;
+      }
       continue;
     }
     if (node.type === 'dualDialogue') {
       body.push(...dualDialogue(node));
       continue;
     }
-    body.push(paragraph(node));
+    // Hidden numbers stay off the page; locked ones are only hidden, not gone.
+    body.push(paragraph(node, false, options.sceneNumbers?.visible !== false));
   }
 
   // Fade In ends every document with an empty Normal Text paragraph; the
@@ -320,6 +359,26 @@ export function exportOSF(doc: JSONContent, options: OSFExportOptions = {}): str
 
   const titlePage = titlePageBlock(titlePageNode);
 
+  // Revisions: the table every revised paragraph's mark points into, and
+  // which revision is current. Written only when there is something to say.
+  const used = new Set<string>();
+  for (const node of doc.content ?? []) {
+    const r = blockRevision(node);
+    if (r) used.add(r);
+  }
+  // The active colour counts once revising has begun — White is the
+  // unrevised script, not a revision.
+  if (options.revisions?.color && osfRevisionIndex(options.revisions.color) > 0) used.add(options.revisions.color);
+  const revisionSettings = used.size > 0
+    ? ` revision="${osfRevisionIndex(options.revisions?.color || latestRevision(used) || [...used].pop()!)}" show_revisions="true"`
+    : '';
+  const sceneSettings = options.sceneNumbers
+    ? ` scene_numbering="${options.sceneNumbers.visible}" scenes_locked="${options.sceneNumbers.locked}"`
+    : '';
+  const lists = used.size > 0
+    ? ['  <lists>', ...osfRevisionColors(used, options.revisions?.settings), '  </lists>']
+    : [];
+
   return [
     '<?xml version="1.0" encoding="utf-8"?>',
     '<document type="Open Screenplay Format document" version="30">',
@@ -330,7 +389,8 @@ export function exportOSF(doc: JSONContent, options: OSFExportOptions = {}): str
     // save. The title page is the title page.
     '  <info/>',
     '  <settings page_width="2159" page_height="2794" margin_top="317" margin_bottom="220"' +
-      ' margin_left="317" margin_right="317" normal_linesperinch="6.0" element_spacing="1.00"/>',
+      ' margin_left="317" margin_right="317" normal_linesperinch="6.0" element_spacing="1.00"' +
+      `${sceneSettings}${revisionSettings}/>`,
     '  <styles>',
     ...styles,
     '  </styles>',
@@ -338,6 +398,7 @@ export function exportOSF(doc: JSONContent, options: OSFExportOptions = {}): str
     ...body,
     '  </paragraphs>',
     ...(titlePage ? [titlePage] : []),
+    ...lists,
     '</document>',
     '',
   ].join('\n');
@@ -368,7 +429,7 @@ export async function downloadFadeIn(
   options: OSFExportOptions = {},
 ): Promise<void> {
   const bytes = await exportFadeIn(doc, options);
-  const filename = `${title.replace(/[^a-zA-Z0-9_\- ]/g, '') || 'Untitled'}.fadein`;
+  const filename = `${sanitizeExportFilename(title)}.fadein`;
   const { saveFile } = await import('./fileOps');
   await saveFile(bytes, filename, [{ name: 'Fade In', extensions: ['fadein'] }]);
 }

@@ -5,6 +5,15 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PrintManager
 import android.provider.DocumentsContract
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
@@ -27,6 +36,32 @@ class MainActivity : TauriActivity() {
      * which is what Android users expect.
      */
     override val handleBackNavigation: Boolean = true
+
+    /**
+     * Back at the first screen puts the app in the background instead of
+     * destroying it.
+     *
+     * Once the WebView has no history left, WryActivity's back callback falls
+     * through to `onBackPressed()`, whose default finishes the Activity. On
+     * Android that tears down the WebView while the *process* survives — and
+     * Wry only builds its WebView from `WryLifecycleObserver.onCreate`, which
+     * is registered on `ProcessLifecycleOwner` and so runs once per process and
+     * never again. Reopening from the launcher therefore recreated MainActivity
+     * around a WebView nothing had rebuilt: a blank white page, with no script
+     * and no JS running, until the process was killed by hand. Verified on the
+     * emulator — the process id is unchanged across Back and the relaunch.
+     *
+     * Backgrounding the task keeps process and WebView alive, so reopening
+     * resumes the script exactly as leaving by Home already did. If the task
+     * cannot be moved (it is not the root of its own task) the default
+     * behaviour still runs, rather than leaving Back doing nothing at all.
+     */
+    @Suppress("DEPRECATION", "MissingSuperCall")
+    override fun onBackPressed() {
+        if (!moveTaskToBack(true)) {
+            super.onBackPressed()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Explicit edge-to-edge opt-in with transparent bars using the
@@ -69,7 +104,7 @@ class MainActivity : TauriActivity() {
          * that is not UTF-8 text, which meant archive formats — .fadein is a
          * zip — could never be imported on Android at all.
          *
-         * Done in Kotlin rather than JNI because minSdk is 24, so
+         * Done in Kotlin rather than JNI because minSdk is 26, so
          * InputStream.readAllBytes() (API 33) is unavailable and the
          * alternative is a hand-rolled read loop across the JNI boundary.
          * `context` is passed in because a companion object has none.
@@ -85,6 +120,211 @@ class MainActivity : TauriActivity() {
             } catch (e: Exception) {
                 android.util.Log.e("OpenDraft", "[content-uri] readUriBytes failed: ${e.message}")
                 null
+            }
+        }
+
+        /**
+         * The clipboard's HTML flavour, or null when it holds none.
+         *
+         * The clipboard plugin only offers plain text, so a paste through the
+         * Edit menu arrived stripped of bold, italic and colour — everything
+         * the long-press callout preserves, because that hands the web view
+         * the real thing. `ClipData.Item.getHtmlText()` is the same flavour,
+         * so reading it here closes the gap (issue #102).
+         *
+         * Null is the ordinary answer, not a failure: most clips are plain
+         * text and carry no HTML at all. The Rust side turns null into "no
+         * HTML flavour" and the caller falls back to plain text.
+         *
+         * `context` is passed in because a companion object has none.
+         */
+        @JvmStatic
+        fun readClipboardHtml(context: android.content.Context): String? {
+            return try {
+                val manager = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as? android.content.ClipboardManager ?: return null
+                val clip = manager.primaryClip ?: return null
+                if (clip.itemCount == 0) return null
+                clip.getItemAt(0).htmlText
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[clipboard] readClipboardHtml failed: ${e.message}")
+                null
+            }
+        }
+
+        /**
+         * The folder a file waits in between being written and being handed
+         * to the rest of Android — the save-as picker, or the print spooler.
+         *
+         * The Rust side reached for `std::env::temp_dir()` first, which on
+         * Android means `/data/local/tmp`: TMPDIR is unset, and that is the
+         * fallback Rust compiles in. It belongs to the shell user, so every
+         * export and every print died on the staging write with "Permission
+         * denied (os error 13)" — and no permission exists that would have
+         * opened it, which is why the report read as a missing permission
+         * prompt (issue #125). The app's own cache directory needs no
+         * permission at all, and Android reclaims it under storage pressure,
+         * which is the right lifetime for files this short-lived.
+         *
+         * `context` is passed in because a companion object has none.
+         *
+         * Returns null on any failure; the Rust side turns that into a
+         * user-facing error.
+         */
+        @JvmStatic
+        fun exportStagingDir(context: Context): String? {
+            return try {
+                val dir = File(context.cacheDir, "exports")
+                if (!dir.isDirectory && !dir.mkdirs()) {
+                    android.util.Log.e("OpenDraft", "[export] could not create ${dir.path}")
+                    null
+                } else {
+                    dir.absolutePath
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[export] exportStagingDir failed: ${e.message}")
+                null
+            }
+        }
+
+        // ── Table Read (issue #131) ──────────────────────────────────────
+        // Android's WebView has no speechSynthesis, so Table Read speaks
+        // through the platform's TextToSpeech. Rust starts a line with
+        // ttsSpeak and polls ttsPoll for what happened since — start, each
+        // word (onRangeStart, API 26+, which is minSdk), done or error — so no
+        // JNI call is held open while a sentence plays.
+        //
+        // The engine binds its service asynchronously; ttsVoices returns null
+        // until it is ready and the frontend retries.
+
+        private var tts: android.speech.tts.TextToSpeech? = null
+        /** null = still binding; SUCCESS or ERROR once onInit has run. */
+        @Volatile private var ttsStatus: Int? = null
+        private val ttsEvents = java.util.concurrent.ConcurrentLinkedQueue<JSONObject>()
+        private val ttsLock = Any()
+
+        private fun ttsEvent(id: String?, kind: String, start: Int? = null, end: Int? = null, message: String? = null) {
+            val n = id?.toLongOrNull() ?: return
+            val ev = JSONObject().put("id", n).put("kind", kind)
+            if (start != null) ev.put("start", start)
+            if (end != null) ev.put("end", end)
+            if (message != null) ev.put("message", message)
+            // A frontend that stopped polling must not grow this forever.
+            while (ttsEvents.size > 500) ttsEvents.poll()
+            ttsEvents.add(ev)
+        }
+
+        /** The engine, created on first use. Null until it has finished binding. */
+        private fun ttsEngine(context: Context): android.speech.tts.TextToSpeech? {
+            synchronized(ttsLock) {
+                if (tts == null) {
+                    ttsStatus = null
+                    // The application context: the engine outlives any one activity.
+                    tts = android.speech.tts.TextToSpeech(context.applicationContext) { status ->
+                        ttsStatus = status
+                        if (status != android.speech.tts.TextToSpeech.SUCCESS) {
+                            android.util.Log.e("OpenDraft", "[tts] engine failed to start: $status")
+                        }
+                    }.also { engine ->
+                        engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+                            override fun onStart(utteranceId: String?) = ttsEvent(utteranceId, "start")
+                            override fun onDone(utteranceId: String?) = ttsEvent(utteranceId, "done")
+                            @Deprecated("Deprecated in Java")
+                            override fun onError(utteranceId: String?) =
+                                ttsEvent(utteranceId, "error", message = "The voice could not speak this line.")
+                            override fun onError(utteranceId: String?, errorCode: Int) =
+                                ttsEvent(utteranceId, "error", message = "The voice could not speak this line (error $errorCode).")
+                            override fun onStop(utteranceId: String?, interrupted: Boolean) = ttsEvent(utteranceId, "done")
+                            override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) =
+                                ttsEvent(utteranceId, "word", start, end)
+                        })
+                    }
+                }
+                return if (ttsStatus == android.speech.tts.TextToSpeech.SUCCESS) tts else null
+            }
+        }
+
+        /**
+         * Installed voices as a JSON array of {id, name, lang, detail}; null
+         * while the engine is still starting; {"error": …} if it never will.
+         */
+        @JvmStatic
+        fun ttsVoices(context: Context): String? {
+            return try {
+                val engine = ttsEngine(context)
+                if (engine == null) {
+                    val status = ttsStatus
+                    if (status != null && status != android.speech.tts.TextToSpeech.SUCCESS) {
+                        // Let the next attempt rebind — the writer may install an engine meanwhile.
+                        synchronized(ttsLock) { tts?.shutdown(); tts = null; ttsStatus = null }
+                        return JSONObject().put("error", "No text-to-speech engine is available on this device.").toString()
+                    }
+                    return null
+                }
+                val out = JSONArray()
+                val voices = engine.voices ?: emptySet()
+                for (v in voices.sortedBy { it.name }) {
+                    // Voices that would need a download, or the network, cannot read offline.
+                    if (v.features?.contains(android.speech.tts.TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) == true) continue
+                    if (v.isNetworkConnectionRequired) continue
+                    val locale = v.locale
+                    val detail = listOfNotNull(
+                        locale.getDisplayCountry().takeIf { it.isNotEmpty() },
+                        if (v.quality >= android.speech.tts.Voice.QUALITY_HIGH) "high quality" else null,
+                    ).joinToString(", ")
+                    out.put(JSONObject()
+                        .put("id", v.name)
+                        .put("name", v.name)
+                        .put("lang", locale.toLanguageTag())
+                        .put("detail", detail.ifEmpty { JSONObject.NULL }))
+                }
+                out.toString()
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[tts] listing voices failed: ${e.message}")
+                JSONObject().put("error", "Could not list the voices: ${e.message}").toString()
+            }
+        }
+
+        /** Speak one line. Returns null once it is queued, or a message saying why not. */
+        @JvmStatic
+        fun ttsSpeak(context: Context, id: String, text: String, voiceName: String, rate: String, pitch: String): String? {
+            return try {
+                val engine = ttsEngine(context) ?: return "The speech engine is still starting. Try again in a moment."
+                if (voiceName.isNotEmpty()) {
+                    val voice = engine.voices?.firstOrNull { it.name == voiceName }
+                    if (voice != null) engine.voice = voice
+                }
+                engine.setSpeechRate(rate.toFloatOrNull()?.coerceIn(0.25f, 4f) ?: 1f)
+                engine.setPitch(pitch.toFloatOrNull()?.coerceIn(0.25f, 2f) ?: 1f)
+                // QUEUE_FLUSH: a new line replaces anything still playing.
+                val result = engine.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, id)
+                if (result == android.speech.tts.TextToSpeech.SUCCESS) null
+                else "The speech engine refused the line."
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[tts] speak failed: ${e.message}")
+                "Could not speak: ${e.message}"
+            }
+        }
+
+        /** Everything that has happened since the last poll, as a JSON array. */
+        @JvmStatic
+        fun ttsPoll(context: Context): String? {
+            val out = JSONArray()
+            while (true) {
+                val ev = ttsEvents.poll() ?: break
+                out.put(ev)
+            }
+            return out.toString()
+        }
+
+        @JvmStatic
+        fun ttsStop(context: Context): String? {
+            return try {
+                synchronized(ttsLock) { tts?.stop() }
+                null
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[tts] stop failed: ${e.message}")
+                "Could not stop: ${e.message}"
             }
         }
 
@@ -369,6 +609,46 @@ class MainActivity : TauriActivity() {
             }
             return probe.toString()
         }
+
+        // ── Printing ─────────────────────────────────────────────────────
+        // Android's WebView, unlike Chrome for Android, does not implement
+        // window.print(), so File → Print did nothing at all until this.
+        // PrintManager is the platform's answer, and it takes a document
+        // rather than a page — which suits OpenDraft, whose printable form is
+        // the PDF the exporter already produces. Printing the WebView instead
+        // would have meant printing the app rather than the script.
+
+        /**
+         * Start a system print job for an already-rendered PDF.
+         *
+         * Returns null when the job was handed to the print service, or a
+         * message the Rust side turns into a user-facing error. Note that null
+         * means "the print dialog is opening", not "the pages came out": once
+         * PrintManager has the job the writer owns it, and cancelling is a
+         * normal outcome the app never hears about.
+         */
+        @JvmStatic
+        fun startPrintJob(context: Context, filePath: String, jobName: String): String? {
+            val file = File(filePath)
+            if (!file.isFile) return "The file to print is missing: $filePath"
+            val printManager = context.getSystemService(Context.PRINT_SERVICE) as? PrintManager
+                ?: return "This device has no print service."
+
+            // PrintManager.print must be called from the main thread, and Rust
+            // calls in on whichever thread served the command.
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    // null attributes: no paper-size preference of our own, so
+                    // the dialog opens on the printer's default. The PDF carries
+                    // its own page size and the spooler fits it to whatever the
+                    // writer picks.
+                    printManager.print(jobName, PdfPrintAdapter(file, jobName), null)
+                } catch (e: Exception) {
+                    android.util.Log.e("OpenDraft", "[print] could not start job: ${e.message}")
+                }
+            }
+            return null
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -480,5 +760,79 @@ class MainActivity : TauriActivity() {
                 }
             }
         }
+    }
+}
+
+/**
+ * Feeds a finished PDF to the Android print spooler.
+ *
+ * The whole file is written on every pass, whatever range was asked for, and
+ * onWriteFinished then reports ALL_PAGES — that is the contract that lets the
+ * spooler pull the writer's selected pages out of the document itself. Getting
+ * this wrong is the classic PrintDocumentAdapter bug: report a narrower range
+ * than was written and the print preview shows blank pages.
+ *
+ * The page count is left unknown rather than guessed. Two things depend on it
+ * being right — the "N pages" the dialog shows and the range it will accept —
+ * and neither is worth a number the exporter has not confirmed.
+ */
+private class PdfPrintAdapter(
+    private val file: File,
+    private val jobName: String,
+) : PrintDocumentAdapter() {
+
+    override fun onLayout(
+        oldAttributes: PrintAttributes?,
+        newAttributes: PrintAttributes?,
+        cancellationSignal: CancellationSignal?,
+        callback: LayoutResultCallback,
+        extras: Bundle?,
+    ) {
+        if (cancellationSignal?.isCanceled == true) {
+            callback.onLayoutCancelled()
+            return
+        }
+        val info = PrintDocumentInfo.Builder(jobName)
+            .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+            .setPageCount(PrintDocumentInfo.PAGE_COUNT_UNKNOWN)
+            .build()
+        // Always `changed = true`, even though the document genuinely never
+        // changes between passes: `false` invites the spooler to reuse a
+        // previously written document, and on the first pass there is none —
+        // which is how this adapter shape ends up previewing blank pages. One
+        // redundant file copy is the cheaper mistake.
+        callback.onLayoutFinished(info, true)
+    }
+
+    override fun onWrite(
+        pages: Array<out PageRange>?,
+        destination: ParcelFileDescriptor,
+        cancellationSignal: CancellationSignal?,
+        callback: WriteResultCallback,
+    ) {
+        // Off the main thread: a feature-length script is megabytes, and these
+        // callbacks arrive on the UI thread where that copy would show as jank
+        // or, on a slow device, an ANR.
+        Thread {
+            val result = try {
+                file.inputStream().use { input ->
+                    java.io.FileOutputStream(destination.fileDescriptor).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                android.util.Log.e("OpenDraft", "[print] could not write document: ${e.message}")
+                e.message ?: "The document could not be written."
+            }
+
+            Handler(Looper.getMainLooper()).post {
+                when {
+                    cancellationSignal?.isCanceled == true -> callback.onWriteCancelled()
+                    result != null -> callback.onWriteFailed(result)
+                    else -> callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                }
+            }
+        }.start()
     }
 }

@@ -2,7 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- SVG first so browsers that support it get the crisp mark; the .ico is
+         the fallback for those that don't. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <!-- viewport-fit=cover is what makes env(safe-area-inset-*) report real
          values.  Without it iOS/iPadOS resolve every inset to 0 and the app
          chrome renders underneath the notch and the iPadOS window controls.
@@ -14,9 +18,19 @@
   <body>
     <div id="root"></div>
     <script>
+      // Set by main.tsx the moment it is about to mount React. Until then a
+      // thrown error or a rejected promise means the app never started, and
+      // the overlay below is the only way the user sees why. Afterwards it
+      // means something inside a running app went wrong — a failed export, a
+      // command the platform does not implement (issue #97) — and covering
+      // the editor with an unclosable overlay loses the writer's session and
+      // forces a force-quit. Past this flag the console is enough.
+      window.__odBooted = false;
+
       // Catch fatal JS errors that prevent React from mounting.
       // Shows a visible error overlay instead of a blank screen.
       window.addEventListener('error', function(e) {
+        if (window.__odBooted) return;
         var d = document.getElementById('_fatal');
         if (!d) {
           d = document.createElement('div');
@@ -31,6 +45,7 @@
         d.appendChild(document.createTextNode('\n[ERROR] ' + (e.message || e) + '\n  at ' + (e.filename || '?') + ':' + (e.lineno || '?') + '\n'));
       });
       window.addEventListener('unhandledrejection', function(e) {
+        if (window.__odBooted) return;
         var d = document.getElementById('_fatal');
         if (!d) {
           d = document.createElement('div');

@@ -1,9 +1,40 @@
+import unicodedata
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 
 from app.services import asset_service, project_service
 
 router = APIRouter()
+
+
+def content_disposition(disposition: str, filename: str) -> str:
+    """Build a Content-Disposition header that survives a non-ASCII filename.
+
+    HTTP header values are latin-1, and a filename interpolated straight into
+    one is a 500 waiting for the first file that is not pure ASCII. It does not
+    take an unusual name: every macOS screenshot carries U+202F (narrow no-break
+    space) before the AM/PM, so ``Screenshot ... 12.25.22 PM.png`` crashed this
+    endpoint, and the storyboard frame it was dropped into came back empty.
+
+    RFC 6266 has the answer, and both halves are given because they serve
+    different readers: ``filename=`` is an ASCII-folded fallback for anything
+    old, ``filename*=`` carries the real name UTF-8 percent-encoded.
+    """
+    # NFKD splits an accented letter into its base plus a combining mark and
+    # folds U+202F to a plain space; dropping the marks then leaves "resume",
+    # not "re_sume_". Anything still unrepresentable (CJK, emoji) becomes '_'
+    # rather than raising or vanishing.
+    folded = unicodedata.normalize("NFKD", filename)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    ascii_name = folded.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    # A quote or a backslash would close the quoted-string early, and a newline
+    # would end the header itself — injection shapes, not just broken names.
+    ascii_name = "".join("_" if c in '"\\' or ord(c) < 0x20 or ord(c) == 0x7F else c for c in ascii_name)
+    ascii_name = ascii_name.strip() or "download"
+    encoded = quote(filename, safe="")
+    return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 @router.post("/{project_id}/assets/upload")
@@ -53,12 +84,15 @@ async def download_asset(
     try:
         entry = asset_service.get_asset_entry(project_id, asset_id)
         file_path = asset_service.get_asset_path(project_id, asset_id)
-        return FileResponse(
+        response = FileResponse(
             path=str(file_path),
             media_type=entry.get("mime_type") or "application/octet-stream",
             filename=str(entry.get("original_name") or "download"),
             content_disposition_type=disposition,
         )
+        fname = entry.get("original_name") or asset_id
+        response.headers["Content-Disposition"] = content_disposition(disposition, fname)
+        return response
     except project_service.InvalidResourceIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:

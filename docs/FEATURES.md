@@ -7,6 +7,8 @@ A complete list of features in OpenDraft.
 - **Industry-standard formatting** -- Scene headings, action, character, dialogue, parenthetical, transition, and shot elements with proper Courier Prime formatting
 - **Character Autocomplete** -- Smart suggestions as you type character names
 - **Scene Navigator** -- Jump between scenes instantly from the sidebar
+- **Element Numbering** -- Number any element, not only scene headings: every line of dialogue, every sound effect or shot. The format chooses which elements are numbered, what restarts each count (a scene heading, a new act, any element) and an optional prefix such as FX 1. Shown in the margin on screen, in print, PDF, Word and Final Draft
+- **Podcast format** -- Scripted podcast and audio fiction, with every line of dialogue numbered for the recording session and FX and music cues numbered on their own
 - **Distraction-free writing** -- Clean, focused interface with minimal chrome
 
 ## Story Planning
@@ -14,10 +16,12 @@ A complete list of features in OpenDraft.
 - **Beat Board & Index Cards** -- Visual story planning with drag-and-drop scene organization
 - **Character Profiles** -- Track characters with role types, highlight colors, and rich descriptions
 - **Casting / Reference Images** -- Attach headshots or reference images to characters
+- **Table Read** -- Hear the script read aloud with a voice per character and a live, word-by-word preview; device voices, free on-device Kokoro, or Gemini, OpenAI, ElevenLabs, Azure or your own speech server
 
 ## Project Management
 
 - **Multiple Projects** -- Organize all your screenplays with metadata (genre, logline, synopsis)
+- **Project Folders** -- On the desktop, save a project's scripts as files in any folder (external disk, RAID, network drive), with changes made elsewhere detected
 - **Asset Management** -- Attach reference images, research docs, and notes to projects
 - **Script Notes** -- Inline annotations for review and feedback
 

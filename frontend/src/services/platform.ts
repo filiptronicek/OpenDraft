@@ -24,9 +24,64 @@ export function isMobileTauri(): boolean {
     (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
 }
 
+/**
+ * Opens a URL outside the app — the system browser.
+ *
+ * `window.open` is only right in a browser tab. Inside the iOS web view it
+ * returns null and nothing happens, and the Android one takes the whole app
+ * down with it, which is how the manual's "Read online" link behaved on both.
+ * Tauri opens it through the platform instead: an Intent on Android,
+ * UIApplication on iOS, the desktop's default browser elsewhere.
+ */
+export async function openExternal(url: string): Promise<void> {
+  if (!isTauri()) {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return;
+  }
+  const { openUrl } = await import('@tauri-apps/plugin-opener');
+  await openUrl(url);
+}
+
 /** True when running as a Tauri desktop app (has sidecar backend). */
 export function isDesktopTauri(): boolean {
   return isTauri() && !isMobileTauri();
+}
+
+/** How File → Print reaches a printer on this platform. */
+export type PrintRoute =
+  /** The web view's own print dialog. Desktop and browsers. */
+  | 'dialog'
+  /** iOS: the exported PDF, handed to the share sheet that carries AirPrint. */
+  | 'ios-share-sheet'
+  /** Android: the exported PDF, handed to the system print service. */
+  | 'android-print-service';
+
+/**
+ * Where Print has to send the script, because neither mobile web view can open
+ * a print dialog of its own.
+ *
+ * iOS is the loud failure (issue #97): Tauri swaps `window.print()` for an
+ * invoke of `plugin:webview|print` but registers that command on desktop only,
+ * so the call rejects with "not allowed by ACL". Granting the permission would
+ * not help — there is no iOS implementation behind it, wry's print is
+ * macOS-only. AirPrint is reached from the share sheet instead.
+ *
+ * Android is the quiet one: Tauri leaves `window.print()` alone there, and
+ * Android's WebView — unlike Chrome for Android — simply does not implement
+ * it, so Print has always been a menu item that did nothing at all. Android
+ * prints through PrintManager, which takes a document rather than a page, so
+ * that route hands it the same PDF.
+ *
+ * Both are given the file File → Export → PDF produces, so what comes out of
+ * the printer is what the writer would have got out of the exporter.
+ */
+export function printRoute(): PrintRoute {
+  if (isTauri()) {
+    const os = getOS();
+    if (os === 'ios') return 'ios-share-sheet';
+    if (os === 'android') return 'android-print-service';
+  }
+  return 'dialog';
 }
 
 /** True when running as a plain browser web app (no Tauri). */
@@ -46,6 +101,34 @@ export function getOS(): 'macos' | 'windows' | 'linux' | 'android' | 'ios' | 'un
   if (/windows/i.test(ua)) return 'windows';
   if (/linux/i.test(ua)) return 'linux';
   return 'unknown';
+}
+
+/**
+ * Whether the app has to draw its own text-selection handles (issue #108).
+ *
+ * iPadOS puts no selection grabbers on a range selected inside this web view:
+ * the text highlights and that is all, so neither end of the selection can be
+ * nudged without starting again. Every other web view on the device is left
+ * alone — Android's draws its own, and so does Safari, and a second pair drawn
+ * over those would be two live handles at each end.
+ */
+export function needsSelectionHandles(): boolean {
+  return isTauri() && getOS() === 'ios';
+}
+
+/**
+ * Whether this device is one an Apple Pencil can be used with — an iPad.
+ *
+ * iPhone and iPod run the same OS and report the same way, but no Pencil pairs
+ * with them, so the handwriting input is not offered there. iPadOS 13+ sends a
+ * desktop-class "Macintosh" user agent, which is why a real Mac has to be told
+ * apart by its lack of touch points rather than by its name.
+ */
+export function supportsApplePencil(): boolean {
+  const ua = navigator.userAgent || '';
+  if (/iphone|ipod/i.test(ua)) return false;
+  if (/ipad/i.test(ua)) return true;
+  return /macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
 }
 
 /**
@@ -107,6 +190,31 @@ function pickHeader(headers: HeadersInit | undefined, name: string): string | un
   return undefined;
 }
 
+/**
+ * Flatten any of the three RequestInit.headers shapes into a plain object.
+ *
+ * Content-Type and Authorization keep their dedicated invoke parameters, so
+ * they are left out here; every other header used to be silently dropped on
+ * the way through the Rust side, which is how `X-Device-Id` went missing on
+ * desktop and mobile.
+ */
+function collectExtraHeaders(headers: HeadersInit | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers) return out;
+  const skip = new Set(['content-type', 'authorization']);
+  const add = (k: string, v: string) => {
+    if (!skip.has(String(k).toLowerCase())) out[String(k)] = String(v);
+  };
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+    headers.forEach((v, k) => add(k, v));
+  } else if (Array.isArray(headers)) {
+    for (const [k, v] of headers) add(k, v);
+  } else {
+    for (const [k, v] of Object.entries(headers as Record<string, string>)) add(k, v);
+  }
+  return out;
+}
+
 export async function platformFetch(url: string, options?: RequestInit): Promise<Response> {
   if (!isTauri()) return fetch(url, options);
 
@@ -121,6 +229,7 @@ export async function platformFetch(url: string, options?: RequestInit): Promise
       body: typeof options?.body === 'string' ? options.body : undefined,
       contentType: pickHeader(options?.headers, 'Content-Type'),
       authorization: pickHeader(options?.headers, 'Authorization'),
+      headers: collectExtraHeaders(options?.headers),
     });
 
     console.log(`[platformFetch] ${method} ${url} → ${result.status} (${result.body.length} bytes)`);

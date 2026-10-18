@@ -11,6 +11,9 @@ import { showToast } from './Toast';
 import MiniRichText from './MiniRichText';
 import { RelationshipMap } from './RelationshipMap';
 import { AuthenticatedAssetImage } from './AuthenticatedAssetImage';
+import VoicePicker from './VoicePicker';
+import { useTableReadStore } from '../stores/tableReadStore';
+import Select from './Select';
 
 // Default colors for auto-assignment (VIBGYOR palette)
 const DEFAULT_HIGHLIGHT_COLORS = [
@@ -47,16 +50,16 @@ const InlineRelForm: React.FC<{
   return (
     <div className="char-profile-rel-form">
       <div className="char-profile-rel-form-row">
-        <select value={otherChar} onChange={(e) => setOtherChar(e.target.value)}>
+        <Select value={otherChar} onChange={(e) => setOtherChar(e.target.value)}>
           <option value="">Select character...</option>
           {others.map((c) => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <select value={relType} onChange={(e) => setRelType(e.target.value)}>
+        </Select>
+        <Select value={relType} onChange={(e) => setRelType(e.target.value)}>
           {REL_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-        </select>
-        <select value={dynamic} onChange={(e) => setDynamic(e.target.value)}>
+        </Select>
+        <Select value={dynamic} onChange={(e) => setDynamic(e.target.value)}>
           {REL_DYNAMICS.map((d) => <option key={d} value={d}>{d}</option>)}
-        </select>
+        </Select>
       </div>
       <textarea
         value={desc}
@@ -495,6 +498,28 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
     [characterProfiles],
   );
 
+  // Voices Table Read cast automatically, shown beside "Automatic".
+  const tableReadCasting = useTableReadStore((s) => s.casting);
+
+  /** The Table Read voice for a character (issue #131). */
+  const renderTableReadVoice = (charName: string, prof: CharacterProfile) => (
+    <div className="char-profile-tts-voice">
+      <label className="char-profile-label" htmlFor={`tts-voice-${charName}`}>Table Read Voice</label>
+      <VoicePicker
+        id={`tts-voice-${charName}`}
+        value={prof.voice}
+        onChange={(slot, id) => {
+          const voice = { ...(prof.voice ?? {}) };
+          if (id) voice[slot] = id;
+          else delete voice[slot];
+          upsertCharacterProfile(charName, { voice });
+        }}
+        sample={singleLine(prof.sampleDialogue ? stripHtml(prof.sampleDialogue) : '').slice(0, 160) || `Hello, I'm ${charName.charAt(0) + charName.slice(1).toLowerCase()}.`}
+        automaticVoiceId={tableReadCasting[charName]}
+      />
+    </div>
+  );
+
   /** Calculate profile completeness as percentage + field breakdown */
   const getProfileCompleteness = useCallback((profile: CharacterProfile) => {
     const fields: { label: string; filled: boolean }[] = [
@@ -599,7 +624,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
         <div className="char-profile-meta-row char-profile-meta-row-3">
           <div className="char-profile-meta-field">
             <label className="char-profile-label">Role</label>
-            <select
+            <Select
               className="char-profile-select"
               value={prof.role}
               onChange={(e) => upsertCharacterProfile(charName, { role: e.target.value })}
@@ -607,7 +632,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
               {CHARACTER_ROLES.map((r) => (
                 <option key={r} value={r}>{r || '—'}</option>
               ))}
-            </select>
+            </Select>
           </div>
           <div className="char-profile-meta-field">
             <label className="char-profile-label">Gender</label>
@@ -712,6 +737,8 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
           placeholder="How does this character change through the story..."
           minHeight={isModal ? 80 : 50}
         />
+
+        {renderTableReadVoice(charName, prof)}
 
         {/* Voice Profile (collapsible) */}
         <details className="char-profile-voice-section">
@@ -944,7 +971,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
       {/* Sort bar */}
       <div className="char-profiles-sort">
         <span className="char-sort-label">Sort</span>
-        <select
+        <Select
           className="char-sort-select"
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
@@ -954,7 +981,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
           <option value="scenes">Scenes</option>
           <option value="dialogues">Dialogues</option>
           <option value="appearance">Appearance</option>
-        </select>
+        </Select>
       </div>
 
       {/* Character list */}
@@ -1098,7 +1125,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                         <div className="char-profile-meta-row char-profile-meta-row-3">
                           <div className="char-profile-meta-field">
                             <label className="char-profile-label">Role</label>
-                            <select
+                            <Select
                               className="char-profile-select"
                               value={profile.role}
                               onChange={(e) => upsertCharacterProfile(name, { role: e.target.value })}
@@ -1106,7 +1133,7 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                               {CHARACTER_ROLES.map((r) => (
                                 <option key={r} value={r}>{r || '—'}</option>
                               ))}
-                            </select>
+                            </Select>
                           </div>
                           <div className="char-profile-meta-field">
                             <label className="char-profile-label">Gender</label>
@@ -1215,6 +1242,8 @@ const CharacterProfiles: React.FC<CharacterProfilesProps> = ({ editor, projectId
                         placeholder="How does this character change through the story..."
                         minHeight={50}
                       />
+
+                      {renderTableReadVoice(name, profile)}
 
                       {/* Voice Profile (collapsible) */}
                       <details className="char-profile-voice-section">

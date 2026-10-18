@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
-import { useEditorStore, DEFAULT_PAGE_LAYOUT, DEFAULT_HEADER_CONTENT, DEFAULT_FOOTER_CONTENT } from '../stores/editorStore';
-import type { PageLayout, HeaderFooterContent } from '../stores/editorStore';
+import { useEditorStore, DEFAULT_PAGE_LAYOUT, resolveHeaderFooter } from '../stores/editorStore';
+import type { PageLayout } from '../stores/editorStore';
+import Select from './Select';
 
 interface PageSetupDialogProps {
   onClose: () => void;
@@ -20,17 +21,41 @@ function inToPt(inches: number): number {
   return Math.round(inches * 72);
 }
 
-const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
-  const { pageLayout, setPageLayout } = useEditorStore();
+/**
+ * Landscape margins.
+ *
+ * A landscape page is 3.5" wider and 2.5" shorter than portrait, and carrying
+ * the screenplay's 1.5" left margin across means a line of AV copy runs most of
+ * a foot before it wraps. Issue #118 asks for "appropriate landscape margins";
+ * these are even, narrower side margins that keep the columns readable and
+ * leave the extra width to the content, which is the point of turning the page.
+ */
+const LANDSCAPE_MARGINS = { leftMargin: 1, rightMargin: 1, topMargin: 54, bottomMargin: 54 };
 
-  // Backwards-compatible: fill in missing headerContent/footerContent for old layouts
-  const [layout, setLayout] = useState<PageLayout>({
+/**
+ * The portrait side of that comparison, taken FROM the store rather than
+ * restated here.
+ *
+ * Written out by hand it said `rightMargin: 1`, while every new screenplay is
+ * created with DEFAULT_PAGE_LAYOUT's 0.76. So the "has the writer touched their
+ * margins?" test below failed for the one document that most obviously has not
+ * — an untouched one — and rotating it to landscape kept the portrait margins.
+ */
+const PORTRAIT_MARGINS = {
+  leftMargin: DEFAULT_PAGE_LAYOUT.leftMargin,
+  rightMargin: DEFAULT_PAGE_LAYOUT.rightMargin,
+  topMargin: DEFAULT_PAGE_LAYOUT.topMargin,
+  bottomMargin: DEFAULT_PAGE_LAYOUT.bottomMargin,
+};
+
+const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
+  const { pageLayout, setPageLayout, setHeaderFooterOpen } = useEditorStore();
+
+  // Backwards-compatible: fill in fields missing from layouts saved by older versions
+  const [layout, setLayout] = useState<PageLayout>(() => ({
     ...pageLayout,
-    headerContent: pageLayout.headerContent || { ...DEFAULT_HEADER_CONTENT },
-    footerContent: pageLayout.footerContent || { ...DEFAULT_FOOTER_CONTENT },
-    headerStartPage: pageLayout.headerStartPage ?? 2,
-    footerStartPage: pageLayout.footerStartPage ?? 1,
-  });
+    ...resolveHeaderFooter(pageLayout),
+  }));
 
   const setField = useCallback(
     <K extends keyof PageLayout>(key: K, value: PageLayout[K]) => {
@@ -39,46 +64,63 @@ const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
     [],
   );
 
-  const setHeaderField = useCallback(
-    (pos: keyof HeaderFooterContent, value: string) => {
-      setLayout((prev) => ({
-        ...prev,
-        headerContent: { ...prev.headerContent, [pos]: value },
-      }));
-    },
-    [],
-  );
-
-  const setFooterField = useCallback(
-    (pos: keyof HeaderFooterContent, value: string) => {
-      setLayout((prev) => ({
-        ...prev,
-        footerContent: { ...prev.footerContent, [pos]: value },
-      }));
-    },
-    [],
-  );
-
   // Detect current page size label
+  // Matched in either orientation: A4 turned on its side is still A4, and the
+  // dropdown falling to "Custom" the moment you rotate would be wrong.
   const currentSizeLabel = PAGE_SIZES.find(
     (s) =>
-      Math.abs(s.width - layout.pageWidth) < 0.05 &&
-      Math.abs(s.height - layout.pageHeight) < 0.05,
+      (Math.abs(s.width - layout.pageWidth) < 0.05 && Math.abs(s.height - layout.pageHeight) < 0.05) ||
+      (Math.abs(s.height - layout.pageWidth) < 0.05 && Math.abs(s.width - layout.pageHeight) < 0.05),
   )?.label || 'Custom';
 
   const handlePageSizeChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
       const size = PAGE_SIZES.find((s) => s.label === e.target.value);
       if (size) {
-        setLayout((prev) => ({
-          ...prev,
-          pageWidth: size.width,
-          pageHeight: size.height,
-        }));
+        setLayout((prev) => {
+          // Keep the orientation the document is already in; picking "A4" while
+          // in landscape should give landscape A4, not flip the page back.
+          const landscape = prev.pageWidth > prev.pageHeight;
+          return {
+            ...prev,
+            pageWidth: landscape ? size.height : size.width,
+            pageHeight: landscape ? size.width : size.height,
+          };
+        });
       }
     },
     [],
   );
+
+  /** Portrait when the page is taller than it is wide — derived, not stored, so
+   *  a custom width/height a user types still reads correctly. */
+  const isLandscape = layout.pageWidth > layout.pageHeight;
+
+  /**
+   * Switch orientation by swapping the page dimensions.
+   *
+   * Margins move with it, but only when they are still the defaults for the
+   * orientation being left — a writer who has set their own margins keeps them.
+   */
+  const handleOrientation = useCallback((wantLandscape: boolean) => {
+    setLayout((prev) => {
+      const currentlyLandscape = prev.pageWidth > prev.pageHeight;
+      if (currentlyLandscape === wantLandscape) return prev;
+      const from = currentlyLandscape ? LANDSCAPE_MARGINS : PORTRAIT_MARGINS;
+      const to = wantLandscape ? LANDSCAPE_MARGINS : PORTRAIT_MARGINS;
+      const untouched =
+        Math.abs(prev.leftMargin - from.leftMargin) < 0.01 &&
+        Math.abs(prev.rightMargin - from.rightMargin) < 0.01 &&
+        Math.abs(prev.topMargin - from.topMargin) < 1 &&
+        Math.abs(prev.bottomMargin - from.bottomMargin) < 1;
+      return {
+        ...prev,
+        pageWidth: prev.pageHeight,
+        pageHeight: prev.pageWidth,
+        ...(untouched ? to : {}),
+      };
+    });
+  }, []);
 
   const handleApply = useCallback(() => {
     setPageLayout(layout);
@@ -88,6 +130,14 @@ const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
   const handleReset = useCallback(() => {
     setLayout({ ...DEFAULT_PAGE_LAYOUT });
   }, []);
+
+  /** Hand off to the Header & Footer dialog, keeping whatever was typed here —
+   *  losing half-finished margin edits on the way out would be its own bug. */
+  const handleOpenHeaderFooter = useCallback(() => {
+    setPageLayout(layout);
+    onClose();
+    setHeaderFooterOpen(true);
+  }, [layout, setPageLayout, onClose, setHeaderFooterOpen]);
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
@@ -102,7 +152,7 @@ const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
             <div className="page-setup-section-title">Page Size</div>
             <div className="page-setup-row">
               <label>Size</label>
-              <select
+              <Select
                 value={currentSizeLabel}
                 onChange={handlePageSizeChange}
               >
@@ -114,7 +164,30 @@ const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
                 {currentSizeLabel === 'Custom' && (
                   <option value="Custom">Custom</option>
                 )}
-              </select>
+              </Select>
+            </div>
+            <div className="page-setup-row">
+              <label>Orientation</label>
+              <div className="page-setup-orientation">
+                <label className="page-setup-orientation-option">
+                  <input
+                    type="radio"
+                    name="page-orientation"
+                    checked={!isLandscape}
+                    onChange={() => handleOrientation(false)}
+                  />
+                  Portrait
+                </label>
+                <label className="page-setup-orientation-option">
+                  <input
+                    type="radio"
+                    name="page-orientation"
+                    checked={isLandscape}
+                    onChange={() => handleOrientation(true)}
+                  />
+                  Landscape
+                </label>
+              </div>
             </div>
             <div className="page-setup-row-pair">
               <div className="page-setup-row">
@@ -219,112 +292,17 @@ const PageSetupDialog: React.FC<PageSetupDialogProps> = ({ onClose }) => {
             </div>
           </div>
 
-          {/* Header / Footer */}
+          {/* Header and footer content lives in its own dialog (Format → Header &
+              Footer), where it has room for field buttons and a preview. This is
+              the signpost for anyone who still looks for it here. */}
           <div className="page-setup-section">
             <div className="page-setup-section-title">Header &amp; Footer</div>
-            <div className="page-setup-row-pair">
-              <div className="page-setup-row">
-                <label>Header margin (in)</label>
-                <input
-                  type="number"
-                  step="0.05"
-                  min="0"
-                  max="2"
-                  value={ptToIn(layout.headerMargin)}
-                  onChange={(e) =>
-                    setField(
-                      'headerMargin',
-                      inToPt(parseFloat(e.target.value) || 0),
-                    )
-                  }
-                />
-              </div>
-              <div className="page-setup-row">
-                <label>Footer margin (in)</label>
-                <input
-                  type="number"
-                  step="0.05"
-                  min="0"
-                  max="2"
-                  value={ptToIn(layout.footerMargin)}
-                  onChange={(e) =>
-                    setField(
-                      'footerMargin',
-                      inToPt(parseFloat(e.target.value) || 0),
-                    )
-                  }
-                />
-              </div>
+            <div className="page-setup-hf-hint" style={{ marginBottom: 8 }}>
+              Page numbers, header and footer text, and where numbering starts.
             </div>
-
-            <div className="page-setup-hf-label">Header Content</div>
-            <div className="page-setup-hf-hint">
-              Fields: {'{page}'} {'{pages}'} {'{title}'} {'{date}'} {'{revision}'}
-            </div>
-            <div className="page-setup-hf-row">
-              <input
-                placeholder="Left"
-                value={layout.headerContent.left}
-                onChange={(e) => setHeaderField('left', e.target.value)}
-              />
-              <input
-                placeholder="Center"
-                value={layout.headerContent.center}
-                onChange={(e) => setHeaderField('center', e.target.value)}
-              />
-              <input
-                placeholder="Right"
-                value={layout.headerContent.right}
-                onChange={(e) => setHeaderField('right', e.target.value)}
-              />
-            </div>
-            <div className="page-setup-row">
-              <label>Start on page</label>
-              <input
-                type="number"
-                step="1"
-                min="1"
-                max="999"
-                value={layout.headerStartPage}
-                onChange={(e) =>
-                  setField('headerStartPage', parseInt(e.target.value, 10) || 1)
-                }
-                style={{ width: 60 }}
-              />
-            </div>
-
-            <div className="page-setup-hf-label" style={{ marginTop: 12 }}>Footer Content</div>
-            <div className="page-setup-hf-row">
-              <input
-                placeholder="Left"
-                value={layout.footerContent.left}
-                onChange={(e) => setFooterField('left', e.target.value)}
-              />
-              <input
-                placeholder="Center"
-                value={layout.footerContent.center}
-                onChange={(e) => setFooterField('center', e.target.value)}
-              />
-              <input
-                placeholder="Right"
-                value={layout.footerContent.right}
-                onChange={(e) => setFooterField('right', e.target.value)}
-              />
-            </div>
-            <div className="page-setup-row">
-              <label>Start on page</label>
-              <input
-                type="number"
-                step="1"
-                min="1"
-                max="999"
-                value={layout.footerStartPage}
-                onChange={(e) =>
-                  setField('footerStartPage', parseInt(e.target.value, 10) || 1)
-                }
-                style={{ width: 60 }}
-              />
-            </div>
+            <button type="button" className="dialog-btn page-setup-link" onClick={handleOpenHeaderFooter}>
+              Header &amp; Footer Settings…
+            </button>
           </div>
         </div>
 

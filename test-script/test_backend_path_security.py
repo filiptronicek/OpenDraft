@@ -260,7 +260,10 @@ def test_assets(victim_dir):
         assets_api.download_asset("writer-room", entry["id"], "attachment")
     )
     header = response.headers["content-disposition"]
-    assert "\r" not in header and "\n" not in header and "X-Evil:" not in header
+    assert "\r" not in header and "\n" not in header
+    # Upstream includes a safe ASCII fallback as well as the encoded filename.
+    assert 'filename="shot___X-Evil: injected.png"' in header
+    assert "%22%0D%0AX-Evil%3A" in header
 
     class OversizedUpload:
         filename = "large.bin"

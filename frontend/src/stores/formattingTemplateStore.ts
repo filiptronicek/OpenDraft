@@ -9,12 +9,15 @@ import { create } from 'zustand';
 import type { FormattingTemplate } from './formattingTypes';
 import { INDUSTRY_STANDARD_ID } from './formattingTypes';
 import { INDUSTRY_STANDARD_TEMPLATE } from './industryStandardTemplate';
+import { titlePageRules, avBlockRule } from './templates/_helpers';
 import { MULTICAM_SITCOM_TEMPLATE, MULTICAM_SITCOM_ID } from './templates/multicamSitcomTemplate';
 import { ONE_HOUR_DRAMA_TEMPLATE, ONE_HOUR_DRAMA_ID } from './templates/oneHourDramaTemplate';
 import { STAGE_PLAY_TEMPLATE, STAGE_PLAY_ID } from './templates/stagePlayTemplate';
 import { RADIO_PLAY_TEMPLATE, RADIO_PLAY_ID } from './templates/radioPlayTemplate';
+import { PODCAST_TEMPLATE, PODCAST_ID } from './templates/podcastTemplate';
 import { AV_SCRIPT_TEMPLATE, AV_SCRIPT_ID } from './templates/avScriptTemplate';
 import { api } from '../services/api';
+import { useSettingsStore } from './settingsStore';
 
 /** Built-in system templates, keyed by id. Read-only — never persisted. */
 export const SYSTEM_TEMPLATES: Record<string, FormattingTemplate> = {
@@ -23,6 +26,7 @@ export const SYSTEM_TEMPLATES: Record<string, FormattingTemplate> = {
   [ONE_HOUR_DRAMA_ID]: ONE_HOUR_DRAMA_TEMPLATE,
   [STAGE_PLAY_ID]: STAGE_PLAY_TEMPLATE,
   [RADIO_PLAY_ID]: RADIO_PLAY_TEMPLATE,
+  [PODCAST_ID]: PODCAST_TEMPLATE,
   [AV_SCRIPT_ID]: AV_SCRIPT_TEMPLATE,
 };
 
@@ -33,6 +37,7 @@ export const SYSTEM_TEMPLATE_LIST: FormattingTemplate[] = [
   MULTICAM_SITCOM_TEMPLATE,
   STAGE_PLAY_TEMPLATE,
   RADIO_PLAY_TEMPLATE,
+  PODCAST_TEMPLATE,
   AV_SCRIPT_TEMPLATE,
 ];
 
@@ -77,6 +82,128 @@ function now(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Give a stored template the rules it predates.
+ *
+ * Templates are persisted as whole objects, so every one saved before an
+ * element existed comes back without it — and a missing rule means the template
+ * editor cannot show the field and the stylesheet emits nothing for it. Filling
+ * the gaps on read costs one object spread and needs no migration pass over
+ * storage, which matters because templates live in three places (local SQLite,
+ * the backend, and the cloud copy).
+ *
+ * Two sets of rules have arrived this way: the title page's own elements, and
+ * `avBlock` — the element-menu entry for a two-column AV body. The AV one comes
+ * in switched OFF for a template that has never heard of it, because a writer's
+ * own format is theirs to decide: the tick box in the Template Editor is how
+ * they turn it on, not a default chosen for them.
+ *
+ * Only absent ids are added: a rule the writer has already customised is left
+ * exactly as they set it.
+ */
+function withMissingRules(template: FormattingTemplate): FormattingTemplate {
+  const defaults = { ...titlePageRules(), ...avBlockRule(false) };
+  const missing = Object.keys(defaults).filter((id) => !template.rules?.[id]);
+  if (missing.length === 0) return template;
+  const rules = { ...template.rules };
+  for (const id of missing) rules[id] = defaults[id];
+  return { ...template, rules };
+}
+
+
+/**
+ * The optional script-type fields of a template, picked off `source` and
+ * included only where it actually has them.
+ *
+ * These carry the parts of a format that live outside `rules`: the starter
+ * pages, which title-page fields appear, act breaks, dialogue line spacing.
+ * Create and duplicate both dropped them, which went unnoticed while a custom
+ * template could only restyle the document already on screen. It stops being
+ * invisible once a custom template can start a new script — a copy of the
+ * Multi-Cam Sitcom would open on a blank page, single-spaced.
+ *
+ * Absent keys are left out rather than written as `undefined`, so a template
+ * round-trips through JSON storage unchanged. Callers that store the result
+ * must deep-copy it: the source may be a system template, which is a shared
+ * module-level singleton the template editor must never be able to reach.
+ */
+function optionalFormatFields(source: Partial<FormattingTemplate>): Partial<FormattingTemplate> {
+  const out: Partial<FormattingTemplate> = {};
+  if (source.pageLayout) out.pageLayout = source.pageLayout;
+  if (source.starterDocument?.length) out.starterDocument = source.starterDocument;
+  if (source.pageTimeSeconds !== undefined) out.pageTimeSeconds = source.pageTimeSeconds;
+  if (source.titlePageFields?.length) out.titlePageFields = source.titlePageFields;
+  if (source.forceBreakBefore?.length) out.forceBreakBefore = source.forceBreakBefore;
+  if (source.lineHeightMultiplier) out.lineHeightMultiplier = source.lineHeightMultiplier;
+  return out;
+}
+
+/** Resolve an id against the built-in formats first, then the writer's own. */
+/**
+ * `withMissingRules`, answered once per stored template.
+ *
+ * Components subscribe with `useFormattingTemplateStore((s) =>
+ * s.getActiveTemplate())`, and React re-renders whenever that returns a
+ * different object. A template saved without some rules — every duplicate of a
+ * system format but Industry Standard, which alone carries the title-page
+ * rules — was filled in afresh on every read, so the answer was never the same
+ * object twice and the editor re-rendered until React gave up (error #185:
+ * applying "Radio Play (Copy)" left a blank window). Templates are replaced,
+ * never mutated, when they change, so keying on the object is enough.
+ */
+const filledTemplates = new WeakMap<FormattingTemplate, FormattingTemplate>();
+
+function withMissingRulesOnce(template: FormattingTemplate): FormattingTemplate {
+  let filled = filledTemplates.get(template);
+  if (!filled) {
+    filled = withMissingRules(template);
+    filledTemplates.set(template, filled);
+  }
+  return filled;
+}
+
+function resolveTemplate(
+  id: string | null | undefined,
+  templates: FormattingTemplate[],
+): FormattingTemplate | null {
+  if (!id) return null;
+  const sys = SYSTEM_TEMPLATES[id];
+  if (sys) return sys;
+  const found = templates.find((t) => t.id === id);
+  return found ? withMissingRulesOnce(found) : null;
+}
+
+/**
+ * The template with this id, or null if nothing answers to it.
+ *
+ * Callers outside the store used to reach straight into SYSTEM_TEMPLATES, which
+ * silently resolved every custom template to nothing.
+ */
+export function findTemplate(id: string | null | undefined): FormattingTemplate | null {
+  return resolveTemplate(id, useFormattingTemplateStore.getState().templates);
+}
+
+/** In-flight load, so callers arriving together share one round-trip. */
+let loadInFlight: Promise<void> | null = null;
+
+/**
+ * Resolves once the writer's own templates are in the store.
+ *
+ * The enabled-format ids come out of localStorage synchronously, but the
+ * templates they name arrive from storage over a promise. Anything that turns
+ * an id back into a template — starting a new script, above all — has to wait
+ * here first, or a custom format silently falls back to Industry Standard
+ * whenever the writer is quick enough to beat the load.
+ */
+export async function ensureTemplatesLoaded(): Promise<void> {
+  const store = useFormattingTemplateStore.getState();
+  if (store.loaded) return;
+  if (!loadInFlight) {
+    loadInFlight = store.loadTemplates().finally(() => { loadInFlight = null; });
+  }
+  await loadInFlight;
+}
+
 export const useFormattingTemplateStore = create<FormattingTemplateState>((set, get) => ({
   templates: [],
   activeTemplateId: null,
@@ -84,13 +211,7 @@ export const useFormattingTemplateStore = create<FormattingTemplateState>((set, 
 
   getActiveTemplate: () => {
     const { activeTemplateId, templates } = get();
-    if (activeTemplateId) {
-      const sys = SYSTEM_TEMPLATES[activeTemplateId];
-      if (sys) return sys;
-      const found = templates.find((t) => t.id === activeTemplateId);
-      if (found) return found;
-    }
-    return INDUSTRY_STANDARD_TEMPLATE;
+    return resolveTemplate(activeTemplateId, templates) || INDUSTRY_STANDARD_TEMPLATE;
   },
 
   getEnabledElements: () => {
@@ -107,7 +228,7 @@ export const useFormattingTemplateStore = create<FormattingTemplateState>((set, 
   loadTemplates: async () => {
     try {
       const templates = await (api as any).listFormattingTemplates();
-      set({ templates, loaded: true });
+      set({ templates: (templates as FormattingTemplate[]).map(withMissingRules), loaded: true });
     } catch {
       // Storage not available yet or no templates
       set({ loaded: true });
@@ -124,7 +245,9 @@ export const useFormattingTemplateStore = create<FormattingTemplateState>((set, 
       mode: data.mode || 'enforce',
       category: data.category || 'user',
       rules: data.rules || { ...INDUSTRY_STANDARD_TEMPLATE.rules },
-      ...(data.forceBreakBefore?.length ? { forceBreakBefore: [...data.forceBreakBefore] } : {}),
+      // Deep-copied, so a template built from a system format cannot hold a
+      // reference into it and let a later edit rewrite the built-in one.
+      ...JSON.parse(JSON.stringify(optionalFormatFields(data))),
       createdAt: ts,
       updatedAt: ts,
     };
@@ -155,6 +278,17 @@ export const useFormattingTemplateStore = create<FormattingTemplateState>((set, 
       templates: s.templates.filter((t) => t.id !== id),
       activeTemplateId: s.activeTemplateId === id ? null : s.activeTemplateId,
     }));
+    // A deleted template must also stop being a format new scripts can be
+    // started in — otherwise the preference outlives the template it names and
+    // New Screenplay quietly falls back to Industry Standard instead.
+    const settings = useSettingsStore.getState();
+    if (settings.enabledScriptFormats.includes(id)) {
+      // The setter drops a default that is no longer enabled, so this covers
+      // both preferences at once.
+      settings.setEnabledScriptFormats(settings.enabledScriptFormats.filter((f) => f !== id));
+    } else if (settings.defaultScriptFormat === id) {
+      settings.setDefaultScriptFormat(null);
+    }
     try {
       await (api as any).deleteFormattingTemplate(id);
     } catch { /* ignore */ }
@@ -165,13 +299,14 @@ export const useFormattingTemplateStore = create<FormattingTemplateState>((set, 
     if (!source) throw new Error('Template not found');
 
     return get().createTemplate({
+      // Everything that makes the source the format it is, not just its rules:
+      // a duplicate of the 1-Hour TV Drama that had lost the drama's starter
+      // pages and act breaks would only look like the format it came from.
+      ...optionalFormatFields(source),
       name: `${source.name} (Copy)`,
       description: source.description,
       mode: source.mode,
       rules: JSON.parse(JSON.stringify(source.rules)),
-      // Carry the source's page-break rules so a duplicated TV/sitcom template
-      // keeps its act/scene page breaks.
-      forceBreakBefore: source.forceBreakBefore ? [...source.forceBreakBefore] : undefined,
     });
   },
 

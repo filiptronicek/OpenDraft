@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import type { Editor } from '@tiptap/react';
 import FontPicker from './FontPicker';
-import { FONT_REGISTRY, loadFont } from '../utils/fonts';
+import { findFont, loadFontByName } from '../utils/fonts';
 import { useEditorStore } from '../stores/editorStore';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
 import { getCurrentElementRule, getLockedFormatting } from '../utils/effectiveFormatting';
+import Select from './Select';
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 48, 60, 72, 96];
 
@@ -90,7 +91,8 @@ const FormatPanel: React.FC<FormatPanelProps> = ({ editor, onClose }) => {
         for (const mark of node.marks) {
           if (mark.type.name === 'textStyle' && mark.attrs.fontFamily) {
             const f = mark.attrs.fontFamily as string;
-            if (!FONT_REGISTRY.find((r) => r.name === f)) found.add(f);
+            if (findFont(f)) loadFontByName(f);
+            else found.add(f);
           }
         }
       }
@@ -167,8 +169,7 @@ const FormatPanel: React.FC<FormatPanelProps> = ({ editor, onClose }) => {
 
   const handleFontChange = (f: string) => {
     setFont(f);
-    const entry = FONT_REGISTRY.find((e) => e.name === f);
-    if (entry) loadFont(entry);
+    loadFontByName(f);
     preview({ f });
   };
 
@@ -289,13 +290,18 @@ const FormatPanel: React.FC<FormatPanelProps> = ({ editor, onClose }) => {
           {/* Font family */}
           <div className="format-row" style={locked.fontFamily ? { opacity: 0.5, pointerEvents: 'none' } : undefined}>
             <label className="format-label">Font</label>
-            <FontPicker value={font} extraFonts={extraFonts} onChange={handleFontChange} />
+            <FontPicker
+              value={font}
+              extraFonts={extraFonts}
+              onChange={handleFontChange}
+              onManageFonts={() => useEditorStore.getState().setFontsDialogOpen(true)}
+            />
           </div>
 
           {/* Font size */}
           <div className="format-row">
             <label className="format-label">Size</label>
-            <select
+            <Select
               className="format-size-select"
               value={size}
               disabled={locked.fontSize}
@@ -305,7 +311,7 @@ const FormatPanel: React.FC<FormatPanelProps> = ({ editor, onClose }) => {
               {(FONT_SIZES.includes(size) ? FONT_SIZES : [...FONT_SIZES, size].sort((a, b) => a - b)).map((s) => (
                 <option key={s} value={s}>{s}pt</option>
               ))}
-            </select>
+            </Select>
           </div>
 
           {/* Style toggles */}

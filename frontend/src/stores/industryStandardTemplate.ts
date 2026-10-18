@@ -7,6 +7,7 @@
 
 import type { FormattingTemplate, FormattingElementRule } from './formattingTypes';
 import { INDUSTRY_STANDARD_ID } from './formattingTypes';
+import { outlineRules, titlePageRules, avBlockRule } from './templates/_helpers';
 
 function rule(
   id: string,
@@ -35,6 +36,7 @@ function rule(
     nextOnTab: null,
     placeholder: '',
     allowFormatOverride: true,
+    avCell: 'none',
     ...overrides,
   };
 }
@@ -51,7 +53,12 @@ export const INDUSTRY_STANDARD_TEMPLATE: FormattingTemplate = {
     sceneHeading: rule('sceneHeading', 'Scene Heading', {
       bold: true,
       textTransform: 'uppercase',
-      marginTop: 12,
+      // Two blank lines, matching Final Draft's Screenplay template default
+      // (Space Before = 2) and what OpenDraft's own FDX and OSF exporters have
+      // always written. Documents saved under the previous one-line default are
+      // pinned to it on load and offered the change — see
+      // `sceneHeadingSpaceBefore` in editorStore.
+      marginTop: 24,
       nextOnEnter: 'action',
       nextOnTab: 'action',
       placeholder: 'INT./EXT. LOCATION - TIME',
@@ -92,7 +99,7 @@ export const INDUSTRY_STANDARD_TEMPLATE: FormattingTemplate = {
       nextOnEnter: 'sceneHeading',
       placeholder: 'TRANSITION:',
     }),
-    general: rule('general', 'General', {
+    general: rule('general', 'General (Unformatted text)', {
       nextOnEnter: 'general',
       placeholder: 'Text...',
     }),
@@ -140,5 +147,15 @@ export const INDUSTRY_STANDARD_TEMPLATE: FormattingTemplate = {
       nextOnEnter: 'castList',
       placeholder: 'Cast...',
     }),
+    ...outlineRules(),
+    // A two-column AV body. On in a screenplay because a screenplay genuinely
+    // has them — a commercial inside a feature, a documentary insert, a music
+    // video sequence — and because `Insert AV Columns` has always worked here;
+    // this is what puts it in the element menu beside every other element,
+    // rather than only in the Format menu.
+    ...avBlockRule(true),
+    // The title page's own elements, so its typography is part of the template
+    // rather than fixed in the stylesheet.
+    ...titlePageRules(),
   },
 };

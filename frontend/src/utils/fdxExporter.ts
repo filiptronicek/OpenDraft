@@ -1,8 +1,19 @@
 // Final Draft XML (.fdx) exporter — full formatting & layout support
 import type { JSONContent } from '@tiptap/react';
 import type { CharacterProfile, TagCategory, TagItem, BeatInfo, BeatColumn, PageLayout } from '../stores/editorStore';
+import { resolveHeaderFooter } from '../stores/editorStore';
 import { CUSTOM_TYPE_TO_FDX } from './fdxParser';
 import { jsonBlockText } from './nodeText';
+import { sanitizeExportFilename } from './exportFilename';
+import { isNonPrintingType } from './nonPrinting';
+import { noteBlockText } from './noteContent';
+import type { FootnotePlan } from './footnotes';
+import { DEFAULT_TITLE_PAGE_CREDIT } from './titlePageBlocks';
+import { titlePageAttrsCarryData } from './titlePageRegion';
+import {
+  REVISION_COLORS, findRevisionColor, revisionMarkFor, type RevisionSettings,
+} from '../editor/revisionColors';
+import { withElementNumbers, elementNumberOf } from './elementNumbers';
 
 const NODE_TO_FDX: Record<string, string> = {
   sceneHeading: 'Scene Heading',
@@ -43,6 +54,91 @@ function esc(str: string): string {
     // pretty-printers and whitespace-normalizing readers, which would
     // otherwise collapse a raw newline to a space and lose the break.
     .replace(/\r\n?|\n/g, '&#10;');
+}
+
+/**
+ * Build the `<HeaderAndFooter>` block from the document's own settings.
+ *
+ * Final Draft carries the dynamic fields as `<DynamicLabel>` elements rather
+ * than literal text, so a template is split on the tokens OpenDraft shares with
+ * it; `{revision}` has no FDX equivalent and goes out as the resolved text.
+ */
+const FDX_DYNAMIC_LABEL: Record<string, string> = {
+  '{page}': 'Page #',
+  '{pages}': 'Last Page #',
+  '{title}': 'Title',
+  '{date}': 'Date',
+};
+
+function buildHFParagraph(
+  template: string,
+  alignment: 'Left' | 'Center' | 'Right',
+  docFont: string,
+  docFontSize: string,
+): string[] {
+  if (!template) return [];
+  const out: string[] = [];
+  out.push(`      <Paragraph Alignment="${alignment}" FirstIndent="0.00" Leading="Regular" LeftIndent="1.25" RightIndent="-1.00" SpaceBefore="0" Spacing="1" StartsNewPage="No">`);
+  const textRun = (s: string) => {
+    if (!s) return;
+    out.push(`        <Text AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(docFont)}" RevisionID="0" Size="${esc(docFontSize)}" Style="">${esc(s)}</Text>`);
+  };
+  const tokenRe = /(\{page\}|\{pages\}|\{title\}|\{date\}|\{revision\})/gi;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(template)) !== null) {
+    textRun(template.slice(last, m.index));
+    const label = FDX_DYNAMIC_LABEL[m[0].toLowerCase()];
+    // {revision} has no Final Draft counterpart; drop the token rather than
+    // writing a label Final Draft would reject.
+    if (label) out.push(`        <DynamicLabel Type="${label}"/>`);
+    last = tokenRe.lastIndex;
+  }
+  textRun(template.slice(last));
+  out.push('      </Paragraph>');
+  return out;
+}
+
+function buildHeaderAndFooter(
+  pageLayout: PageLayout | undefined,
+  docFont: string,
+  docFontSize: string,
+): string[] {
+  const hf = resolveHeaderFooter(pageLayout);
+  const hasContent = (c: { left: string; center: string; right: string }) =>
+    !!(c.left || c.center || c.right);
+  const headerVisible = hasContent(hf.headerContent);
+  const footerVisible = hasContent(hf.footerContent);
+  // Final Draft's first-page flags are relative to the printed number the
+  // script's opening page carries, the same comparison every OpenDraft
+  // consumer makes.
+  const first = hf.startingPageNumber;
+  const yn = (b: boolean) => (b ? 'Yes' : 'No');
+
+  const out: string[] = [];
+  out.push(
+    `  <HeaderAndFooter FooterFirstPage="${yn(hf.footerStartPage <= first)}"`
+    + ` FooterVisible="${yn(footerVisible)}"`
+    + ` HeaderFirstPage="${yn(hf.headerStartPage <= first)}"`
+    + ` HeaderVisible="${yn(headerVisible)}"`
+    + ` StartingPage="${hf.startingPageNumber}">`,
+  );
+  if (headerVisible) {
+    out.push('    <Header>');
+    out.push(...buildHFParagraph(hf.headerContent.left, 'Left', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.headerContent.center, 'Center', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.headerContent.right, 'Right', docFont, docFontSize));
+    out.push('    </Header>');
+  }
+  if (footerVisible) {
+    out.push('    <Footer>');
+    out.push(...buildHFParagraph(hf.footerContent.left, 'Left', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.footerContent.center, 'Center', docFont, docFontSize));
+    out.push(...buildHFParagraph(hf.footerContent.right, 'Right', docFont, docFontSize));
+    out.push('    </Footer>');
+  }
+  out.push('  </HeaderAndFooter>');
+  return out;
 }
 
 /** Strip HTML tags to plain text (for FDX export — CastMember Description is plain text only) */
@@ -157,9 +253,74 @@ function buildElementSettings(lm: number, ri: number, font: string, size: string
 
 interface MarkInfo { type: string; attrs?: Record<string, unknown>; }
 
-function getTextAttributes(marks?: MarkInfo[]): string {
-  if (!marks || marks.length === 0) return '';
+/**
+ * Final Draft numbers revisions; a run's RevisionID points into the file's
+ * `<Revisions>` list. OpenDraft numbers them by the colour's place in the
+ * production sequence, so the same colour is the same ID in every file.
+ */
+function fdxRevisionId(color: string): number {
+  const i = REVISION_COLORS.findIndex((c) => c.name === findRevisionColor(color)?.name);
+  return i < 0 ? 1 : i + 1;
+}
+
+/** Every revision colour a document's text or blocks carry. */
+function collectRevisionColors(node: JSONContent, out: Set<string> = new Set()): Set<string> {
+  if (typeof node.attrs?.revised === 'string' && node.attrs.revised) out.add(node.attrs.revised);
+  for (const mark of node.marks ?? []) {
+    if (mark.type === 'textStyle' && mark.attrs?.revision) out.add(String(mark.attrs.revision));
+  }
+  for (const child of node.content ?? []) collectRevisionColors(child, out);
+  return out;
+}
+
+/** Revision Mode's state at export, for the `<Revisions>` block. */
+export interface FDXExportOptions {
+  /** False leaves scene numbers out, as hiding them did before they could be
+   *  locked. Absent writes whatever numbers the scenes carry. */
+  sceneNumbersVisible?: boolean;
+  /** Write the numbers the active format puts on other elements
+   *  (utils/elementNumbers) as each paragraph's `Number`, which is where Final
+   *  Draft keeps a numbered element's number. Absent or false writes none. */
+  elementNumbersVisible?: boolean;
+}
+
+export interface FDXRevisionState {
+  mode: boolean;
+  color: string;
+  /** The marks to write for each revision; absent writes an asterisk. */
+  settings?: RevisionSettings | null;
+}
+
+function buildRevisions(doc: JSONContent, state?: FDXRevisionState): string[] {
+  const used = collectRevisionColors(doc);
+  if (state?.mode) used.add(state.color);
+  if (used.size === 0) return [];
+  const listed = REVISION_COLORS.filter((c) => [...used].some((u) => findRevisionColor(u)?.name === c.name));
+  // The active set has to be one the file defines: the current colour when
+  // it is listed, otherwise the latest round that is.
+  const current = state?.color ? findRevisionColor(state.color)?.name : undefined;
+  const active = current && listed.some((c) => c.name === current)
+    ? fdxRevisionId(current)
+    : fdxRevisionId(listed[listed.length - 1]?.name ?? 'White');
+  const out = [
+    '',
+    `  <Revisions ActiveSet="${active}" Location="7.75" RevisionMode="${state?.mode ? 'Yes' : 'No'}" RevisionsShown="Active" ShowAllMarks="Yes" ShowAllSets="Yes" ShowPageColor="No">`,
+  ];
+  for (const c of listed) {
+    out.push(`    <Revision Color="#000000000000" FullRevision="No" ID="${fdxRevisionId(c.name)}" Mark="${esc(revisionMarkFor(state?.settings, c.name))}" Name="${esc(c.name)} Revision" PageColor="${c.fdx}" Style=""/>`);
+  }
+  out.push('  </Revisions>');
+  return out;
+}
+
+function getTextAttributes(marks?: MarkInfo[], blockRevision?: string): string {
   const parts: string[] = [];
+  let revision = blockRevision;
+  for (const mark of marks ?? []) {
+    if (mark.type === 'textStyle' && mark.attrs?.revision) revision = String(mark.attrs.revision);
+  }
+  if (revision) parts.push(`RevisionID="${fdxRevisionId(revision)}"`);
+  if (!marks || marks.length === 0) return parts.length > 0 ? ' ' + parts.join(' ') : '';
   const styles: string[] = [];
   let fontName = '', fontSize = '', fontColor = '';
 
@@ -188,7 +349,21 @@ export interface FDXDocumentFont {
   size?: number;
 }
 
-export function exportFDX(doc: JSONContent, title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont): string {
+/**
+ * `_title` is the document's name, and deliberately unused: it used to be the
+ * fallback title on the exported title page, which is exactly the bug issue #98
+ * reported. It stays in the signature because every argument after it is
+ * positional, and `downloadFDX` still names the file after it.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- see above
+export function exportFDX(doc: JSONContent, _title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont, footnotes?: FootnotePlan | null, revisions?: FDXRevisionState, options: FDXExportOptions = {}): string {
+  // Printing notes reach a file only when the writer asked them to.
+  const plan = footnotes && footnotes.settings.includeInExports ? footnotes : null;
+  // Labels for numbered elements, on a copy; the same document when none are.
+  doc = withElementNumbers(doc, {
+    visible: options.elementNumbersVisible === true,
+    sceneNumbersVisible: options.sceneNumbersVisible !== false,
+  });
   // Final Draft keeps the typeface on each element's FontSpec; the screenplay
   // Courier is the default a file gets when the writer has not changed it.
   const docFont = documentFont?.family || 'Courier Prime';
@@ -216,42 +391,64 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
   lines.push(buildElementSettings(leftIndent, rightIndent, docFont, docFontSize));
   lines.push('');
 
-  // Header
-  lines.push('  <HeaderAndFooter FooterFirstPage="Yes" FooterVisible="No" HeaderFirstPage="No" HeaderVisible="Yes" StartingPage="1">');
-  lines.push('    <Header>');
-  lines.push('      <Paragraph Alignment="Right" FirstIndent="0.00" Leading="Regular" LeftIndent="1.25" RightIndent="-1.00" SpaceBefore="0" Spacing="1" StartsNewPage="No">');
-  lines.push('        <DynamicLabel Type="Page #"/>');
-  lines.push(`        <Text AdornmentStyle="0" Background="#FFFFFFFFFFFF" Color="#000000000000" Font="${esc(docFont)}" RevisionID="0" Size="${esc(docFontSize)}" Style="">.</Text>`);
-  lines.push('      </Paragraph>');
-  lines.push('    </Header>');
-  lines.push('  </HeaderAndFooter>');
+  // Header and footer — the document's own settings, not a fixed page number.
+  // Final Draft models each band as aligned paragraphs plus attributes for
+  // first-page visibility and the starting number, which is close enough to
+  // OpenDraft's model to carry across without loss.
+  lines.push(...buildHeaderAndFooter(pageLayout, docFont, docFontSize));
   lines.push('');
 
-  // Title page — extract structured attrs from titlePage nodes if available
+  // Title page — the structured fields live on the one `field: 'title'` node.
+  //
+  // Whether there is a title page at all is `titlePageAttrsCarryData`, the test
+  // the paginator, the PDF exporter and the DOCX exporter already share. This
+  // asked for a non-empty `tpTitle` instead, and — worse — fell back to the
+  // *document* title when it found none, writing `<TitlePage>` unconditionally.
+  // A script that had never had a title page therefore exported one reading
+  // "Untitled Screenplay", and reopening that .fdx read the name straight back
+  // in as a title page the writer never wrote (issue #98). The same test also
+  // left a title page carrying a credit but no title contributing nothing.
+  //
+  // The element itself always ships — Final Draft expects it — but an untouched
+  // title page now ships empty, which is what "preserve it as-is" means for a
+  // blank one. `title` stays in the signature: `downloadFDX` still names the
+  // file after it, and the argument is positional.
   lines.push('  <TitlePage>');
   lines.push('    <Content>');
-  let tpTitle = title;
+  let tpTitle = '';
+  let tpCredit = DEFAULT_TITLE_PAGE_CREDIT;
   let tpWrittenBy = '';
   let tpBasedOn = '';
   let tpDraft = '';
   let tpContact = '';
   let tpCopyright = '';
+  let tpWgaRegistration = '';
+  let tpNotes = '';
   if (doc.content) {
     for (const node of doc.content) {
-      if (node.type === 'titlePage' && node.attrs?.field === 'title' && node.attrs?.tpTitle) {
-        tpTitle = node.attrs.tpTitle || title;
-        tpWrittenBy = node.attrs.tpWrittenBy || '';
-        tpBasedOn = node.attrs.tpBasedOn || '';
-        tpDraft = [node.attrs.tpDraft, node.attrs.tpDraftDate].filter(Boolean).join(' - ');
-        tpContact = node.attrs.tpContact || '';
-        tpCopyright = node.attrs.tpCopyright || '';
+      if (node.type === 'titlePage'
+          && titlePageAttrsCarryData(node.attrs as Record<string, unknown> | undefined)) {
+        const attrs = node.attrs ?? {};
+        tpTitle = attrs.tpTitle || '';
+        tpCredit = attrs.tpCredit || DEFAULT_TITLE_PAGE_CREDIT;
+        tpWrittenBy = attrs.tpWrittenBy || '';
+        tpBasedOn = attrs.tpBasedOn || '';
+        tpDraft = [attrs.tpDraft, attrs.tpDraftDate].filter(Boolean).join(' - ');
+        tpContact = attrs.tpContact || '';
+        tpCopyright = attrs.tpCopyright || '';
+        tpWgaRegistration = attrs.tpWgaRegistration || '';
+        tpNotes = attrs.tpNotes || '';
         break;
       }
     }
   }
-  lines.push(`      <Paragraph Type="General" Alignment="Center" SpaceBefore="288"><Text>${esc(tpTitle)}</Text></Paragraph>`);
+  if (tpTitle) {
+    lines.push(`      <Paragraph Type="General" Alignment="Center" SpaceBefore="288"><Text>${esc(tpTitle)}</Text></Paragraph>`);
+  }
   if (tpWrittenBy) {
-    lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>Written by</Text></Paragraph>`);
+    // The credit the writer chose, not a fixed "Written by" — a script credited
+    // "Screenplay by" said the wrong thing on every .fdx it was exported to.
+    lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpCredit)}</Text></Paragraph>`);
     lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpWrittenBy)}</Text></Paragraph>`);
     if (tpBasedOn) {
       lines.push(`      <Paragraph Type="General" Alignment="Center"><Text>${esc(tpBasedOn)}</Text></Paragraph>`);
@@ -267,6 +464,15 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
   }
   if (tpCopyright) {
     lines.push(`      <Paragraph Type="General"><Text>${esc(tpCopyright)}</Text></Paragraph>`);
+  }
+  // The registration sits with the copyright, and the notes at the foot —
+  // matching what `deriveTitlePageLines` lays out on screen. Neither was
+  // written at all, so both were lost the moment a script was exported.
+  if (tpWgaRegistration) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(tpWgaRegistration)}</Text></Paragraph>`);
+  }
+  for (const line of tpNotes.split('\n').filter((l) => l.trim() !== '')) {
+    lines.push(`      <Paragraph Type="General"><Text>${esc(line)}</Text></Paragraph>`);
   }
   lines.push('    </Content>');
   lines.push('  </TitlePage>');
@@ -318,11 +524,19 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
   }
 
   // Helper: emit a single Paragraph element
-  const emitParagraph = (node: JSONContent, indent: string) => {
+  const emitParagraph = (node: JSONContent, indent: string, noteTexts: readonly string[] = []) => {
     const fdxType = resolveFdxExportType(node);
     const paraAttrs: string[] = [`Type="${fdxType}"`];
 
-    if (node.attrs?.sceneNumber) paraAttrs.push(`Number="${node.attrs.sceneNumber}"`);
+    // Hidden numbers are not printed numbers. Locked ones are kept on the
+    // scenes while hidden, so they are left out here rather than by clearing.
+    // An element number (utils/elementNumbers) takes the paragraph's one
+    // Number. A script imported from Final Draft and saved before it was ever
+    // opened can still carry Final Draft's own on the paragraph; writing both
+    // would repeat the attribute and break the XML.
+    const elementNumber = elementNumberOf(node);
+    if (elementNumber) paraAttrs.push(`Number="${esc(elementNumber)}"`);
+    else if (node.attrs?.sceneNumber && options.sceneNumbersVisible !== false) paraAttrs.push(`Number="${node.attrs.sceneNumber}"`);
     if (node.attrs?.textAlign) {
       const a = ALIGNMENT_TO_FDX[node.attrs.textAlign as string];
       if (a) paraAttrs.push(`Alignment="${a}"`);
@@ -333,6 +547,17 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
 
     if (node.content && node.content.length > 0) {
       lines.push(`${indent}<Paragraph ${attrStr}>`);
+      // Printing script notes travel as Final Draft's own ScriptNote element.
+      //
+      // Be clear about what this is: Final Draft has no footnote. A ScriptNote
+      // is a NON-PRINTING annotation shown in its Notes pane, so the citation
+      // arrives with the script and is not lost, but Final Draft will not print
+      // it at the foot of the page the way the PDF does.
+      for (const text of noteTexts) {
+        lines.push(`${indent}  <ScriptNote>`);
+        lines.push(`${indent}    <Paragraph><Text>${esc(text)}</Text></Paragraph>`);
+        lines.push(`${indent}  </ScriptNote>`);
+      }
       // Scene heading synopsis → SceneProperties/Summary (Final Draft format)
       if (node.type === 'sceneHeading' && node.attrs?.synopsis) {
         lines.push(`${indent}  <SceneProperties>`);
@@ -346,6 +571,9 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
       // A Character paragraph must stay on one line — a break there would
       // read as a second, phantom speaker. Collapse rather than encode.
       const collapseBreaks = fdxType === 'Character';
+      // A block flagged for an edit with no text of its own (a deletion, an
+      // element change) puts its revision on its first run.
+      let blockRevision = typeof node.attrs?.revised === 'string' && node.attrs.revised ? node.attrs.revised : undefined;
       for (const child of node.content) {
         if (child.type === 'hardBreak') {
           if (!collapseBreaks) {
@@ -356,20 +584,65 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
             lines.push(`${indent}  <Text> </Text>`);
           }
         } else if (child.type === 'text' && child.text) {
-          const ta = getTextAttributes(child.marks as MarkInfo[] | undefined);
+          const ta = getTextAttributes(child.marks as MarkInfo[] | undefined, blockRevision);
+          blockRevision = undefined;
           lines.push(`${indent}  <Text${ta}>${esc(child.text)}</Text>`);
         }
       }
+      lines.push(`${indent}</Paragraph>`);
+    } else if (noteTexts.length > 0) {
+      lines.push(`${indent}<Paragraph ${attrStr}>`);
+      for (const text of noteTexts) {
+        lines.push(`${indent}  <ScriptNote>`);
+        lines.push(`${indent}    <Paragraph><Text>${esc(text)}</Text></Paragraph>`);
+        lines.push(`${indent}  </ScriptNote>`);
+      }
+      lines.push(`${indent}  <Text></Text>`);
       lines.push(`${indent}</Paragraph>`);
     } else {
       lines.push(`${indent}<Paragraph ${attrStr}><Text></Text></Paragraph>`);
     }
   };
 
+  // The last block that will actually be written out, so the general notes have
+  // something real to hang from.
+  const lastBodyIndex = doc.content
+    ? doc.content.reduce((last, node, idx) => (
+      isNonPrintingType(node.type) || node.type === 'screenplayImage' || node.type === 'titlePage'
+        ? last : idx
+    ), -1)
+    : -1;
+
   if (doc.content) {
-    for (const node of doc.content) {
+    for (let srcIndex = 0; srcIndex < doc.content.length; srcIndex++) {
+      const node = doc.content[srcIndex];
+      /** Citation text for the notes anchored in this block, if any. */
+      const noteTexts = (plan?.refsByNode.get(srcIndex) ?? [])
+        .map((ref) => plan!.entryById.get(ref.noteId))
+        .filter((e): e is NonNullable<typeof e> => !!e)
+        .map((e) => `${e.entryLabel}. ${e.blocks.map(noteBlockText).filter(Boolean).join(' ')}`.trim());
+      // General notes belong to the file, not to any line of it, and Final Draft
+      // has nowhere to put such a thing. Rather than drop them, they ride on the
+      // last paragraph of the script — which is as near to "the end" as the
+      // format allows.
+      if (plan && srcIndex === lastBodyIndex) {
+        for (const e of plan.generalEntries) {
+          const body = e.blocks.map(noteBlockText).filter(Boolean).join(' ');
+          noteTexts.push(`${e.entryLabel}. ${e.title ? `${e.title} — ` : ''}${body}`.trim());
+        }
+      }
       // FDX has no representation for inserted images — skip them.
+      // Fountain's non-printing structure has no Final Draft equivalent that
+      // stays off the page — a Paragraph of any type prints — so it is left out
+      // rather than smuggled in as Action.
+      if (isNonPrintingType(node.type)) continue;
       if (node.type === 'screenplayImage') continue;
+      // The title page has already been written to <TitlePage><Content>, which
+      // is where Final Draft looks for it. Emitting these here as well put the
+      // title, credit and copyright at the top of the script body — reopening
+      // the exported file showed the title page on script page 1, which is the
+      // very thing issue #52 is about.
+      if (node.type === 'titlePage') continue;
       if (node.type === 'dualDialogue') {
         // Wrap in DualDialogue element — flatten columns into paragraphs
         lines.push('    <DualDialogue>');
@@ -399,13 +672,20 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
                 // Hard breaks come through as newlines, which esc() encodes as
                 // &#10; — the same in-paragraph break encoding used above.
                 const text = jsonBlockText(para);
-                lines.push(`    <Paragraph Type="General" data-av-side="${esc(side)}" data-av-row-id="${esc(rowId)}"><Text>${esc(text)}</Text></Paragraph>`);
+                // A cell holds ordinary screenplay elements too, when the
+                // active template allows it. Those have a real FDX type, so
+                // they get it: Final Draft then shows a Character as a
+                // Character instead of one more line of General. The four AV
+                // paragraph types have no FDX equivalent and stay General,
+                // which is what this export has always degraded them to.
+                const fdxType = resolveFdxExportType(para);
+                lines.push(`    <Paragraph Type="${esc(fdxType)}" data-av-side="${esc(side)}" data-av-row-id="${esc(rowId)}" data-av-style="${esc(para.type || 'avPara')}"><Text>${esc(text)}</Text></Paragraph>`);
               }
             }
           }
         }
       } else {
-        emitParagraph(node, '    ');
+        emitParagraph(node, '    ', noteTexts);
       }
     }
   }
@@ -467,14 +747,16 @@ export function exportFDX(doc: JSONContent, title: string = 'Untitled', characte
     lines.push('  </DisplayBoards>');
   }
 
+  lines.push(...buildRevisions(doc, revisions));
+
   lines.push('</FinalDraft>');
 
   return lines.join('\n');
 }
 
-export async function downloadFDX(doc: JSONContent, title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont) {
-  const xml = exportFDX(doc, title, characterProfiles, tagCategories, tags, beats, beatColumns, pageLayout, documentFont);
-  const filename = `${title.replace(/[^a-zA-Z0-9_\- ]/g, '')}.fdx`;
+export async function downloadFDX(doc: JSONContent, title: string = 'Untitled', characterProfiles?: CharacterProfile[], tagCategories?: TagCategory[], tags?: TagItem[], beats?: BeatInfo[], beatColumns?: BeatColumn[], pageLayout?: PageLayout, documentFont?: FDXDocumentFont, footnotes?: FootnotePlan | null, revisions?: FDXRevisionState, options: FDXExportOptions = {}) {
+  const xml = exportFDX(doc, title, characterProfiles, tagCategories, tags, beats, beatColumns, pageLayout, documentFont, footnotes, revisions, options);
+  const filename = `${sanitizeExportFilename(title)}.fdx`;
   const { saveFile } = await import('./fileOps');
   await saveFile(xml, filename, [{ name: 'Final Draft', extensions: ['fdx'] }]);
 }

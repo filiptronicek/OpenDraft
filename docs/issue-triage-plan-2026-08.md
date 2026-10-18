@@ -1,5 +1,10 @@
 # Open Issue Triage & Remediation Plan — August 2026
 
+> **Second batch (2026-08-17).** `ServerBaby` filed #74–#78 on 2026-08-16, after
+> the v0.23 work below. All five were validated against the code and against the
+> Fountain specification, Final Draft's knowledge base and the OSF 2.1 schema;
+> all five held up. See **Second batch** at the end of this document.
+
 > **Status update (2026-08-12).** #65, #66, #67, #68 and #62 Phase 1 are
 > implemented on `main`; see "Implementation notes" at the end of this document
 > for what shipped and what still needs on-device verification. #64 needs no
@@ -360,9 +365,14 @@ take the existing snapshot down with it. Covered by
   rather than reporting a save that did not happen.
 - `StatusBar` — shows the file Save will overwrite.
 
-**Deliberately excluded:** `.fadein`. It is an OSF archive and OpenDraft has no
-OSF writer, so `IN_PLACE_EDITABLE_EXTENSIONS` is `fdx`/`fountain`/`txt` and
-picking a `.fadein` explains why rather than promising a Save it cannot honour.
+**Deliberately excluded at the time:** `.fadein`. It is an OSF archive and
+OpenDraft had no OSF writer, so `IN_PLACE_EDITABLE_EXTENSIONS` was
+`fdx`/`fountain`/`txt` and picking a `.fadein` explained why rather than
+promising a Save it could not honour.
+
+> **Superseded (2026-08-17).** `utils/osfExporter.ts` shipped in `0483837`
+> ("Add a Fade In (.fadein / OSF) writer") and File ▸ Export ▸ Fade In works, so
+> the "no OSF writer" reasoning below and under #62 Phase 2 no longer holds.
 
 **Data-loss guard:** `setImportedSource()` now also clears `documentOrigin` —
 they are mutually exclusive answers to "where did this document come from", and
@@ -560,3 +570,237 @@ and a `takePersistableUriPermission` call for READ). What was missing:
 A provider that refuses a write grant will fail at Save time with a clear
 message, and the editor stays in the error state rather than claiming a save
 that did not happen.
+
+---
+
+# Second batch — #74–#78 (2026-08-17)
+
+Filed by `ServerBaby` on 2026-08-16, on iPad, after the v0.23 release. Each claim
+was checked against the code, and each "industry standard" claim against primary
+documentation. **All five were correct**; two turned out to be worse than
+reported, and one exposed an inconsistency the reporter could not have seen.
+
+## Standards checked
+
+| Claim | Source | Verdict |
+|---|---|---|
+| Two blank lines before a Scene Heading is standard | [Final Draft KB](https://kb.finaldraft.com/hc/en-us/articles/15575271650452-Why-are-there-two-blank-lines-above-a-Scene-Heading-and-a-Shot) — "Final Draft's default Screenplay template is already set this way", Space Before = 2 | Confirmed |
+| Fade In has a configurable Space Before | Fade In element styles expose "the spacing before the paragraph" | Confirmed |
+| …but it is not a hard rule | A 2013 Black List analysis found ~18% of scripts used single spacing | Confirmed — hence configurable, not hard-coded |
+| Fountain markup should not become visible text | [Fountain spec](https://fountain.io/syntax/) — emphasis is `*`/`**`/`_`, literal delimiters are backslash-escaped; a Scene Heading may have **nothing** before `INT`/`EXT`; scene numbers go at the **end** as `#47#` | Confirmed; `**47 EXT. …**` violates the spec twice |
+| Leading spaces in unformatted text should survive | Fountain spec — "tabs and spaces are retained in Action elements" | Confirmed |
+| "General" is unclear | FDX calls it **General**; OSF 2.1 (Fade In's own format) has no `General` and calls it **Normal Text** | Confirmed as a naming gap — the reporter is a Fade In user. Kept the id, changed the label |
+
+## What was actually wrong
+
+**#75 — Fountain round trip. The most serious of the five: silent corruption on
+an ordinary ⌘S.** `MenuBar.tsx` routes Save for any in-place `.fountain`/`.txt`
+through `exportFountain`, so no user "conversion" was needed — which is exactly
+why the reporter could not identify one. Three compounding defects: the exporter
+emitted marks with no escaping, no edge-whitespace handling and no run merging
+(the FDX/OSF importers attach bold to every scene heading, so headings exported
+as `**INT. …**`); it never wrote forcing syntax, so a heading not starting with
+`INT./EXT.` could not round-trip and scene numbers were dropped; and the parser's
+emphasis regexes over-spanned (`**A** and **B**` produced literal asterisks).
+The worst symptom was not the visible `**` — a bolded heading failed the anchored
+heading regex, matched `isCharacterLine`, and **became a character cue with the
+action beneath it turning into dialogue**.
+
+The existing round-trip test was *text*-first, so it structurally could not catch
+a *doc*-first bug. Both directions are now covered, plus an on-disk harness.
+
+**#74 — General and indentation.** No live indentation-based auto-detection
+exists, so the reporter's stated mechanism was not what happened — but four real
+defects produced exactly their symptoms: a spaces-only line counted as blank, so
+Enter opened the element picker and the choice overwrote the chosen type;
+Enter-at-start hardcoded the new line to Action; the PDF word-wrapper silently
+dropped leading spaces while the line counter kept them (so editor and PDF
+disagreed on page breaks); and General round-tripped to Action through both
+Fountain and Word.
+
+**#76 — Spacing.** Confirmed, and the app already disagreed with itself:
+`fdxExporter` wrote `SpaceBefore="24"` and `osfExporter` `spacebefore="2.0"`
+while the editor, pagination, PDF and DOCX all used one line. A script exported
+to Final Draft repaginated longer than OpenDraft had shown. Separately, the
+per-element `marginTop` the Template Editor exposes reached **CSS only** — a
+control that silently did nothing outside the editor.
+
+## Housekeeping still outstanding
+
+- Label #74–#78, and create the `platform:ios` label the first batch also wanted.
+- `docs/feature-gap-analysis-fade-in.md` is written against v0.12.0 and is stale
+  in several rows beyond the Space Before one added here.
+
+---
+
+# #100 — Consecutive blank lines (2026-09-01)
+
+Filed by `ServerBaby` on iPad against v0.26.0. Correct as written, including the
+spaces-only detail and the observation that the "insert above a populated line"
+workaround has no equivalent at the end of a script.
+
+**Mechanism.** `EnterHandlerExtension` in `ScreenplayEditor.tsx` treated a blank
+line as "the writer is choosing what comes next", opened `ElementPicker` and
+returned `true` — the keystroke was consumed and no line was inserted. Inside
+the picker, Enter accepted the highlighted row, and the highlighted row is index
+0 of a context-ordered list that for an Action line *is* Action: pressing Enter
+twice on a blank Action line therefore did nothing at all. Escape dismissed the
+picker, but the next Enter re-opened it, so there was no exit at any depth. The
+same shape existed in `AvKeymap`'s empty-cell branch.
+
+## Standards checked
+
+| Claim | Source | Verdict |
+|---|---|---|
+| Enter on an empty element opening a menu is a legitimate pattern | Movie Magic Screenwriter ([manual](http://support.screenplay.com/filestore/mmsw6/docs/mmsw6_usermanual.pdf) §1.8.4 QuickType), WriterDuet ("Show line type select on enter"), Arc Studio ("hit `Return` on any empty element … opens the element mode shortcut list"), Final Draft Writer ("going to a new line with Enter, then pressing Enter again to bring up the elements menu") | Confirmed — keep the picker |
+| …but every one of them ships a way out | Movie Magic: *"type 'v' for Nevermind to Cancel, or press ESC"*; Fade In: ESC dismisses, ESC again re-displays; Final Draft SmartType: keep typing and it goes away | Confirmed — this is the gap |
+| …and most ship an off switch | Final Draft "Show SmartType Window"; Movie Magic "Enable Quick Entry"; WriterDuet "Show line type select on enter" | Confirmed — added as a preference |
+| Blocking consecutive empty paragraphs is not done anywhere | Final Draft's Return table maps **Action → Action**; Movie Magic allows them and cleans them at SmartCheck time; Fountain treats a blank line as load-bearing syntax | Confirmed — OpenDraft was stricter than the whole category |
+| A key-triggered popup must never make a literal newline unreachable | [W3C ARIA combobox pattern](https://www.w3.org/WAI/ARIA/apg/patterns/combobox/) — "Escape: dismisses the popup"; VS Code ships `editor.acceptSuggestionOnEnter: "off"` so Enter is always a newline | Confirmed |
+| Blank lines are *not* how a pro adds vertical space | [Final Draft KB](https://kb.finaldraft.com/hc/en-us/articles/15575372032020) — *"Hitting Return or Enter places blank paragraphs in your script that can affect pagination later… Don't do it."* Use Space Before | Confirmed — but advice, not a lock. OpenDraft's per-element spacing (from #76) is the right tool; the editor still must not refuse the keystroke |
+
+## The fix
+
+`editor/blankLine.ts` holds the three decisions as pure functions
+(`isBlankBlock`, `previousSiblingBlock`, `blankLineTypeFor`), unit-tested in
+`blankLine.test.ts`, and both Enter handlers read them. Enter on a blank line
+still opens the picker, and now four things insert the line instead:
+
+1. **Enter with nothing chosen in the picker.** Enter opened the menu, so it
+   cannot also mean "accept the highlighted row" — nothing is highlighted until
+   an arrow key picks something, and the ⏎ marker moves to whatever Enter will
+   actually do.
+2. **Choosing the element the line is already on.** The menu only ever opens on
+   a blank line, so that row cannot mean "convert this line" — as a conversion
+   it is a no-op, and it is the row a writer lands on most, since the list is
+   ordered current-type first. It means one more line of this element. The row
+   is labelled `blank line` so this is read off the menu, not discovered.
+3. **A "Blank Line" row**, sticky at the foot of the menu. Movie Magic's
+   "Nevermind" item, and the only route that works by tap on iPad.
+4. **The line after a blank line.** The menu offered itself once; a second blank
+   line is an answer, not a new question. This is what makes a *run* of blank
+   lines cost one keystroke each, at the end of the script included.
+5. **Escape, then Enter.** A dismissal is remembered for the line it happened on
+   (`pickerDismissedAtRef`), cleared the moment the caret moves — the ARIA
+   invariant above.
+
+Plus two settings, both under **Settings → Editing**:
+
+- **"Offer the element menu when I press Enter on a blank line"**, default on.
+- **An element menu shortcut**, default `Alt-Enter` (`⌥↩` on a Mac). It opens
+  the menu wherever the caret is — on a line with text as well, where the menu
+  is an ordinary type chooser: no Blank Line row, no `blank line` marker, and
+  Enter accepts the highlighted row straight away. It is also the route to the
+  menu for anyone who turns the Enter route off, and it reaches the same menu
+  from **Format → Element → Show Element Menu…**.
+
+Shortcuts are stored in ProseMirror notation with `Mod` left unresolved, so the
+setting follows a writer between a Mac and a PC and reads as that platform's own
+shortcut on each. `utils/shortcuts.ts` holds the recording, matching and
+display, unit-tested in `shortcuts.test.ts`; the recorder reads `event.code`
+rather than `event.key`, because on a Mac Option+E reports its key as `Dead` —
+it is the accent prefix for é — and Option with almost any letter reports a
+different character entirely.
+
+## Submenu placement, found alongside
+
+Right-clicking low on the page opened the Element submenu — and Revision Color —
+off the bottom of the window, with no way to reach the rest of the list. CSS
+alone could only ever say "flush right of the row, aligned with it", which near
+an edge is off screen. `CtxSubmenu` in `ScriptContextMenu.tsx` now places every
+submenu against the row it hangs off: flipped left when there is no room right,
+lifted when it would run off the bottom, and capped to the window with its own
+scrollbar when it is taller than the screen. They are `position: fixed`, which
+also let the context menu itself become scrollable when it is too tall without
+clipping its own submenus.
+
+**The trap in the fix.** `splitBlock` gives the new node the *schema default*
+whenever the caret is at the end of a block — always true on a blank one — and
+this document's default is `sceneHeading`. An unset blank line would have come
+out as an empty scene heading, in the navigator and the scene numbering. Every
+insertion path sets the type explicitly; `blankLineTypeFor` is the single place
+that decides it, and keeps General (#74), title-page lines (#52) and AV cells
+(where `action` is not a legal child at all) out of the Action default. Route 2
+overrides it with the type the writer actually named, and re-applies a custom
+element's `customTypeId`/`customLabel`, which the split drops.
+
+## ALL CAPS on a multi-line selection, found alongside
+
+Right-click → Style → ALL CAPS across several lines returned them as one line.
+`handleAllCaps` read the selection as a string and wrote it back with
+`insertText` over the whole range — which replaces the block boundaries inside
+that range as well, so the lines merged, and the plain text it inserted carried
+none of the marks the original had (bold, italic, script notes, revision
+highlight). `editor/caseTransform.ts` rewrites each text node where it sits
+instead, re-created with its own marks, and maps positions as it goes because a
+case change is not always length-preserving — German ß upper-cases to SS.
+Covered in `caseTransform.test.ts`.
+
+## Footnotes vanishing on a page that ends in (MORE)
+
+Reported as "when a page has CONT'D it does not show the page footnote", and
+reproduced from the reporter's own `Test CONTD` document.
+
+`computeBreaks` accumulates the notes a page owes in `pageNotes` as it walks the
+blocks. Every ordinary page break closes on that: `closePage(pageNotes)`. The
+dialogue-split path closed on `committed` instead — the notes belonging to the
+character cue and the half of the speech that fitted — which **discarded every
+note the rest of the page had already claimed**. A page whose last speech
+carried over therefore printed no footnotes at all, including notes anchored
+several elements earlier.
+
+In the reporter's document the single printing note sits on a MARCUS cue on page
+1, and page 1 ends in a dialogue split: before the fix `footnotePages` came back
+`[]` for all four pages, so the note printed nowhere. `closePage` now takes
+`pageNotes.concat(committed)`. Covered in `footnotePagination.test.ts`, at two
+filler lengths either side of the split boundary so the case survives a change
+in how many lines the filler happens to take.
+
+## A speech that would not split unless a blank line happened to follow it
+
+Reported as "the entire dialogue shifts to the next page; it splits only when
+there is a blank line between the dialogue", with the telling addition that
+adding a blank line *above* made it split too.
+
+Not about blank lines at all. Enter already starts a new dialogue paragraph
+(`nextOnEnter` for Dialogue is Dialogue), and every paragraph boundary is a
+candidate split point. The defect was in choosing between them: the loop filled
+the page greedily and then tested Final Draft's two-lines-either-side rule
+**once**, on that one boundary. If the fullest page left a single line behind —
+which is what happens when the last paragraph of a speech is one line long — the
+test failed and the split was abandoned outright, sending the whole speech to
+the next page. Nothing was tried in between, so whether a speech split came down
+to whether the last paragraph happened to fall the right way. Adding or removing
+a blank line anywhere above shifted the arithmetic and flipped the result, which
+is exactly why it looked arbitrary.
+
+Every affordable boundary is now recorded as the page fills, and the choice
+walks back from the fullest until one leaves the minimum on both sides. The rule
+is kept rather than relaxed — the split just lands a paragraph earlier. A speech
+with no legal boundary at all still travels whole rather than orphaning a line.
+
+Confirmed on the reporter's document: with the trailing blank line the break
+falls at node 78; with it deleted the break used to jump to node 70, the
+character cue, taking the whole speech with it, and now falls at node 77.
+
+**The remaining limit, unchanged:** a *single* paragraph cannot split. The
+on-screen break is a `margin-top` on a whole node, so a long paragraph moves
+whole, and one longer than a page overflows it — 85 lines recorded on a 58-line
+page in a synthetic case. Splitting inside a paragraph would mean addressing a
+break at a character offset rather than a node.
+
+## (MORE)/CONT'D in the Word export — decided against
+
+`docxExporter` has no line-level pagination: it emits paragraphs and lets Word
+decide where pages fall. It therefore cannot know where a speech splits, and
+never writes `(MORE)` or `CHARACTER (CONT'D)`.
+
+The only way to write them correctly is to run the same break computation the
+editor uses and emit explicit page breaks, which is what Final Draft's Word
+export does. **Rejected:** that would force OpenDraft's line model onto every
+exported document, not only ones with split dialogue, and Word's own metrics on
+the reader's machine need not agree with ours. Keeping Word's pagination is
+worth more than the labels.
+
+So this is an accepted gap, not an open defect. The PDF export is unaffected —
+it lays out line by line and does draw both labels.

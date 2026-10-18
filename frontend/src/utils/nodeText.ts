@@ -81,6 +81,12 @@ export interface Run {
    * which is what every exporter should fall back to.
    */
   fontFamily?: string;
+  /**
+   * The revision colour this run was written in (Revision Mode's `revision`
+   * attribute on textStyle), for exporters that show revisions — the PDF's margin asterisks,
+   * FDX's RevisionID. Absent on unrevised text.
+   */
+  revision?: string;
 }
 
 const EMPTY_RUN: Run = { text: '', bold: false, italic: false, underline: false, strike: false, isBreak: false };
@@ -93,6 +99,7 @@ export function jsonBlockRuns(node: JSONContent | null | undefined): Run[] {
     if (child.type === BREAK_TYPE) return { ...EMPTY_RUN, isBreak: true };
     let bold = false, italic = false, underline = false, strike = false;
     let fontFamily: string | undefined;
+    let revision: string | undefined;
     if (child.marks) {
       for (const mark of child.marks) {
         if (mark.type === 'bold') bold = true;
@@ -102,10 +109,50 @@ export function jsonBlockRuns(node: JSONContent | null | undefined): Run[] {
         if (mark.type === 'textStyle' && typeof mark.attrs?.fontFamily === 'string') {
           fontFamily = mark.attrs.fontFamily;
         }
+        // Revision Mode keeps the revision on textStyle (see editor/revisionMarks).
+        if (mark.type === 'textStyle' && typeof mark.attrs?.revision === 'string' && mark.attrs.revision) {
+          revision = mark.attrs.revision;
+        }
       }
     }
-    return { text: child.text || '', bold, italic, underline, strike, isBreak: false, fontFamily };
+    return {
+      text: child.text || '', bold, italic, underline, strike, isBreak: false, fontFamily,
+      ...(revision ? { revision } : {}),
+    };
   });
+}
+
+/**
+ * Coalesce neighbouring runs that carry identical formatting.
+ *
+ * {@link jsonBlockRuns} returns one run per inline child, and importers routinely
+ * produce several children with the same marks — an FDX scene heading arrives as
+ * `<Text Style="Bold">47 </Text><Text Style="Bold">EXT. FOO</Text>`. A delimiter-based
+ * exporter must not emit those separately, or the output reads `**47 ****EXT. FOO**`,
+ * which no longer parses back as one bold run.
+ *
+ * Breaks are never merged — they are boundaries, not text.
+ */
+export function mergeRuns(runs: Run[]): Run[] {
+  const merged: Run[] = [];
+  for (const run of runs) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      !prev.isBreak &&
+      !run.isBreak &&
+      prev.bold === run.bold &&
+      prev.italic === run.italic &&
+      prev.underline === run.underline &&
+      prev.strike === run.strike &&
+      prev.fontFamily === run.fontFamily
+    ) {
+      merged[merged.length - 1] = { ...prev, text: prev.text + run.text };
+      continue;
+    }
+    merged.push({ ...run });
+  }
+  return merged;
 }
 
 // ── ProseMirror side ────────────────────────────────────────────────────────

@@ -59,6 +59,7 @@
   <div class="sidebar-section">
     <div class="sidebar-section-title">Analysis</div>
     <a href="script-statistics.html" class="sidebar-link">Script Statistics &amp; Timing</a>
+    <a href="table-read.html" class="sidebar-link">Table Read</a>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-section-title">Production</div>
@@ -72,6 +73,7 @@
     <a href="version-history.html" class="sidebar-link">Version History</a>
     <a href="backups.html" class="sidebar-link">Backups &amp; Recovery</a>
     <a href="import-export.html" class="sidebar-link active">Import &amp; Export</a>
+    <a href="format-compatibility.html" class="sidebar-link">Format Compatibility</a>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-section-title">Collaboration</div>
@@ -111,6 +113,14 @@
     <h3 id="import-fountain">Fountain (.fountain)</h3>
     <p>Import scripts written in Fountain format. Fountain is an open, plain-text markup language for screenwriting. Many free tools can create Fountain files. Emphasis markup (<code>*italic*</code>, <code>**bold**</code>, <code>_underline_</code>), forced elements (<code>!</code>, <code>~</code>, <code>.</code>, <code>&gt;</code>, <code>@</code>), centred text (<code>&gt;text&lt;</code>) and page breaks (<code>===</code>) are all recognised.</p>
 
+    <p>Fountain&rsquo;s outlining markup comes through as well, and stays off the printed page:</p>
+    <ul>
+      <li><strong>Sections</strong> (<code>#</code>, <code>##</code>, <code>###</code>&hellip;) become Section elements, nested to the depth their hashes describe, and appear in the Scene Navigator&rsquo;s <strong>Structure</strong> tab. They are kept separate from New Act and End of Act, which are act markers that <em>do</em> print.</li>
+      <li><strong>Synopses</strong> (<code>= &hellip;</code>) are filed on the scene heading or Section they sit under.</li>
+      <li><strong>Notes</strong> (<code>[[ &hellip; ]]</code>) become Note elements, whether they stand alone or sit inside a line.</li>
+      <li>The <strong>boneyard</strong> (<code>/*&nbsp;&hellip;&nbsp;*/</code>) is commented-out text, and is dropped.</li>
+    </ul>
+
     <h3 id="import-fadein">Fade In (.fadein) and Open Screenplay Format (.osf)</h3>
     <p>Open scripts saved by <a href="https://www.fadeinpro.com/" target="_blank" rel="noopener">Fade In</a> directly &mdash; there is no need to export to another format first. A <code>.fadein</code> file is a compressed Open Screenplay Format document, and OpenDraft reads both it and plain <code>.osf</code> files. Imported:</p>
     <ul>
@@ -134,6 +144,8 @@
     <h3 id="paste-fountain">Paste as Fountain</h3>
     <p>To bring in part of a script rather than a whole file, copy the Fountain text and use <strong>Edit &gt; Paste as Fountain</strong> (or <kbd>Shift</kbd>+<kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>V</kbd>, also on the right-click menu). The pasted text is run through the Fountain parser and inserted at the cursor as real screenplay elements, instead of landing as one block of whatever element you were already in.</p>
 
+    <p>A single line of ordinary text is the exception. Fountain calls anything it does not recognise Action, so pasting <em>Across the yard</em> in the middle of a scene heading would otherwise break the heading in two and drop an Action line between the halves. Text like that is inserted at the cursor instead, keeping the element you are in &mdash; exactly as an ordinary paste would. Anything Fountain does recognise, including a line you have marked as Action yourself with a leading <code>!</code>, still arrives as its own element.</p>
+
     <div class="callout callout-info">
       <span class="callout-icon">&#8505;&#65039;</span>
       <div class="callout-content">
@@ -156,7 +168,7 @@
     <div class="callout callout-info">
       <span class="callout-icon">&#8505;&#65039;</span>
       <div class="callout-content">
-        <p><strong>Opening another application&rsquo;s format?</strong> OpenDraft says what saving back to it can and cannot carry before you start. Notes, tags, beats and character profiles have nowhere to live in a <code>.fdx</code> or <code>.fountain</code> file, so use <strong>File &gt; Save As</strong> to keep a lossless <code>.odraft</code> copy alongside it.</p>
+        <p><strong>Opening another application&rsquo;s format?</strong> OpenDraft says what saving back to it can and cannot carry before you start. Notes, tags, beats and character profiles have nowhere to live in a <code>.fdx</code> or <code>.fountain</code> file, so use <strong>File &gt; Save to Library As</strong> to keep a lossless <code>.odraft</code> copy alongside it.</p>
       </div>
     </div>
 
@@ -183,6 +195,20 @@
     <h3 id="export-fountain">Fountain (.fountain)</h3>
     <p>Go to <strong>File &gt; Export &gt; Fountain (.fountain)</strong>. This creates a plain-text Fountain file that can be opened in any Fountain-compatible editor or version control system.</p>
 
+    <div class="callout callout-warning">
+      <span class="callout-icon">&#9888;&#65039;</span>
+      <div class="callout-content">
+        <p>
+          <strong>Fountain cannot carry every element.</strong> It has no General element, so OpenDraft
+          writes General as forced Action (<code>!</code>). Import that file again and the text comes
+          back as <strong>Action, not General</strong>. The same applies to Shot, New Act, End of Act,
+          Show/Episode and Cast List. Use <code>.fdx</code>, <code>.docx</code> or <code>.odraft</code>
+          if you need those preserved &mdash; see
+          <a href="format-compatibility.html">Format Compatibility</a> for the full mapping.
+        </p>
+      </div>
+    </div>
+
     <h3 id="export-fadein">Fade In (.fadein)</h3>
     <p>Go to <strong>File &gt; Export &gt; Fade In (.fadein)</strong>. This writes a Fade In document &mdash; an Open Screenplay Format archive that Fade In 3 and 4 both open. It carries a great deal more than Fountain does:</p>
     <ul>
@@ -197,6 +223,8 @@
     <h3 id="export-docx">Microsoft Word (.docx)</h3>
     <p>Go to <strong>File &gt; Export &gt; Microsoft Word (.docx)</strong> for a formatted document to share with people who do not use screenwriting software.</p>
 
+    <p>The title page is included unless you have turned it off in <strong>Format &gt; Title Page</strong> &mdash; see <a href="title-page.html#include-in-output">Leaving the Title Page Out</a>.</p>
+
     <h3 id="export-odraft">OpenDraft (.odraft)</h3>
     <p>Go to <strong>File &gt; Export &gt; OpenDraft (.odraft)</strong>. This is the lossless one: the script plus its notes, tags, beats, character profiles and images, in a single file. Use it to move a screenplay between machines, or to keep a complete copy of your own. It is the same format <a href="backups.html">backups</a> are written in.</p>
 
@@ -208,12 +236,56 @@
       <li>Turn off note highlights (<strong>View &gt; Note Highlights</strong>)</li>
       <li>Turn off tag highlights (<strong>View &gt; Tag Highlights</strong>)</li>
       <li>Check your <a href="page-setup.html">Page Setup</a> settings</li>
+      <li>Decide whether to include the title page &mdash; the checkbox at the bottom of <strong>Format &gt; Title Page</strong>. See <a href="title-page.html#include-in-output">Leaving the Title Page Out</a>.</li>
     </ul>
 
     <h3 id="print">Printing</h3>
     <p>Go to <strong>File &gt; Print</strong> or press <kbd>&#8984;</kbd><kbd>P</kbd> to print your screenplay directly.</p>
+    <p>
+      What gets printed is the PDF &mdash; the same pages <strong>File &gt; Export &gt; PDF</strong>
+      produces &mdash; so the printed script matches both what is on screen and what you would have
+      sent anyone. On the desktop the PDF opens in whatever your computer uses for PDFs and you
+      print from there; in a browser it goes straight to the print dialog.
+    </p>
+    <p>
+      On phones and tablets there is nothing to choose: neither has a print dialog of its own, so
+      Print hands the script to the system. On iPhone and iPad it appears in the share sheet, where
+      <strong>Print</strong> sits alongside Save to Files and AirDrop; on Android it opens the
+      standard Android print dialog, which also offers <strong>Save as PDF</strong>.
+    </p>
+
+    <h4 id="print-via-pdf">Printing the page instead</h4>
+
+    <p>
+      On the desktop and in a browser, <strong>Settings &gt; Printing</strong> has a switch:
+      <strong>Print the PDF, so the pages match the ones on screen</strong>. It is on to begin with.
+    </p>
+
+    <p>
+      Turn it off and Print uses the browser's own dialog on the page itself. That is quicker on a
+      long script, and it is what the dialog's margin and scaling controls apply to &mdash; but the
+      browser then decides where the pages end, and it does not always agree with the editor, so a
+      page can break somewhere you have not seen. For a script going to anyone else, leave the
+      switch on.
+    </p>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">&#8505;&#65039;</span>
+      <div class="callout-content">
+        <p>
+          The switch is not on iPad, iPhone or Android, because there is no second way to print on
+          those devices for it to choose between.
+        </p>
+      </div>
+    </div>
 
     <h2 id="format-comparison">Format Comparison</h2>
+
+    <p>
+      For what happens to each individual screenplay element in each format &mdash; and which ones change
+      if you import the file again &mdash; see <a href="format-compatibility.html">Format Compatibility</a>.
+    </p>
+
 
     <table>
       <thead>
@@ -236,15 +308,15 @@
         <span class="nav-label">&larr; Previous</span>
         <span class="nav-title">Backups &amp; Recovery</span>
       </a>
-      <a href="collaboration.html" class="nav-next">
+      <a href="format-compatibility.html" class="nav-next">
         <span class="nav-label">Next &rarr;</span>
-        <span class="nav-title">Real-Time Collaboration</span>
+        <span class="nav-title">Format Compatibility</span>
       </a>
     </div>
 
   </div>
   <footer class="footer">
-    OpenDraft User Manual &middot; v0.23.1 &middot; Made by Proteus Technologies
+    OpenDraft User Manual &middot; v2.5.4 &middot; Made by Proteus Technologies
   </footer>
 </main>
 

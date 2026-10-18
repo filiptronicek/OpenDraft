@@ -16,13 +16,15 @@ import History from '@tiptap/extension-history';
 import Dropcursor from '@tiptap/extension-dropcursor';
 import Gapcursor from '@tiptap/extension-gapcursor';
 import Placeholder from '@tiptap/extension-placeholder';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import { api } from '../services/api';
+import { useGoBackTo } from '../hooks/useGoBack';
 import { showToast } from './Toast';
 import {
   FaBold, FaItalic, FaUnderline, FaListUl, FaListOl,
   FaQuoteLeft, FaArrowLeft, FaSave,
 } from 'react-icons/fa';
+import Select from './Select';
 
 /**
  * TreatmentEditor — a simplified TipTap editor for prose treatments.
@@ -30,7 +32,9 @@ import {
  */
 const TreatmentEditor: React.FC = () => {
   const { projectId, scriptId } = useParams<{ projectId: string; scriptId: string }>();
-  const navigate = useNavigate();
+  // Pop back to the project rather than pushing another copy of it, or the
+  // project's own back control walks straight back in here (issue #66).
+  const handleBack = useGoBackTo(projectId ? `/project/${projectId}` : '/projects');
 
   const [title, setTitle] = useState('Untitled Treatment');
   const [saving, setSaving] = useState(false);
@@ -73,6 +77,19 @@ const TreatmentEditor: React.FC = () => {
     let cancelled = false;
     (async () => {
       try {
+        // A treatment in a project folder is an .odraft file there (issue
+        // #135); pick up a change made to it elsewhere before showing it.
+        try {
+          const lf = await import('../services/linkedFiles');
+          if (lf.linkingSupported()) {
+            const sync = await lf.syncScriptWithFile(projectId, scriptId);
+            if (sync.kind === 'loaded-from-file' && !cancelled) {
+              showToast(`${lf.basenameOf(sync.path)} was changed outside OpenDraft — opened that version.`, 'info');
+            }
+          }
+        } catch (err) {
+          console.warn('[TreatmentEditor] linked file check failed:', err);
+        }
         const resp = await api.getScript(projectId, scriptId);
         if (cancelled) return;
         setTitle(resp.meta.title || 'Untitled Treatment');
@@ -144,11 +161,6 @@ const TreatmentEditor: React.FC = () => {
     saveTimer.current = setTimeout(() => save(newTitle), 1200);
   };
 
-  const handleBack = () => {
-    if (projectId) navigate(`/project/${projectId}`);
-    else navigate('/projects');
-  };
-
   const isActive = (type: string, opts?: Record<string, unknown>) =>
     editor ? editor.isActive(type, opts) : false;
 
@@ -185,7 +197,7 @@ const TreatmentEditor: React.FC = () => {
       </div>
 
       <div className="treatment-toolbar">
-        <select
+        <Select
           className="treatment-element-select"
           value={
             isActive('heading', { level: 1 }) ? 'h1' :
@@ -211,7 +223,7 @@ const TreatmentEditor: React.FC = () => {
           <option value="h2">Sequence / Beat</option>
           <option value="h3">Sub-heading</option>
           <option value="blockquote">Block Quote</option>
-        </select>
+        </Select>
         <button
           className={`treatment-tool-btn${isActive('bold') ? ' active' : ''}`}
           onClick={() => editor?.chain().focus().toggleBold().run()}

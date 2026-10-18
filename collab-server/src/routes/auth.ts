@@ -14,6 +14,7 @@ import {
   oidcCallbackLimiter,
   oidcExchangeLimiter,
   oidcStartLimiter,
+  refreshLimiter,
   strictLimiter,
   veryStrictLimiter,
 } from '../middleware/rateLimit';
@@ -531,7 +532,7 @@ router.post('/resend-device-challenge', strictLimiter, async (req, res) => {
   }
 });
 
-router.post('/refresh', strictLimiter, async (req, res) => {
+router.post('/refresh', refreshLimiter, async (req, res) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) {

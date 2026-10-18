@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import { getDefaultCollabWsUrl } from '../config';
+import { parseShortcut } from '../utils/shortcuts';
+import { DEFAULT_ELEMENT_MENU_SHORTCUT } from '../utils/elementMenu';
 
 export interface CollabUser {
   id: string;
@@ -44,10 +46,19 @@ interface SettingsState {
   settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
 
-  // Script-format preferences — which system templates show up in the new-script picker.
-  // Stored as template ids (e.g. INDUSTRY_STANDARD_ID, MULTICAM_SITCOM_ID, ...).
+  // Script-format preferences — which templates show up in the new-script picker.
+  // Stored as template ids: system formats (INDUSTRY_STANDARD_ID, MULTICAM_SITCOM_ID,
+  // ...) and the ids of the writer's own custom templates.
   enabledScriptFormats: string[];
   setEnabledScriptFormats: (ids: string[]) => void;
+
+  // The format the New Screenplay picker opens on — a built-in format or one of
+  // the writer's own. It orders and preselects the picker; it never replaces
+  // it, because several enabled formats mean the next script could be any of
+  // them. null = no preference. Kept inside `enabledScriptFormats`; an id that
+  // is not enabled is dropped rather than honoured.
+  defaultScriptFormat: string | null;
+  setDefaultScriptFormat: (id: string | null) => void;
 
   // True once the user has seen and confirmed the first-run format-preferences dialog.
   // Until then, the New Screenplay action opens the prefs dialog instead of going straight in.
@@ -81,12 +92,79 @@ interface SettingsState {
   /** Also snapshot documents that were never saved to the library. */
   backupUnsavedDocs: boolean;
   setBackupUnsavedDocs: (v: boolean) => void;
+
+  // ── Saving ────────────────────────────────────────────────────────────
+  /**
+   * Whether a script in the library is saved on a timer and when the writer
+   * leaves it. Off means nothing is written until they save — leaving,
+   * switching scripts or closing the window asks first instead (issue #135).
+   * The crash-recovery snapshot runs either way.
+   */
+  autoSaveLibrary: boolean;
+  setAutoSaveLibrary: (v: boolean) => void;
+  /**
+   * Whether a file opened from disk is written back on the same timer. Off by
+   * default: Save to File rewrites the writer's own file, and in another
+   * application's format that rewrite can lose what the format cannot hold, so
+   * doing it unasked is opt-in.
+   */
+  autoSaveFiles: boolean;
+  setAutoSaveFiles: (v: boolean) => void;
+  /** Seconds between auto-saves, for both of the above. */
+  autoSaveIntervalSeconds: number;
+  setAutoSaveIntervalSeconds: (s: number) => void;
+  /**
+   * Folder new projects are created in, each in a subfolder of its own;
+   * '' = new projects live in the library only. Desktop only (issue #135).
+   */
+  defaultProjectFolder: string;
+  setDefaultProjectFolder: (path: string) => void;
+  /** Format scripts in a project folder are written in: odraft, fountain or fdx. */
+  defaultFileFormat: string;
+  setDefaultFileFormat: (format: string) => void;
+
+  // ── Editing ───────────────────────────────────────────────────────────
+  /**
+   * Whether Enter on a blank line offers the element menu. Off means Enter is
+   * always a plain new line, for writers who format by muscle memory — the same
+   * switch Final Draft ships as "Show SmartType Window", Movie Magic as "Enable
+   * Quick Entry" and WriterDuet as "Show line type select on enter" (issue #100).
+   */
+  elementMenuOnEnter: boolean;
+  setElementMenuOnEnter: (v: boolean) => void;
+  /**
+   * Shortcut that opens the element menu anywhere, blank line or not, in
+   * ProseMirror notation (`Alt-Enter`, `Mod-Shift-e`). '' turns it off. It is
+   * the way to the menu for anyone who has turned the Enter route off, and the
+   * only way to it from a line that already has text on it (issue #100).
+   */
+  elementMenuShortcut: string;
+  setElementMenuShortcut: (spec: string) => void;
+  /**
+   * Whether File → Print prints the exported PDF rather than the page.
+   *
+   * On by default, and the reason is fidelity. The editor draws its page turns
+   * rather than making them, so printing the page asks the browser to
+   * paginate the script a second time by its own rules — and it put the page
+   * turns somewhere else, which in a screenplay is a change to the script. The
+   * PDF is laid out page by page by the exporter, so printing it gives the
+   * pages the writer has been looking at, and the same document anyone sent
+   * the export would read. Off falls back to the web view's own print dialog,
+   * which is faster on a long script and is what the browser's own margin and
+   * scaling controls apply to.
+   *
+   * Only consulted where there is a print dialog to fall back to. iOS and
+   * Android have none and have always printed the PDF — see printRoute().
+   */
+  printViaPdf: boolean;
+  setPrintViaPdf: (v: boolean) => void;
 }
 
 const STORAGE_KEY_URL = 'opendraft:collabServerUrl';
 const STORAGE_KEY_AUTH = 'opendraft:collabAuth';
 const STORAGE_KEY_EXPIRY = 'opendraft:defaultInviteExpiry';
 const STORAGE_KEY_FORMATS = 'opendraft:enabledScriptFormats';
+const STORAGE_KEY_DEFAULT_FORMAT = 'opendraft:defaultScriptFormat';
 const STORAGE_KEY_FORMATS_INIT = 'opendraft:formatPreferencesInitialized';
 const STORAGE_KEY_BACKUP_ENABLED = 'opendraft:backupEnabled';
 const STORAGE_KEY_BACKUP_FOLDER = 'opendraft:backupFolder';
@@ -95,12 +173,25 @@ const STORAGE_KEY_BACKUP_INTERVAL = 'opendraft:backupIntervalMinutes';
 const STORAGE_KEY_BACKUP_RETENTION = 'opendraft:backupRetentionCount';
 const STORAGE_KEY_BACKUP_IMAGES = 'opendraft:backupIncludeImages';
 const STORAGE_KEY_BACKUP_UNSAVED = 'opendraft:backupUnsavedDocs';
+const STORAGE_KEY_AUTO_SAVE_LIBRARY = 'opendraft:autoSaveLibrary';
+const STORAGE_KEY_AUTO_SAVE_FILES = 'opendraft:autoSaveFiles';
+const STORAGE_KEY_AUTO_SAVE_INTERVAL = 'opendraft:autoSaveIntervalSeconds';
+const STORAGE_KEY_DEFAULT_PROJECT_FOLDER = 'opendraft:defaultProjectFolder';
+const STORAGE_KEY_DEFAULT_FILE_FORMAT = 'opendraft:defaultFileFormat';
+const STORAGE_KEY_ELEMENT_MENU_ON_ENTER = 'opendraft:elementMenuOnEnter';
+const STORAGE_KEY_PRINT_VIA_PDF = 'opendraft:printViaPdf';
+const STORAGE_KEY_ELEMENT_MENU_SHORTCUT = 'opendraft:elementMenuShortcut';
 
 export const BACKUP_INTERVAL_OPTIONS = [5, 10, 15, 30, 60] as const;
 /** 0 means "keep every snapshot". */
 export const BACKUP_RETENTION_OPTIONS = [10, 25, 50, 100, 0] as const;
 
+export const AUTO_SAVE_INTERVAL_OPTIONS = [15, 30, 60, 120, 300] as const;
+
 const DEFAULT_BACKUP_INTERVAL_MINUTES = 10;
+const DEFAULT_AUTO_SAVE_INTERVAL_SECONDS = 30;
+const MIN_AUTO_SAVE_INTERVAL_SECONDS = 5;
+const MAX_AUTO_SAVE_INTERVAL_SECONDS = 3600;
 const DEFAULT_BACKUP_RETENTION = 25;
 
 /**
@@ -116,6 +207,25 @@ function loadClampedInt(key: string, fallback: number, min: number, max: number)
   const n = parseInt(raw, 10);
   if (Number.isNaN(n)) return fallback;
   return Math.min(max, Math.max(min, n));
+}
+
+/** Stored spec, the shipped default when nothing is stored, '' when switched off. */
+function loadElementMenuShortcut(): string {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_ELEMENT_MENU_SHORTCUT);
+    if (raw === null) return DEFAULT_ELEMENT_MENU_SHORTCUT;
+    return raw && parseShortcut(raw) ? raw : '';
+  } catch {
+    return DEFAULT_ELEMENT_MENU_SHORTCUT;
+  }
+}
+
+function loadString(key: string, fallback: string): string {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function loadBool(key: string, fallback: boolean): boolean {
@@ -135,6 +245,13 @@ function loadEnabledScriptFormats(): string[] {
   return [];
 }
 
+function loadDefaultScriptFormat(): string | null {
+  try {
+    return localStorage.getItem(STORAGE_KEY_DEFAULT_FORMAT) || null;
+  } catch { /* ignore */ }
+  return null;
+}
+
 const DEFAULT_COLLAB_URL = getDefaultCollabWsUrl();
 
 function loadAuth(): CollabAuth {
@@ -145,7 +262,7 @@ function loadAuth(): CollabAuth {
   return { accessToken: null, refreshToken: null, user: null };
 }
 
-export const useSettingsStore = create<SettingsState>((set) => ({
+export const useSettingsStore = create<SettingsState>((set, get) => ({
   collabServerUrl: localStorage.getItem(STORAGE_KEY_URL) || DEFAULT_COLLAB_URL,
   setCollabServerUrl: (url) => {
     localStorage.setItem(STORAGE_KEY_URL, url);
@@ -184,7 +301,25 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   enabledScriptFormats: loadEnabledScriptFormats(),
   setEnabledScriptFormats: (ids) => {
     try { localStorage.setItem(STORAGE_KEY_FORMATS, JSON.stringify(ids)); } catch { /* ignore */ }
+    // A default that is no longer on the list is no default at all — drop it
+    // rather than leave the picker pointing at a format the writer just
+    // switched off.
+    const current = get().defaultScriptFormat;
+    if (current && !ids.includes(current)) {
+      try { localStorage.removeItem(STORAGE_KEY_DEFAULT_FORMAT); } catch { /* ignore */ }
+      set({ enabledScriptFormats: ids, defaultScriptFormat: null });
+      return;
+    }
     set({ enabledScriptFormats: ids });
+  },
+
+  defaultScriptFormat: loadDefaultScriptFormat(),
+  setDefaultScriptFormat: (id) => {
+    try {
+      if (id) localStorage.setItem(STORAGE_KEY_DEFAULT_FORMAT, id);
+      else localStorage.removeItem(STORAGE_KEY_DEFAULT_FORMAT);
+    } catch { /* ignore */ }
+    set({ defaultScriptFormat: id });
   },
 
   formatPreferencesInitialized: localStorage.getItem(STORAGE_KEY_FORMATS_INIT) === '1',
@@ -240,4 +375,86 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     try { localStorage.setItem(STORAGE_KEY_BACKUP_UNSAVED, v ? '1' : '0'); } catch { /* ignore */ }
     set({ backupUnsavedDocs: v });
   },
+
+  // ── Saving ────────────────────────────────────────────────────────────
+  autoSaveLibrary: loadBool(STORAGE_KEY_AUTO_SAVE_LIBRARY, true),
+  setAutoSaveLibrary: (v) => {
+    try { localStorage.setItem(STORAGE_KEY_AUTO_SAVE_LIBRARY, v ? '1' : '0'); } catch { /* ignore */ }
+    set({ autoSaveLibrary: v });
+  },
+
+  autoSaveFiles: loadBool(STORAGE_KEY_AUTO_SAVE_FILES, false),
+  setAutoSaveFiles: (v) => {
+    try { localStorage.setItem(STORAGE_KEY_AUTO_SAVE_FILES, v ? '1' : '0'); } catch { /* ignore */ }
+    set({ autoSaveFiles: v });
+  },
+
+  autoSaveIntervalSeconds: loadClampedInt(
+    STORAGE_KEY_AUTO_SAVE_INTERVAL,
+    DEFAULT_AUTO_SAVE_INTERVAL_SECONDS,
+    MIN_AUTO_SAVE_INTERVAL_SECONDS,
+    MAX_AUTO_SAVE_INTERVAL_SECONDS,
+  ),
+  setAutoSaveIntervalSeconds: (sec) => {
+    const clamped = Math.min(MAX_AUTO_SAVE_INTERVAL_SECONDS, Math.max(MIN_AUTO_SAVE_INTERVAL_SECONDS, sec));
+    try { localStorage.setItem(STORAGE_KEY_AUTO_SAVE_INTERVAL, String(clamped)); } catch { /* ignore */ }
+    set({ autoSaveIntervalSeconds: clamped });
+  },
+
+  defaultProjectFolder: loadString(STORAGE_KEY_DEFAULT_PROJECT_FOLDER, ''),
+  setDefaultProjectFolder: (path) => {
+    try { localStorage.setItem(STORAGE_KEY_DEFAULT_PROJECT_FOLDER, path); } catch { /* ignore */ }
+    set({ defaultProjectFolder: path });
+  },
+
+  defaultFileFormat: loadString(STORAGE_KEY_DEFAULT_FILE_FORMAT, 'odraft'),
+  setDefaultFileFormat: (format) => {
+    try { localStorage.setItem(STORAGE_KEY_DEFAULT_FILE_FORMAT, format); } catch { /* ignore */ }
+    set({ defaultFileFormat: format });
+  },
+
+  elementMenuOnEnter: loadBool(STORAGE_KEY_ELEMENT_MENU_ON_ENTER, true),
+  setElementMenuOnEnter: (v) => {
+    try { localStorage.setItem(STORAGE_KEY_ELEMENT_MENU_ON_ENTER, v ? '1' : '0'); } catch { /* ignore */ }
+    set({ elementMenuOnEnter: v });
+  },
+
+  printViaPdf: loadBool(STORAGE_KEY_PRINT_VIA_PDF, true),
+  setPrintViaPdf: (v) => {
+    try { localStorage.setItem(STORAGE_KEY_PRINT_VIA_PDF, v ? '1' : '0'); } catch { /* ignore */ }
+    set({ printViaPdf: v });
+  },
+
+  elementMenuShortcut: loadElementMenuShortcut(),
+  setElementMenuShortcut: (spec) => {
+    // '' is a real value here — it means "no shortcut" — so it is stored rather
+    // than removed, or the default would come back on the next launch.
+    const clean = spec && parseShortcut(spec) ? spec : '';
+    try { localStorage.setItem(STORAGE_KEY_ELEMENT_MENU_SHORTCUT, clean); } catch { /* ignore */ }
+    set({ elementMenuShortcut: clean });
+  },
 }));
+
+/**
+ * Keep every tab and window on the same session. Each one reads the auth
+ * pair from localStorage once, at load; refresh tokens are single-use, so a
+ * tab still holding the pair another tab has since rotated would be refused
+ * on its next refresh and sign the user out everywhere. The `storage` event
+ * fires in every *other* same-origin document when one of them writes the
+ * key, so a refresh, sign-in or sign-out in one tab reaches all of them.
+ * (A null key means localStorage was cleared outright.)
+ */
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== null && e.key !== STORAGE_KEY_AUTH) return;
+    try {
+      const auth = loadAuth();
+      useSettingsStore.setState({
+        collabAuth: auth,
+        authVerified: Boolean(auth.accessToken && auth.user),
+      });
+    } catch (err) {
+      console.error('[settings] could not sync the session from another tab:', err);
+    }
+  });
+}

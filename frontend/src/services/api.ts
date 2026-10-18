@@ -1,6 +1,6 @@
-import { API_BASE, getCollabWsUrl } from '../config';
+import { getApiBase, getCollabWsUrl } from '../config';
 import { useSettingsStore } from '../stores/settingsStore';
-import { authedFetch } from './authedFetch';
+import { authedFetch, sessionSurvivesUnauthorized } from './authedFetch';
 
 /**
  * Custom events dispatched by the API client so UI components (AuthGate) can
@@ -62,8 +62,20 @@ export async function handleNonOkResponse(res: Response, label: string): Promise
   let handled = false;
 
   if (res.status === 401) {
-    // authedFetch has already cleared auth if refresh failed; ensure it's
-    // cleared for the no-refresh-token path too.
+    if (sessionSurvivesUnauthorized()) {
+      // The refresh failed for a transient reason (rate limit, server down)
+      // and authedFetch kept the session. Signing out here would throw away
+      // a refresh token that still works; let the caller report the error.
+      console.warn(`[${label}] 401 after a failed session refresh; keeping the session`);
+      throw new ApiError(
+        res.status,
+        parsedBody,
+        'Could not renew your sign-in just now. Please try again in a moment.',
+        false,
+      );
+    }
+    // authedFetch has already cleared auth if refresh was refused; ensure
+    // it's cleared for the no-refresh-token path too.
     useSettingsStore.getState().clearCollabAuth();
     dispatchApiEvent('opendraft:auth-required');
     handled = true;
@@ -94,7 +106,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     'Content-Type': 'application/json',
     ...(options?.headers as Record<string, string>),
   };
-  const res = await authedFetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await authedFetch(`${getApiBase()}${path}`, { ...options, headers });
   if (!res.ok) await handleNonOkResponse(res, 'API');
   return res.json();
 }
@@ -157,6 +169,13 @@ export interface ProjectProperties {
   manager_contact: string;
   submissions: SubmissionEntry[];
   dictionary_words?: string[];
+  /**
+   * Folder on disk this project's scripts are saved to, desktop only
+   * (issue #135). Absent or '' = the project lives in the library only.
+   */
+  folder_path?: string;
+  /** Format new scripts in the linked folder are written in: odraft, fountain or fdx. */
+  file_format?: string;
 }
 
 export interface ProjectInfo {
@@ -276,7 +295,9 @@ export const api = {
   listScripts: (projectId: string, includePreview: boolean = false) =>
     request<ScriptMeta[]>(`/projects/${projectId}/scripts/${includePreview ? '?include_preview=true' : ''}`),
 
-  createScript: (projectId: string, data: { title: string; content?: any; format?: string }) =>
+  // skipFileSync: desktop only — the write came from a linked file, so it must
+  // not be written straight back to it (services/linkedFiles). Ignored elsewhere.
+  createScript: (projectId: string, data: { title: string; content?: any; format?: string; skipFileSync?: boolean }) =>
     request<ScriptResponse>(`/projects/${projectId}/scripts/`, {
       method: 'POST',
       body: JSON.stringify(data),
@@ -285,7 +306,7 @@ export const api = {
   getScript: (projectId: string, scriptId: string) =>
     request<ScriptResponse>(`/projects/${projectId}/scripts/${scriptId}`),
 
-  saveScript: (projectId: string, scriptId: string, data: { title?: string; content?: Record<string, unknown>; color?: string; pinned?: boolean; sort_order?: number }) =>
+  saveScript: (projectId: string, scriptId: string, data: { title?: string; content?: Record<string, unknown>; color?: string; pinned?: boolean; sort_order?: number; allowEmptyBody?: boolean; skipFileSync?: boolean }) =>
     request<ScriptResponse>(`/projects/${projectId}/scripts/${scriptId}`, {
       method: 'PUT',
       body: JSON.stringify(data),
@@ -370,7 +391,7 @@ export const api = {
     formData.append('file', file);
     if (tags.length) formData.append('tags', tags.join(','));
     // Multipart — do NOT set Content-Type; the browser adds the boundary.
-    const res = await authedFetch(`${API_BASE}/projects/${projectId}/assets/upload`, {
+    const res = await authedFetch(`${getApiBase()}/projects/${projectId}/assets/upload`, {
       method: 'POST',
       body: formData,
     });
@@ -390,7 +411,7 @@ export const api = {
   },
 
   getAssetUrl: (projectId: string, assetId: string, _filename?: string): string => {
-    return `${API_BASE.replace(/\/api$/, '')}/api/projects/${projectId}/assets/${assetId}`;
+    return `${getApiBase().replace(/\/api$/, '')}/api/projects/${projectId}/assets/${assetId}`;
   },
 
   fetchLinkPreview: async (url: string): Promise<LinkPreview> => {

@@ -6,6 +6,7 @@ import { api, type LocationEntry } from '../services/api';
 import { showToast } from './Toast';
 import { useDelayedUnmount, useSwipeDismiss } from '../hooks/useTouch';
 import { blockContentRange, singleLine } from '../utils/nodeText';
+import Select from './Select';
 
 interface Props {
   editor: Editor | null;
@@ -313,7 +314,7 @@ const LocationDatabase: React.FC<Props> = ({ editor, style }) => {
 interface DetailViewProps {
   loc: LocationEntry;
   sceneIndices: number[];
-  scenes: Array<{ id: string; heading: string; synopsis: string; color: string; sceneNumber?: number | null }>;
+  scenes: Array<{ id: string; heading: string; synopsis: string; color: string; sceneNumber?: string | null }>;
   onEdit: () => void;
   onDelete: () => void;
   onGoToScene: (sceneIndex: number) => void;
@@ -407,11 +408,11 @@ const LocationEditor: React.FC<EditorProps> = ({ draft, setDraft, onSave, onCanc
       </div>
       <div className="location-db-field">
         <label>Type</label>
-        <select value={draft.type || 'interior'} onChange={(e) => set({ type: e.target.value as LocationEntry['type'] })}>
+        <Select value={draft.type || 'interior'} onChange={(e) => set({ type: e.target.value as LocationEntry['type'] })}>
           <option value="interior">Interior</option>
           <option value="exterior">Exterior</option>
           <option value="both">Both</option>
-        </select>
+        </Select>
       </div>
       <div className="location-db-field">
         <label>Address</label>

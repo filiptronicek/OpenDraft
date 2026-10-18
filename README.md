@@ -102,6 +102,9 @@ Check in drafts, compare versions side-by-side, and restore any previous draft i
 **Character Profiles**
 Track characters with descriptions, role types, and color-coded highlighting in your script.
 
+**Table Read**
+Hear the script read aloud with a voice for each character, following along word by word — using your device's own voices, free on-device AI voices, or an AI provider of your choice.
+
 **Import & Export**
 Move freely between Final Draft (.fdx), Fountain, and PDF — never locked into one tool.
 
@@ -149,13 +152,13 @@ Get the latest version — no account required, just install and start writing. 
 
 | Platform | Download |
 |----------|----------|
-| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_aarch64.dmg) |
-| **macOS** (Intel) | [Download .dmg](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_x64.dmg) |
-| **Windows** (64-bit) | [Download .exe](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_x64-setup.exe) |
-| **Windows** (MSI) | [Download .msi](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_x64_en-US.msi) |
-| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_amd64.deb) |
-| **Linux** (AppImage) | [Download .AppImage](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_0.23.1_amd64.AppImage) |
-| **Linux** (RPM/Fedora) | [Download .rpm](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft-0.23.1-1.x86_64.rpm) |
+| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_aarch64.dmg) |
+| **macOS** (Intel) | [Download .dmg](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_x64.dmg) |
+| **Windows** (64-bit) | [Download .exe](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_x64-setup.exe) |
+| **Windows** (MSI) | [Download .msi](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_x64_en-US.msi) |
+| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_amd64.deb) |
+| **Linux** (AppImage) | [Download .AppImage](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft_2.5.4_amd64.AppImage) |
+| **Linux** (RPM/Fedora) | [Download .rpm](https://github.com/Proteus-Technologies-Private-Limited/OpenDraft/releases/latest/download/OpenDraft-2.5.4-1.x86_64.rpm) |
 
 ### Mobile
 

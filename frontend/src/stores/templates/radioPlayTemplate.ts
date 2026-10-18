@@ -9,7 +9,7 @@
  */
 
 import type { FormattingTemplate, StarterNode } from '../formattingTypes';
-import { rule, disabled } from './_helpers';
+import { rule, disabled, outlineRules, avBlockRule } from './_helpers';
 
 export const RADIO_PLAY_ID = '__radio_play__';
 
@@ -71,7 +71,7 @@ export const RADIO_PLAY_TEMPLATE: FormattingTemplate = {
       placeholder: '(beat / off-mic)',
     }),
     transition: disabled('transition', 'Transition'),
-    general: rule('general', 'General', true, { nextOnEnter: 'general' }),
+    general: rule('general', 'General (Unformatted text)', true, { nextOnEnter: 'general' }),
     shot: disabled('shot', 'Shot'),
     newAct: rule('newAct', 'New Act', true, {
       bold: true,
@@ -105,6 +105,11 @@ export const RADIO_PLAY_TEMPLATE: FormattingTemplate = {
       nextOnEnter: 'sceneHeading',
       placeholder: 'SHOW TITLE',
     }),
+    ...outlineRules(),
+    // A two-column AV body, off by default in this format but present in the
+    // Template Editor so a user template built on it can switch it on. See
+    // avBlockRule() in _helpers.ts.
+    ...avBlockRule(false),
     castList: disabled('castList', 'Cast List'),
     // Custom: SFX cue, all caps
     soundEffect: rule('soundEffect', 'Sound Effect', false, {

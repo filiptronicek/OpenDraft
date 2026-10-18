@@ -12,6 +12,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
+import { leaveEditor } from '../services/pendingSave';
 import { FaCloud, FaUserCircle } from 'react-icons/fa';
 import { useSettingsStore } from '../stores/settingsStore';
 import { hasLocalPassword, performLogout } from '../services/collabAuth';
@@ -120,7 +121,14 @@ const AuthIndicator: React.FC = () => {
           <button
             type="button"
             className="auth-indicator__menu-item"
-            onClick={() => { setMenuOpen(false); navigate('/settings'); }}
+            onClick={() => {
+              setMenuOpen(false);
+              // Leaving the editor by router navigation fires neither
+              // `beforeunload` nor Tauri's close handler, so the open document
+              // is flushed — or, with auto-save off, asked about — first
+              // (issues #65, #135).
+              void leaveEditor(() => navigate('/settings'));
+            }}
           >
             <FaUserCircle /> Account settings
           </button>

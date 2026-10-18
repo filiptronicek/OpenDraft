@@ -1,30 +1,20 @@
-import React, { useMemo, useRef, useCallback } from 'react';
+import React, { useRef, useCallback } from 'react';
 import { NodeViewWrapper, type NodeViewProps } from '@tiptap/react';
-import { api } from '../../services/api';
-import { AuthenticatedAssetImage } from '../../components/AuthenticatedAssetImage';
+import { useImageSrc } from '../../hooks/useImageSrc';
 
 const LINE_HEIGHT_PX = 16; // 12pt — matches pagination LINE_HEIGHT_PT
 
 /**
- * React NodeView for the screenplayImage node. Resolves the asset URL (or falls
- * back to an inline data URL), renders the image at its stored width with simple
- * corner resizing, and records an estimated height (in screenplay lines) so the
- * paginator can roughly account for the image.
+ * React NodeView for the screenplayImage node. Resolves the image through the
+ * shared `useImageSrc` (project asset, scratch blob, or legacy inline data URL),
+ * renders it at its stored width with simple corner resizing, and records an
+ * estimated height (in screenplay lines) so the paginator can roughly account
+ * for the image.
  */
 export const ScreenplayImageView: React.FC<NodeViewProps> = ({ node, updateAttributes, selected, editor }) => {
-  const { assetId, projectId, src, filename, width, align } = node.attrs as {
-    assetId: string | null; projectId: string | null; src: string | null;
-    filename: string | null; width: number | null; align: string;
-  };
+  const { width, align } = node.attrs as { width: number | null; align: string };
   const imgRef = useRef<HTMLImageElement>(null);
-
-  const sourceUrl = useMemo(() => {
-    if (src) return src;
-    if (assetId && projectId) {
-      try { return api.getAssetUrl(projectId, assetId, filename || undefined); } catch { return ''; }
-    }
-    return '';
-  }, [src, assetId, projectId, filename]);
+  const { url, missing } = useImageSrc(node.attrs as Record<string, unknown>);
 
   // On first load (no stored width), default to the natural width capped to the
   // content column, and record the rendered height in lines for pagination.
@@ -71,15 +61,20 @@ export const ScreenplayImageView: React.FC<NodeViewProps> = ({ node, updateAttri
       data-drag-handle
     >
       <span className="sp-image-inner" style={{ width: width ? `${width}px` : undefined }}>
-        <AuthenticatedAssetImage
-          ref={imgRef}
-          src={sourceUrl}
-          alt=""
-          draggable={false}
-          onLoad={onLoad}
-          className="sp-image-img"
-        />
-        {selected && editable && (
+        {missing ? (
+          // Hold the stored size rather than collapsing: a broken image that
+          // reflows the page is far more disruptive than a visible gap, and the
+          // bytes may simply live on the machine the document came from.
+          <span
+            className="sp-image-missing"
+            style={{ height: `${Math.max(1, node.attrs.heightLines as number) * LINE_HEIGHT_PX}px` }}
+          >
+            Image not available
+          </span>
+        ) : (
+          <img ref={imgRef} src={url} alt="" draggable={false} onLoad={onLoad} className="sp-image-img" />
+        )}
+        {selected && editable && !missing && (
           <span className="sp-image-resize" onMouseDown={startResize} title="Drag to resize" />
         )}
       </span>

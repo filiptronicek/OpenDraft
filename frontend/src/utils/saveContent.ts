@@ -48,7 +48,14 @@ export const SAVE_METADATA_KEYS = [
   '_grammarCheckEnabled',
   '_sceneNumbersVisible',
   '_sceneNumbersLocked',
+  '_elementNumbersVisible',
   '_pageLayout',
+  '_sceneHeadingSpaceBefore',
+  '_revisionMode',
+  '_revisionColor',
+  '_revisionHistory',
+  '_revisionSettings',
+  '_scriptProfile',
 ] as const;
 
 export type SaveMetadataKey = (typeof SAVE_METADATA_KEYS)[number];
@@ -89,7 +96,23 @@ export function buildSaveContent(editor: Editor | null): Record<string, unknown>
     _grammarCheckEnabled: store.grammarCheckEnabled,
     _sceneNumbersVisible: store.sceneNumbersVisible,
     _sceneNumbersLocked: store.sceneNumbersLocked,
+    // Written only when hidden, so a script that never hid them saves exactly
+    // as it did before element numbering existed. Absent reads as shown.
+    ...(store.elementNumbersVisible ? {} : { _elementNumbersVisible: false }),
     _pageLayout: store.pageLayout,
+    // Always written, even when null. Its *absence* is the signal that a
+    // document predates the two-line scene-heading default, which is what the
+    // spacing prompt keys off — so writing it unconditionally is what stops the
+    // prompt reappearing after the writer has answered it.
+    _sceneHeadingSpaceBefore: store.sceneHeadingSpaceBefore,
+    // Revision Mode is part of the script: a locked production draft opens
+    // still revising, in the colour it was being revised in.
+    _revisionMode: store.revisionMode,
+    _revisionColor: store.revisionColor,
+    _revisionHistory: store.revisionHistory,
+    _revisionSettings: store.revisionSettings,
+    // Pacing (which scales the runtime estimate) and genres.
+    _scriptProfile: store.scriptProfile,
   };
 }
 

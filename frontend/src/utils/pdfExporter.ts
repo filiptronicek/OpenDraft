@@ -2,12 +2,48 @@
 // All constants match pagination.ts and screenplay.css for exact visual parity
 import jsPDF from 'jspdf';
 import type { JSONContent } from '@tiptap/react';
-import { DEFAULT_HEADER_CONTENT, DEFAULT_FOOTER_CONTENT, resolveMoresContds } from '../stores/editorStore';
+import { resolveMoresContds, resolveHeaderFooter, printedPageNumber, resolveHFFields } from '../stores/editorStore';
 import type { PageLayout, HeaderFooterContent } from '../stores/editorStore';
-import { getForceBreakIds, startsOwnPage } from './pageBreaks';
+import { getForceBreakIds, startsOwnPage, elementIdOf, laysItselfOut } from './pageBreaks';
+import { getSpaceBefore } from './elementSpacing';
 import { resolveImageUrl, loadImageData } from './imageAsset';
 import { jsonBlockRuns } from './nodeText';
-import { wordWrapRuns, type WrapRun } from './wrapText';
+import { lineRevision, revisionMarkXPt } from './revisionPdf';
+import { blockRevision } from './revisionExport';
+import {
+  REVISION_COLORS, latestRevision, revisionMarkFor, revisionPaper, type RevisionSettings,
+} from '../editor/revisionColors';
+import type { WrapRun } from './wrapText';
+import { wrapForDrawing } from './bidi';
+import { sanitizeExportFilename } from './exportFilename';
+import { findTitlePageRegion, titlePageAttrsCarryData } from './titlePageRegion';
+import { extractAvBodies } from './avDocument';
+import { drawAvBody, avRowNodes, avFrameKey } from './avPdfTable';
+import { readColumnConfig } from '../editor/extensions/AvBlock';
+import {
+  embedUnicodeFonts, requiredUnicodeFaces, segmentByFace, unsupportedScripts,
+  type ProgressHandler, type StyledText, type UnicodeFallbacks,
+} from './pdfUnicodeFont';
+import { embedCustomFonts, type EmbeddedFace } from './pdfCustomFonts';
+import { genericFor } from './fonts';
+import { isNonPrintingType } from './nonPrinting';
+import {
+  dualChildBounds, dualCharsPerLine, dualColumnLeadLines, dualDialogueLineCount,
+  type DualColumns,
+} from './dualDialogue';
+import {
+  applyFootnoteMarkers,
+  buildEndnotePages,
+  packFootnotePage,
+  FOOTNOTE_CPL,
+  ENDNOTE_HEADING_LINES,
+  type FootnoteEntry,
+  type FootnotePlan,
+  type NoteSlice,
+} from './footnotes';
+import { noteEntryLabel } from './noteNumbering';
+import { withElementNumbers, elementNumberOf } from './elementNumbers';
+import { noteBlockText } from './noteContent';
 
 // --- Constants matching pagination.ts ---
 
@@ -31,12 +67,9 @@ for (const [type, [l, r]] of Object.entries(FD_INDENTS)) {
   CHARS_PER_LINE[type] = Math.round((r - l) * FD_CPI);
 }
 
-// Space before each element type (in lines) — matches pagination.ts & CSS margin-top values
-const SPACE_BEFORE: Record<string, number> = {
-  sceneHeading: 1, action: 1, character: 1, dialogue: 0,
-  parenthetical: 0, transition: 1, general: 0, shot: 1,
-  newAct: 2, endOfAct: 2, lyrics: 0, showEpisode: 1, castList: 0,
-};
+// Space before each element (in lines) now comes from the active formatting
+// template via getSpaceBefore() — see utils/elementSpacing.ts, which pagination
+// and the DOCX exporter read too.
 
 // Types that render in uppercase (CSS text-transform: uppercase)
 const UPPERCASE_TYPES = new Set([
@@ -71,6 +104,12 @@ interface NodeInfo {
   runs: TextRun[];
   plainText: string;
   attrs?: Record<string, unknown>;
+  /** The original JSON node, kept only for `avBlock`: an AV body is a table,
+   *  so the draw pass needs its rows and cells, not a flattened run list. */
+  raw?: JSONContent;
+  /** Index in the ORIGINAL document content. `nodes` drops the title page and
+   *  the non-printing blocks, and the footnote plan is keyed on the original. */
+  srcIndex: number;
 }
 
 // --- Helpers ---
@@ -78,14 +117,25 @@ interface NodeInfo {
 
 /** Styled runs for a node, with hard breaks flagged. See utils/nodeText. */
 export function extractRuns(node: JSONContent): TextRun[] {
-  return jsonBlockRuns(node).map((r) => ({
+  const runs: TextRun[] = jsonBlockRuns(node).map((r) => ({
     text: r.text,
     bold: r.bold,
     italic: r.italic,
     underline: r.underline,
     isBreak: r.isBreak,
     fontFamily: r.fontFamily,
+    ...(r.revision ? { revised: true, revision: r.revision } : {}),
   }));
+  // A block Revision Mode flagged for an edit that left no text to mark (a
+  // deletion, a join, an element change) gets its asterisk on its first line.
+  if (node.attrs?.revised) {
+    const first = runs.find((r) => !r.isBreak && r.text.length > 0);
+    if (first) {
+      first.revised = true;
+      first.revision = latestRevision([first.revision, String(node.attrs.revised)]) ?? undefined;
+    }
+  }
+  return runs;
 }
 
 /** Apply type-level CSS styles (bold, italic, underline) to runs */
@@ -100,6 +150,27 @@ function applyTypeStyles(runs: TextRun[], typeName: string): TextRun[] {
     italic: r.italic || forceItalic,
     underline: r.underline || forceUnderline,
   }));
+}
+
+/**
+ * Every string a block holds, however deeply it is nested, with the style it
+ * will be drawn in.
+ *
+ * An AV body and a dual-dialogue block keep `runs` empty — a table and two
+ * columns cannot be flattened into one line of text, so each gets a draw pass
+ * of its own further down. Their text still has to be declared, or a face that
+ * can write it is never embedded and a Hindi AV script or a Cyrillic
+ * simultaneous speech comes out of the exporter blank.
+ */
+function collectNestedText(node: JSONContent, out: StyledText[]): void {
+  const content = node.content ?? [];
+  if (content.some((child) => child.type === 'text')) {
+    const runs = applyTypeStyles(extractRuns(node), String(node.type ?? ''));
+    for (const run of runs) out.push({ text: run.text, bold: run.bold, italic: run.italic });
+  }
+  for (const child of content) {
+    if (child.type !== 'text') collectNestedText(child, out);
+  }
 }
 
 function getPlainText(runs: TextRun[]): string {
@@ -117,15 +188,181 @@ function getPlainText(runs: TextRun[]): string {
  * any Courier must keep going through the untouched Final Draft path below.
  */
 export function pdfFontFor(family: string | undefined): 'courier' | 'times' | 'helvetica' {
-  const name = (family || '').toLowerCase();
-  if (name === '' || /courier|mono/.test(name)) return 'courier';
-  if (/times|roman|serif|georgia|garamond|palatino|book|minion|cambria/.test(name)) return 'times';
-  return 'helvetica';
+  if (!family || !family.trim()) return 'courier';
+  switch (genericFor(family)) {
+    case 'monospace': return 'courier';
+    // A script face has no Standard 14 equivalent at all; Times is the less
+    // wrong of the two, being the one with strokes of varying weight.
+    case 'serif': case 'cursive': return 'times';
+    default: return 'helvetica';
+  }
 }
 
-/** The face a run is drawn in: its own, else the document's. */
-function runFont(run: TextRun, documentFont: string | undefined): 'courier' | 'times' | 'helvetica' {
-  return pdfFontFor(run.fontFamily || documentFont);
+/**
+ * Everything the exporter needs to know about faces while it draws.
+ *
+ * `fallbacks` are the embedded fonts, present only when the script contains
+ * text no built-in face can encode — see utils/pdfUnicodeFont.
+ */
+interface FontContext {
+  documentFont?: string;
+  /** Character spacing that stretches jsPDF's Courier to the Final Draft cell. */
+  courierSpace: number;
+  fallbacks: UnicodeFallbacks;
+  /**
+   * The writer's own installed fonts, whose bytes are in this document — keyed
+   * by lowercased family name. Empty when the script uses none.
+   */
+  embedded: Map<string, EmbeddedFace>;
+}
+
+/**
+ * A piece of a run, resolved down to the face that draws it and how it is
+ * spaced and measured there.
+ */
+interface DrawnPiece {
+  /** The text as the face needs it ordered — see utils/devanagari. */
+  text: string;
+  face: string;
+  charSpace: number;
+  /** Whether its width is the character count on Final Draft's cell. */
+  fdCell: boolean;
+}
+
+/**
+ * The run's own face: its family, or the document's, or the nearest built-in.
+ *
+ * An installed font is drawn in itself — it carries its own glyphs, so it needs
+ * no Unicode fallback and no Standard 14 approximation.
+ */
+function baseFaceFor(family: string | undefined, fonts: FontContext): string {
+  const named = family || fonts.documentFont;
+  if (named && fonts.embedded.size > 0) {
+    const own = fonts.embedded.get(named.trim().toLowerCase());
+    if (own) return own.id;
+  }
+  return pdfFontFor(named);
+}
+
+/** Whether the run's own face is one of the writer's, which draws the lot itself. */
+function isOwnFont(family: string | undefined, fonts: FontContext): boolean {
+  const named = family || fonts.documentFont;
+  return !!named && fonts.embedded.has(named.trim().toLowerCase());
+}
+
+/**
+ * Break a piece of text into the faces that have to draw it.
+ *
+ * Usually one piece: a Latin script, or one of the writer's own fonts, which is
+ * left to write whatever it carries. A script the built-in faces cannot encode
+ * is split by the bundled font each part needs, so a Latin word inside a Hindi
+ * line stays on Courier's cell rather than being pulled into a proportional
+ * face with it.
+ */
+function drawnPieces(
+  text: string,
+  family: string | undefined,
+  fonts: FontContext,
+  opts: { freeFlow?: boolean } = {},
+): DrawnPiece[] {
+  const base = baseFaceFor(family, fonts);
+  const asBase = (s: string): DrawnPiece => ({
+    text: s,
+    face: base,
+    charSpace: base === 'courier' ? fonts.courierSpace : 0,
+    fdCell: base === 'courier',
+  });
+
+  const pieces = isOwnFont(family, fonts)
+    ? [asBase(text)]
+    : segmentByFace(text, fonts.fallbacks).map((segment): DrawnPiece => (segment.fallback
+      ? {
+        text: segment.fallback.shape(segment.text),
+        face: segment.fallback.id,
+        charSpace: segment.fallback.charSpace,
+        fdCell: segment.fallback.monospace,
+      }
+      : asBase(segment.text)));
+
+  // The title page is laid out free-flow rather than on the Final Draft cell,
+  // and has been since it was written: nothing there is stretched to the cell
+  // and nothing is measured by character count.
+  if (opts.freeFlow) return pieces.map((piece) => ({ ...piece, charSpace: 0, fdCell: false }));
+  return pieces;
+}
+
+/**
+ * Draw one line of page furniture — a (MORE), a CONT'D, a scene number — in
+ * the script's own face, or in the fallback when that face cannot write it.
+ */
+function drawPlain(
+  pdf: jsPDF,
+  text: string,
+  x: number,
+  y: number,
+  fonts: FontContext,
+  opts: { bold?: boolean } = {},
+): void {
+  drawPieces(pdf, drawnPieces(text, undefined, fonts), x, y, !!opts.bold, false);
+}
+
+/**
+ * An element number (utils/elementNumbers), right-aligned 0.15" left of the
+ * element's own text on its first line — the gap the scene numbers keep, and
+ * the place the editor draws it. `topY` is where the element starts, as
+ * renderElement is given it.
+ */
+function drawElementNumber(pdf: jsPDF, label: string, leftPt: number, topY: number, fonts: FontContext): void {
+  pdf.setFontSize(12);
+  const x = leftPt - 0.15 * PTS_PER_INCH - measurePlain(pdf, label, fonts);
+  drawPlain(pdf, label, x, topY + LINE_HEIGHT_PT, fonts);
+}
+
+/** How wide a piece of furniture draws, across every face it needs. */
+function measurePlain(
+  pdf: jsPDF,
+  text: string,
+  fonts: FontContext,
+  opts: { bold?: boolean } = {},
+): number {
+  return measurePieces(pdf, drawnPieces(text, undefined, fonts), !!opts.bold, false);
+}
+
+/**
+ * Draw the pieces of one run, left to right, and return where the cursor
+ * ended up.
+ */
+function drawPieces(
+  pdf: jsPDF,
+  pieces: DrawnPiece[],
+  x: number,
+  y: number,
+  bold: boolean,
+  italic: boolean,
+): number {
+  let cursorX = x;
+  for (const piece of pieces) {
+    if (piece.text.length === 0) continue;
+    setFontStyle(pdf, bold, italic, piece.face);
+    // charSpace stretches a monospace face to Final Draft's cell; a
+    // proportional one must be drawn at its own advances or the letters come
+    // out scattered.
+    //
+    // `isInputVisual: false` switches off half of jsPDF's own bidi pass, which
+    // runs on every text() call whether it is wanted or not.  Left at its
+    // default it reverses Arabic a second time, undoing utils/bidi and
+    // painting the line back in the order it was typed — and only Arabic, since
+    // the same engine ignores Hebrew entirely, so the two scripts came out
+    // contradicting each other.  The naming is inherited from Globalize and
+    // reads backwards here; what the flag does is stop the reordering while
+    // leaving text that is already in presentation forms untouched.  The
+    // painted order is asserted end to end in pdfExporter.rtl.test.ts, so a
+    // jsPDF upgrade that changes this fails there rather than in a writer's
+    // PDF.
+    pdf.text(piece.text, cursorX, y, { charSpace: piece.charSpace, isInputVisual: false });
+    cursorX += pieceWidth(pdf, piece);
+  }
+  return cursorX;
 }
 
 function setFontStyle(pdf: jsPDF, bold: boolean, italic: boolean, face = 'courier'): void {
@@ -141,17 +378,33 @@ function setFontStyle(pdf: jsPDF, bold: boolean, italic: boolean, face = 'courie
 }
 
 /**
- * How wide a run draws.
+ * How wide a piece of text draws.
  *
- * Courier keeps Final Draft's fixed 10.33-CPI cell, which is what every
- * indent, centre and page-break calculation in the app is built on.  A
- * proportional face has no such cell, so it is measured — it still sits in the
- * line box the monospace layout assigned, and since Times and Helvetica are
- * narrower than Courier at the same size, it fits inside it.
+ * A monospace face keeps Final Draft's fixed 10.33-CPI cell, which is what
+ * every indent, centre and page-break calculation in the app is built on — and
+ * the DejaVu fallback is monospace precisely so that stays true when a script
+ * switches to it.  A proportional face has no such cell, so it is measured — it
+ * still sits in the line box the monospace layout assigned, and since Times,
+ * Helvetica and Noto Sans Devanagari are all narrower than Courier at the same
+ * size, it fits inside it.
+ *
+ * `getTextWidth` reads whatever face is currently set, so a measured piece has
+ * to have its own selected first.
  */
-function runWidth(pdf: jsPDF, run: TextRun, face: string): number {
-  if (face === 'courier') return run.text.length * FD_CHAR_WIDTH_PT;
-  return pdf.getTextWidth(run.text);
+function pieceWidth(pdf: jsPDF, piece: DrawnPiece): number {
+  if (piece.fdCell) return piece.text.length * FD_CHAR_WIDTH_PT;
+  return pdf.getTextWidth(piece.text);
+}
+
+/** Total width of a run's pieces, selecting each face it has to measure. */
+function measurePieces(pdf: jsPDF, pieces: DrawnPiece[], bold: boolean, italic: boolean): number {
+  let total = 0;
+  for (const piece of pieces) {
+    if (piece.text.length === 0) continue;
+    if (!piece.fdCell) setFontStyle(pdf, bold, italic, piece.face);
+    total += pieceWidth(pdf, piece);
+  }
+  return total;
 }
 
 /**
@@ -162,36 +415,36 @@ function renderLine(
   lineRuns: TextRun[],
   x: number,
   y: number,
-  charSpace: number,
-  documentFont?: string,
+  fonts: FontContext,
 ): void {
   let cursorX = x;
   for (const run of lineRuns) {
     if (run.text.length === 0) continue;
-    const face = runFont(run, documentFont);
-    setFontStyle(pdf, run.bold, run.italic, face);
-    // charSpace stretches Courier to Final Draft's cell; a proportional face
-    // must be drawn at its own advances or the letters come out scattered.
-    pdf.text(run.text, cursorX, y, { charSpace: face === 'courier' ? charSpace : 0 });
-    const w = runWidth(pdf, run, face);
+    const pieces = drawnPieces(run.text, run.fontFamily, fonts);
+    const nextX = drawPieces(pdf, pieces, cursorX, y, run.bold, run.italic);
     if (run.underline) {
       const ulY = y + 1.5;
       pdf.setLineWidth(0.5);
-      pdf.line(cursorX, ulY, cursorX + w, ulY);
+      pdf.line(cursorX, ulY, nextX, ulY);
     }
-    cursorX += w;
+    cursorX = nextX;
+    if (run.marker) {
+      // Raised, small, and advancing nothing: it overhangs into the space that
+      // follows, which is what the editor's marker decoration does and what
+      // keeps this line the same length in both. See utils/footnotes.
+      pdf.setFontSize(8);
+      drawPieces(pdf, drawnPieces(run.marker, undefined, fonts), cursorX, y - 3.5, false, false);
+      pdf.setFontSize(12);
+    }
   }
 }
 
 /** Width of a whole line, for centring and right alignment. */
-function measureLine(pdf: jsPDF, lineRuns: TextRun[], documentFont?: string): number {
+function measureLine(pdf: jsPDF, lineRuns: TextRun[], fonts: FontContext): number {
   let total = 0;
   for (const run of lineRuns) {
     if (run.text.length === 0) continue;
-    const face = runFont(run, documentFont);
-    // getTextWidth reads the current font, so it has to be set first.
-    if (face !== 'courier') setFontStyle(pdf, run.bold, run.italic, face);
-    total += runWidth(pdf, run, face);
+    total += measurePieces(pdf, drawnPieces(run.text, run.fontFamily, fonts), run.bold, run.italic);
   }
   return total;
 }
@@ -200,49 +453,157 @@ function measureLine(pdf: jsPDF, lineRuns: TextRun[], documentFont?: string): nu
 
 export interface PDFExportOptions {
   sceneNumbersVisible?: boolean;
+  /**
+   * Print the numbers the active format puts on elements other than scene
+   * headings (utils/elementNumbers). Absent or false prints none, so a caller
+   * that has never heard of them exports exactly what it always did.
+   */
+  elementNumbersVisible?: boolean;
   /** Document title for header/footer {title} field */
   documentTitle?: string;
   /** Current revision color for {revision} field */
   revisionColor?: string;
+  /**
+   * Draw an asterisk in the right margin of every line Revision Mode marked.
+   * Absent or true draws them — a script with no revisions is unaffected.
+   */
+  showRevisionMarks?: boolean;
+  /** The mark printed beside a revised line — a custom character, or one per
+   *  revision. Absent: an asterisk. */
+  revisionSettings?: RevisionSettings | null;
+  /**
+   * Print each revised page on its revision's paper colour (the latest round
+   * on the page). Absent or false: every page is white.
+   */
+  colorRevisedPages?: boolean;
+  /**
+   * Only the pages that carry a revision — what goes out to cast and crew
+   * between full drafts. Throws when the script has none.
+   */
+  revisedPagesOnly?: boolean;
+  /**
+   * Printed labels while pages are locked ("12", "12A", "13-14"), from the
+   * editor's pagination — which this exporter's own matches page for page.
+   * Index 0 is script page 1. Absent: pages are numbered.
+   */
+  pageLabels?: string[] | null;
   /**
    * The document's typeface.  Omitted or any Courier keeps the Final Draft
    * Courier output untouched; anything else is what the writer chose, and the
    * script is drawn in the closest face jsPDF embeds.
    */
   documentFont?: string;
+  /**
+   * Printing script notes. Absent — the usual case — and this exporter is
+   * byte-for-byte what it was before footnotes existed.
+   */
+  footnotes?: FootnotePlan | null;
+  /**
+   * Whether the title page is drawn at all. Absent or true keeps it.
+   *
+   * The writer's own preference, not the document's: rendered output — this,
+   * print and DOCX — honours it, while the interchange formats (FDX, Fountain,
+   * Fade In/OSF and .odraft) always carry the title-page data whatever it says.
+   * Sending a script to a producer who wants the pages and nothing else should
+   * not edit the script (issue #98).
+   */
+  includeTitlePage?: boolean;
+  /**
+   * Told how a font fetch is going, for the faces that are not in the bundle.
+   *
+   * Only CJK is: those families are 5-10 MB, far too large to ship to every
+   * user, so the first export of a Chinese, Japanese or Korean script fetches
+   * one.  That takes long enough that saying nothing reads as a hang.  Every
+   * other script is bundled and reports nothing at all.
+   */
+  onFontProgress?: ProgressHandler;
 }
 
-/** Resolve dynamic field placeholders in header/footer text */
-function resolveFields(
-  text: string,
-  pageNum: number,
-  totalPages: number,
-  title: string,
-  revisionColor: string,
-): string {
-  if (!text) return '';
-  return text
-    .replace(/\{page\}/gi, String(pageNum))
-    .replace(/\{pages\}/gi, String(totalPages))
-    .replace(/\{title\}/gi, title)
-    .replace(/\{date\}/gi, new Date().toLocaleDateString())
-    .replace(/\{revision\}/gi, revisionColor);
+/** Resolve dynamic field placeholders in header/footer text. Shared with the
+ *  editor and the settings preview so all three render a template identically. */
+const resolveFields = resolveHFFields;
+
+/** A rendered PDF: the bytes, and what to call the file they belong in. */
+export interface RenderedPDF {
+  bytes: Uint8Array;
+  filename: string;
+  /**
+   * Something the writer has to be told about the file they just got.
+   *
+   * At present only one thing qualifies: a bundled face that would not load,
+   * which leaves the script it was for blank on the page. That is the shape
+   * issue #128 was reported in — a PDF that had simply lost its dialogue — and
+   * it must never be silent again, on any platform.
+   */
+  warning?: string;
 }
 
-export async function exportPDF(doc: JSONContent, title: string, layout: PageLayout, options?: PDFExportOptions): Promise<void> {
-  const { saveFile } = await import('./fileOps');
-  const filename = `${sanitizeFilename(title)}.pdf`;
+/**
+ * What to tell the writer about `fallbacks`, or nothing when all is well.
+ *
+ * Two different failures, and the difference matters to whoever reads it. A
+ * face that would not load is a bad day — the network, a blocked request — and
+ * exporting again may well fix it. A script with no face at all will not fix
+ * itself, and the writer is better off knowing that now than after sending the
+ * file to a producer.
+ */
+function fallbackWarning(fallbacks: UnicodeFallbacks): string | undefined {
+  const parts: string[] = [];
+
+  if (fallbacks.missing.length > 0) {
+    parts.push(`The ${fallbacks.missing.join(' and ')} font could not be loaded, `
+      + 'so that text is blank in the PDF.');
+  }
+
+  if (fallbacks.unsupported.length > 0) {
+    const names = fallbacks.unsupported.join(' and ');
+    parts.push(`${names} cannot be written to a PDF yet, so that text is `
+      + 'missing or garbled. The rest of the script exported normally.');
+  }
+
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+/**
+ * Lay the script out as a PDF and hand back the bytes.
+ *
+ * Split out from exportPDF because the file is no longer only ever destined
+ * for disk: on iOS and Android it is also what File → Print sends to the
+ * system printer (issues #97, and Android's silent Print), and those want the
+ * bytes rather than a save dialog. Everything about the document itself —
+ * pagination, fonts, headers, footnotes — lives here, so print and export can
+ * never drift apart.
+ */
+export async function renderPDF(doc: JSONContent, title: string, layout: PageLayout, options?: PDFExportOptions): Promise<RenderedPDF> {
+  const filename = `${sanitizeExportFilename(title)}.pdf`;
+
+  // Labels for numbered elements, on a copy. The very same document comes back
+  // when nothing is numbered, so nothing below can tell the difference.
+  doc = withElementNumbers(doc, {
+    visible: options?.elementNumbersVisible === true,
+    sceneNumbersVisible: options?.sceneNumbersVisible === true,
+  });
 
   if (!doc || !doc.content || doc.content.length === 0) {
     const pdf = new jsPDF({
       unit: 'pt',
       format: [layout.pageWidth * PTS_PER_INCH, layout.pageHeight * PTS_PER_INCH],
     });
-    await saveFile(new Uint8Array(pdf.output('arraybuffer')), filename, [{ name: 'PDF', extensions: ['pdf'] }]);
-    return;
+    return { bytes: new Uint8Array(pdf.output('arraybuffer')), filename };
   }
 
   const pageWidthPt = layout.pageWidth * PTS_PER_INCH;
+  // Which revision each sheet carries, for coloured paper and revised-only
+  // output: every mark drawn records the latest round on its sheet.
+  const sheetRevisions = new Map<number, string>();
+  const revisionMarkX: RevisionMarker | null = options?.showRevisionMarks === false ? null : {
+    x: revisionMarkXPt(pageWidthPt),
+    settings: options?.revisionSettings ?? null,
+    onMark: (color) => {
+      const latest = latestRevision([sheetRevisions.get(pageNumber), color]);
+      sheetRevisions.set(pageNumber, latest ?? sheetRevisions.get(pageNumber) ?? '');
+    },
+  };
   const pageHeightPt = layout.pageHeight * PTS_PER_INCH;
   const topMarginPt = layout.topMargin;
   const bottomMarginPt = layout.bottomMargin;
@@ -255,56 +616,182 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
     format: [pageWidthPt, pageHeightPt],
   });
 
+  // Printing notes reach a file only when the writer asked them to. One flag,
+  // read from the same resolver the editor reads, so turning it off restores
+  // exactly today's output.
+  const plan = options?.footnotes && options.footnotes.settings.includeInExports
+    ? options.footnotes
+    : null;
+
   const documentFont = options?.documentFont;
-  pdf.setFont(pdfFontFor(documentFont), 'normal');
   pdf.setFontSize(12);
 
-  // Character spacing adjustment: make jsPDF Courier match FD Courier (10.33 CPI)
-  const baseCharWidth = pdf.getTextWidth('M');
-  const charSpace = FD_CHAR_WIDTH_PT - baseCharWidth;
+  // Character spacing adjustment: make jsPDF Courier match FD Courier (10.33 CPI).
+  // Measured on Courier itself, since that is what it is applied to.
+  pdf.setFont('courier', 'normal');
+  const courierSpace = FD_CHAR_WIDTH_PT - pdf.getTextWidth('M');
+  pdf.setFont(pdfFontFor(documentFont), 'normal');
 
   // Build the body node list, separating the title-page region: the leading run
   // of titlePage + image nodes. The title page renders its nodes in DOCUMENT
   // ORDER (free-flow / WYSIWYG), matching the editor and DOCX.
   const nodes: NodeInfo[] = [];
-  interface TitleItem { kind: 'text' | 'image'; field?: string; text?: string; titleSize?: number; attrs?: Record<string, unknown>; }
+  interface TitleItem { kind: 'text' | 'image'; field?: string; text?: string; titleSize?: number; font?: string; attrs?: Record<string, unknown>; }
   const titleItems: TitleItem[] = [];
-  let inLeadingRegion = true;
-  let hasTitlePage = false;
-  for (const node of doc.content) {
+
+  // Where the title page ends. Shared with the paginator, the DOCX exporter and
+  // the Title Page dialog so all four agree even when something stray sits above
+  // the title (issue #52) — see utils/titlePageRegion.
+  const docNodes = doc.content;
+  const region = findTitlePageRegion(
+    docNodes.map((node) => ({
+      type: node.type || 'general',
+      hasText: getPlainText(extractRuns(node)).trim().length > 0,
+      hasTitleData: titlePageAttrsCarryData(node.attrs as Record<string, unknown> | undefined),
+    })),
+  );
+  // Excluding the title page has to drop the region outright. It cannot lean on
+  // the `!hasTitlePage` path below: that one exists for a region that was never
+  // a title page in the first place, so it keeps whatever carries text as body
+  // content — which here would print the title as the first line of page 1.
+  const excludeTitlePage = options?.includeTitlePage === false;
+  const hasTitlePage = region.isReal && !excludeTitlePage;
+  const dropTitleRegion = region.isReal && excludeTitlePage;
+
+  docNodes.forEach((node, index) => {
     const typeName = node.type || 'general';
-    if (inLeadingRegion && (typeName === 'titlePage' || typeName === 'screenplayImage')) {
-      if (typeName === 'titlePage') {
-        if (node.attrs?.field === 'title' && node.attrs?.tpTitle) hasTitlePage = true;
+
+    if (dropTitleRegion && index < region.length) return;
+
+    // Fountain's Sections and Notes are outline, not script. The spec is
+    // explicit that they stay in the file and off the printed page, and
+    // pagination already counts them as nothing — so the PDF must not draw
+    // them, or the file would run longer than the page count on screen.
+    if (isNonPrintingType(typeName)) return;
+
+    if (hasTitlePage && index < region.length) {
+      if (typeName === 'screenplayImage') {
+        titleItems.push({ kind: 'image', attrs: (node.attrs || {}) as Record<string, unknown> });
+      } else {
+        const titleRuns = extractRuns(node);
         titleItems.push({
           kind: 'text',
-          field: (node.attrs?.field as string) || 'title',
-          text: getPlainText(extractRuns(node)),
+          // A node absorbed into the region that is not a title-page node is a
+          // stray blank line; render it as a spacer, never as the title.
+          field: typeName === 'titlePage' ? ((node.attrs?.field as string) || 'title') : 'blank',
+          text: getPlainText(titleRuns),
           titleSize: Number(node.attrs?.tpTitleFontSize) || 12,
+          // The title page is where a display face earns its keep, so the line
+          // is drawn in the font its text carries rather than the document's.
+          // One font per line: the page is flattened to plain text here, as it
+          // has been since it was laid out free-flow.
+          font: titleRuns.find((r) => r.text.trim() && r.fontFamily)?.fontFamily,
         });
-      } else {
-        titleItems.push({ kind: 'image', attrs: (node.attrs || {}) as Record<string, unknown> });
       }
-      continue;
+      return;
     }
-    inLeadingRegion = false;
+
+    // Nothing worth a title page: the region's nodes are body content after all.
+    // Blank title-page spacers are dropped rather than printed as a screenful of
+    // empty lines, but anything carrying text is kept — the old code threw the
+    // whole region away and lost it.
+    if (!hasTitlePage && typeName === 'titlePage' && getPlainText(extractRuns(node)).trim() === '') {
+      return;
+    }
+
+    // An AV body is a table and cannot be flattened into a run list — it gets
+    // its own draw pass below, which needs the node itself. Dual dialogue is
+    // two columns and cannot either: flattening it asked `jsonBlockRuns` for
+    // the text of a node whose children are columns, which is none, so the
+    // block came out of the exporter empty and the speeches were simply
+    // missing from the PDF.
+    if (typeName === 'avBlock' || typeName === 'dualDialogue') {
+      nodes.push({ typeName, runs: [], plainText: '', attrs: node.attrs as Record<string, unknown> | undefined, raw: node, srcIndex: index });
+      return;
+    }
+
     const rawRuns = extractRuns(node);
-    const runs = applyTypeStyles(rawRuns, typeName);
+    const styled = applyTypeStyles(rawRuns, typeName);
+    // References anchored in this block. A superscript rides beside the text
+    // and advances nothing; a bracketed one is spliced in as real characters,
+    // padded to the width the editor reserved — see utils/footnotes.
+    const refs = plan?.refsByNode.get(index);
+    const runs = refs && refs.length > 0
+      ? applyFootnoteMarkers(styled, refs, plan!.settings.markerStyle, plan!.markerWidth)
+      : styled;
     nodes.push({
       typeName,
       runs,
       plainText: getPlainText(rawRuns),
       attrs: node.attrs as Record<string, unknown> | undefined,
+      srcIndex: index,
     });
+  });
+
+  // Header and footer text, resolved once the page count is known but written
+  // from strings that are already fixed here.
+  const hf = resolveHeaderFooter(layout);
+  const hContent = hf.headerContent;
+  const fContent = hf.footerContent;
+  const docTitle = options?.documentTitle || title;
+  const revColor = options?.revisionColor || '';
+
+  // Anything the built-in faces cannot encode — Cyrillic, Greek, and the rest —
+  // is drawn in an embedded font instead. Which styles of it to embed is known
+  // only from the text itself, so every string this export will draw is
+  // collected first, with the style it will be drawn in.
+  const drawn: StyledText[] = [];
+  for (const node of nodes) {
+    for (const run of node.runs) drawn.push({ text: run.text, bold: run.bold, italic: run.italic });
+    // A dialogue block broken across a page repeats the character name.
+    if (node.typeName === 'character') drawn.push({ text: node.plainText });
+    // A block that draws itself carries its text below the run list.
+    if (node.raw) collectNestedText(node.raw, drawn);
   }
-  // No real title page → leading images are top-of-body content; restore them.
-  if (!hasTitlePage && titleItems.length > 0) {
-    const restored: NodeInfo[] = titleItems
-      .filter((it) => it.kind === 'image')
-      .map((it) => ({ typeName: 'screenplayImage', runs: [], plainText: '', attrs: it.attrs }));
-    nodes.unshift(...restored);
-    titleItems.length = 0;
+  for (const it of titleItems) {
+    if (it.kind === 'text') drawn.push({ text: it.text || '', bold: it.field === 'title' });
   }
+  if (plan) {
+    // Every string this export will draw has to be declared here or a face
+    // that cannot encode it is never embedded — the dagger and the section
+    // sign in the symbol format are outside Latin-1, and so is most citation
+    // text that is not English.
+    for (const ref of plan.refs) drawn.push({ text: ref.label });
+    for (const entry of plan.entries) {
+      drawn.push({ text: entry.entryLabel });
+      for (const b of entry.blocks) drawn.push({ text: noteBlockText(b) });
+    }
+  }
+  // Only a script that has revisions draws a mark; asking for a custom mark's
+  // face otherwise fetches a font no page uses.
+  if (revisionMarkX && docNodes.some((n) => blockRevision(n) !== null)) {
+    drawn.push({ text: revisionMarkFor(revisionMarkX.settings, null), bold: true });
+    for (const c of REVISION_COLORS) drawn.push({ text: revisionMarkFor(revisionMarkX.settings, c.name), bold: true });
+  }
+  drawn.push(
+    { text: mc.moreText }, { text: mc.contdText },
+    { text: docTitle }, { text: revColor }, { text: new Date().toLocaleDateString() },
+    ...[hContent, fContent].flatMap((c) => [{ text: c.left }, { text: c.center }, { text: c.right }]),
+  );
+
+  // Fonts the writer installed themselves are embedded outright, so a script
+  // set in one exports as that font rather than as the nearest built-in.
+  const usedFamilies = new Set<string>();
+  if (documentFont) usedFamilies.add(documentFont);
+  for (const node of nodes) {
+    for (const run of node.runs) if (run.fontFamily) usedFamilies.add(run.fontFamily);
+  }
+  for (const it of titleItems) if (it.font) usedFamilies.add(it.font);
+
+  const fonts: FontContext = {
+    documentFont,
+    courierSpace,
+    fallbacks: await embedUnicodeFonts(pdf, requiredUnicodeFaces(drawn), FD_CHAR_WIDTH_PT, {
+      unsupported: unsupportedScripts(drawn),
+      onProgress: options?.onFontProgress,
+    }),
+    embedded: embedCustomFonts(pdf, usedFamilies),
+  };
 
   let currentY = topMarginPt;
   let pageNumber = 1;
@@ -335,6 +822,7 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
     const rightX = pageWidthPt - layout.rightMargin * PTS_PER_INCH;
     const bottom = pageHeightPt - bottomMarginPt;
     let y = topMarginPt;
+    let dropped = 0;
     for (let k = 0; k < titleItems.length; k++) {
       const it = titleItems[k];
       if (it.kind === 'image') {
@@ -349,26 +837,135 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
         const align: 'left' | 'center' | 'right' =
           it.field === 'draft' ? 'left' : (it.field === 'contact' || it.field === 'copyright') ? 'right' : 'center';
         const lineH = isTitle ? (it.titleSize || 12) : LINE_HEIGHT_PT;
-        pdf.setFont(pdfFontFor(documentFont), isTitle ? 'bold' : 'normal');
         pdf.setFontSize(isTitle ? (it.titleSize || 12) : 12);
         const x = align === 'left' ? leftX : align === 'right' ? rightX : centerX;
         const lines = (it.text || '').split('\n');
         for (const line of lines) {
-          if (line && y + lineH <= bottom) pdf.text(isTitle ? line.toUpperCase() : line, x, y + lineH, { align });
+          const drawnLine = isTitle ? line.toUpperCase() : line;
+          // Per line, so a Cyrillic title above a Latin credit each get a face
+          // that can write them — and a line that needs two faces is drawn and
+          // aligned piece by piece, since jsPDF's own `align` can only measure
+          // one. Measured widths, free-flow: the same numbers jsPDF's `align`
+          // was reaching for when this drew every line in a single face.
+          if (line && y + lineH <= bottom) {
+            const pieces = drawnPieces(drawnLine, it.font, fonts, { freeFlow: true });
+            const w = measurePieces(pdf, pieces, isTitle, false);
+            const startX = align === 'left' ? x : align === 'right' ? x - w : x - w / 2;
+            drawPieces(pdf, pieces, startX, y + lineH, isTitle, false);
+          } else if (line) {
+            dropped++;
+          }
           y += lineH;
         }
         pdf.setFontSize(12);
-        y += 4; // small gap between elements
+        // No inter-element gap. The title page is built as a fixed number of
+        // 12pt lines (see buildTitlePageBlocks), and an extra 4pt per element
+        // added up to a third of a page over ~50 of them — enough that the
+        // draft, contact, copyright and notes block ran off the bottom and was
+        // silently skipped by the bounds check above (issue #52).
       }
     }
+    if (dropped > 0) {
+      console.warn(
+        `[pdf] ${dropped} title-page line(s) did not fit the page and were not drawn.`,
+      );
+    }
 
-    // Start page 2 for the screenplay
+    // Start the screenplay on a fresh sheet. This is physical page 2 of the
+    // file; it is script page 1, and the header/footer pass below numbers it
+    // that way so the PDF agrees with the page count in the editor.
     pdf.addPage([pageWidthPt, pageHeightPt]);
     pageNumber = 2;
     currentY = topMarginPt;
   }
 
+  // Footnotes owed by the page being laid out, and any lines carried in from
+  // the page before. The usable bottom moves up to make room for them, so the
+  // reserve is taken from the same place the editor takes it — the content
+  // area — and the two page counts stay equal.
+  const drawFootnotes = !!plan;
+  let pageEntries: FootnoteEntry[] = [];
+  /** Parts of a note still to be drawn, continuing onto the next page. */
+  let pendingSlices: NoteSlice[] = [];
+  const linesPerPage = Math.floor((pageHeightPt - topMarginPt - bottomMarginPt) / LINE_HEIGHT_PT);
+
+  function reserveLines(): number {
+    if (!drawFootnotes) return 0;
+    return packFootnotePage(pendingSlices, pageEntries, linesPerPage).reserve;
+  }
+
+  /** Where the script has to stop on this page. */
+  function bottomPt(): number {
+    return usableBottomPt - reserveLines() * LINE_HEIGHT_PT;
+  }
+
+  /**
+   * Every line a note occupies, so a slice of it can be drawn on its own.
+   * The label opens the first line, exactly as `footnoteEntryLines` measured it.
+   */
+  function noteLines(entry: FootnoteEntry, label: string | null): TextRun[][] {
+    const out: TextRun[][] = [];
+    const wrap = (text: string, bold = false) => {
+      for (const line of wrapForDrawing(
+        [{ text, bold, italic: false, underline: false }], FOOTNOTE_CPL, false,
+      )) out.push(line as TextRun[]);
+    };
+    let first = true;
+    if (entry.title) {
+      wrap(label ? `${label} ${entry.title}` : entry.title, true);
+      first = false;
+    }
+    for (const b of entry.blocks) {
+      if (b.kind === 'image') continue; // measured by height, not drawn here
+      const text = noteBlockText(b);
+      wrap(label && first ? `${label} ${text}` : text);
+      first = false;
+    }
+    if (out.length === 0 && label) wrap(label);
+    return out;
+  }
+
+  /**
+   * Draw this page's footnotes, bottom-aligned on the content area's edge.
+   *
+   * Only this page's share of each note is drawn — a note longer than the room
+   * the page can spare continues at the foot of the next one, which is both
+   * what Word does and what stops it overflowing into the script.
+   */
+  function flushFootnotes(): void {
+    if (!drawFootnotes) return;
+    const fill = packFootnotePage(pendingSlices, pageEntries, linesPerPage);
+    pendingSlices = fill.pending;
+    pageEntries = [];
+    if (fill.reserve === 0) return;
+
+    const leftPt = FD_INDENTS.action[0] * PTS_PER_INCH;
+    let y = usableBottomPt - (fill.reserve - 1) * LINE_HEIGHT_PT;
+
+    // A blank line, then Word's short rule — drawn on a continuation page too.
+    const ruleY = y - LINE_HEIGHT_PT * 0.4;
+    pdf.setLineWidth(0.5);
+    pdf.line(leftPt, ruleY, leftPt + 2 * PTS_PER_INCH, ruleY);
+    y += LINE_HEIGHT_PT;
+
+    for (const slice of fill.slices) {
+      const entry = plan!.entryById.get(slice.noteId);
+      if (!entry) continue;
+      const label = !slice.isStart
+        ? null
+        : plan!.settings.numbering === 'restartEachPage'
+          ? noteEntryLabel(plan!.settings.startAt + Math.max(0, fill.slices.indexOf(slice)), plan!.settings.numberFormat)
+          : entry.entryLabel;
+      const lines = noteLines(entry, label);
+      for (const line of lines.slice(slice.fromLine, slice.fromLine + slice.lines)) {
+        renderLine(pdf, line, leftPt, y, fonts);
+        y += LINE_HEIGHT_PT;
+      }
+    }
+  }
+
   function newPage(): void {
+    flushFootnotes();
     pdf.addPage([pageWidthPt, pageHeightPt]);
     pageNumber++;
     currentY = topMarginPt;
@@ -391,13 +988,45 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
     imageMap.set(k, { dataUrl: d.dataUrl, wPt, hPt, align: (attrs.align as string) || 'center' });
   }
 
+  // Storyboard frames, preloaded for the same reason inserted images are: the
+  // render loop below is synchronous.
+  const avImageMap = new Map<string, { dataUrl: string; width: number; height: number }>();
+  for (const n of nodes) {
+    if (n.typeName !== 'avBlock' || !n.raw) continue;
+    for (const rn of avRowNodes(n.raw)) {
+      if (!rn.image) continue;
+      const attrs = (rn.image.attrs || {}) as Record<string, unknown>;
+      const key = avFrameKey(attrs as { src?: string | null; assetId?: string | null; scratchId?: string | null });
+      if (!key || avImageMap.has(key)) continue;
+      const url = resolveImageUrl(attrs);
+      if (!url) continue;
+      const d = await loadImageData(url);
+      if (d) avImageMap.set(key, { dataUrl: d.dataUrl, width: d.width, height: d.height });
+    }
+  }
+
   // Element ids the active template requires to start a new page (e.g. TV newAct).
   const forceBreakIds = getForceBreakIds();
+  // Blank lines before each element, from the same template the editor
+  // paginates with — resolved once so the whole document uses one answer.
+  const spaceBeforeLines = getSpaceBefore();
+
+  /**
+   * Blank lines above an element, in points.
+   *
+   * Keyed by the element's template id, not its node type — a custom element
+   * is `customElement` to the schema and `sceneCharacters` (say) to the
+   * template that gives it its spacing. Reading the node type dropped that
+   * spacing here while the editor kept it, so a script using a custom element
+   * paginated differently in the file (issue #123).
+   */
+  const spaceBeforePtOf = (n: NodeInfo): number =>
+    (spaceBeforeLines[elementIdOf({ type: n.typeName, attrs: n.attrs })] ?? 0) * LINE_HEIGHT_PT;
 
   /** True when this node must open a fresh page (template rule or manual flag). */
   function mustStartNewPage(node: NodeInfo): boolean {
     if (isFirstElement || currentY <= topMarginPt) return false;
-    return startsOwnPage({ type: node.typeName, attrs: node.attrs }, forceBreakIds);
+    return startsOwnPage({ type: node.typeName, attrs: node.attrs }, forceBreakIds, { lockedPages: true });
   }
 
   // Process each node
@@ -407,15 +1036,129 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
     const typeName = node.typeName;
     const forcedBreak = mustStartNewPage(node);
 
+    // Decided jointly with the block, exactly as the paginator decides it: if
+    // the block plus its own notes will not fit, both move to the next page and
+    // the reservation returns to what it was.
+    const claimed: FootnoteEntry[] = [];
+    if (drawFootnotes) {
+      for (const ref of plan!.refsByNode.get(node.srcIndex) ?? []) {
+        // A note anchored here but sent to the end of the script still gets its
+        // reference number in the text; it just costs this page nothing.
+        if (!plan!.footnoteIds.has(ref.noteId)) continue;
+        const entry = plan!.entryById.get(ref.noteId);
+        if (entry && !pageEntries.includes(entry)) { pageEntries.push(entry); claimed.push(entry); }
+      }
+    }
+    /**
+     * Break the page for this block. The block's own notes travel with it
+     * rather than being drawn on the page it has just left — which is exactly
+     * why the reservation cannot oscillate.
+     */
+    const breakForBlock = () => {
+      for (const e of claimed) {
+        const at = pageEntries.indexOf(e);
+        if (at >= 0) pageEntries.splice(at, 1);
+      }
+      newPage();
+      for (const e of claimed) pageEntries.push(e);
+    };
+
+    // Dual dialogue — two speeches side by side, each in half the text column.
+    // Drawn by its own pass for the same reason an AV body is: it is not one
+    // run of text, and flattening it lost both speeches entirely.
+    if (typeName === 'dualDialogue' && node.raw) {
+      const columns = (node.raw.content ?? []).map((column) =>
+        (column.content ?? []).map((child) => {
+          const childType = String(child.type ?? 'dialogue');
+          const runs = extractRuns(child);
+          return {
+            type: childType,
+            text: getPlainText(runs),
+            runs: applyTypeStyles(runs, childType),
+            number: elementNumberOf(child),
+          };
+        }));
+      const heightPt = dualDialogueLineCount(columns as DualColumns) * LINE_HEIGHT_PT;
+      const sbPt = isFirstElement ? 0 : spaceBeforePtOf(node);
+
+      if (forcedBreak || (currentY + sbPt + heightPt > bottomPt() && currentY > topMarginPt)) {
+        breakForBlock();
+      }
+      if (!isFirstElement && currentY > topMarginPt) currentY += sbPt;
+
+      const top = currentY;
+      columns.forEach((children, col) => {
+        // Each column's own first cue sits a line below the top of the block,
+        // which is the margin the stylesheet gives it.
+        let y = top + dualColumnLeadLines(children as DualColumns[number]) * LINE_HEIGHT_PT;
+        for (const child of children) {
+          const [leftIn, rightIn] = dualChildBounds(col, child.type);
+          const wrapped = wrapForDrawing(
+            child.runs, dualCharsPerLine(child.type), UPPERCASE_TYPES.has(child.type),
+          );
+          renderElement(
+            pdf, wrapped, leftIn * PTS_PER_INCH, rightIn * PTS_PER_INCH, y, child.type, fonts,
+            revisionMarkX,
+          );
+          if (child.number) drawElementNumber(pdf, child.number, leftIn * PTS_PER_INCH, y, fonts);
+          y += wrapped.length * LINE_HEIGHT_PT;
+        }
+      });
+      // The taller column decides how far the page has filled.
+      currentY = top + heightPt;
+      isFirstElement = false;
+      i++;
+      continue;
+    }
+
+    // AV body — a table, drawn by its own pass with row-level pagination and a
+    // repeated header. See utils/avPdfTable.
+    if (typeName === 'avBlock' && node.raw) {
+      if (forcedBreak) breakForBlock();
+      const bodies = extractAvBodies({ type: 'doc', content: [node.raw] });
+      const body = bodies[0];
+      if (body) {
+        const cfg = readColumnConfig(node.attrs);
+        const repeatHeaders = (node.attrs as { repeatHeaders?: boolean } | undefined)?.repeatHeaders !== false;
+        drawAvBody(
+          {
+            pdf,
+            drawLine: (line, xPt, yPt) => {
+              renderLine(pdf, line as TextRun[], xPt, yPt, fonts);
+              // Same margin as the rest of the script — not beside the cell.
+              drawRevisionMark(pdf, line as TextRun[], yPt, fonts, revisionMarkX);
+            },
+            charWidthPt: FD_CHAR_WIDTH_PT,
+            lineHeightPt: LINE_HEIGHT_PT,
+            leftPt: layout.leftMargin * PTS_PER_INCH,
+            contentWidthPt,
+            topMarginPt,
+            bottomMarginPt,
+            pageHeightPt,
+            getY: () => currentY,
+            setY: (y) => { currentY = y; },
+            newPage,
+            images: avImageMap,
+          },
+          body,
+          avRowNodes(node.raw),
+          { widths: cfg.widths, repeatHeaders },
+        );
+      }
+      isFirstElement = false;
+      i++;
+      continue;
+    }
+
     // Inserted image — place it, paginating if it doesn't fit.
     if (typeName === 'screenplayImage') {
       const img = imageMap.get(i);
       if (img) {
         const sbPt = isFirstElement ? 0 : LINE_HEIGHT_PT;
         if (forcedBreak) {
-          newPage();
+          breakForBlock();
         } else if (currentY + sbPt + img.hPt > pageHeightPt - bottomMarginPt && currentY > topMarginPt) {
-          newPage();
+          breakForBlock();
         } else {
           currentY += sbPt;
         }
@@ -437,244 +1180,337 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
     const maxChars = CHARS_PER_LINE[typeName] || 62;
     const forceUpper = UPPERCASE_TYPES.has(typeName);
 
-    const spaceBefore = isFirstElement ? 0 : (SPACE_BEFORE[typeName] ?? 0);
-    const spaceBeforePt = spaceBefore * LINE_HEIGHT_PT;
+    const spaceBeforePt = isFirstElement ? 0 : spaceBeforePtOf(node);
 
-    const wrappedLines = wordWrapRuns(node.runs, maxChars, forceUpper);
+    const wrappedLines = wrapForDrawing(node.runs, maxChars, forceUpper);
     const elementHeightPt = wrappedLines.length * LINE_HEIGHT_PT;
     const totalHeightPt = spaceBeforePt + elementHeightPt;
 
-    // Check if this is a character node starting a dialogue block
-    let isDialogueBlock = false;
-    let dialogueBlockNodes: number[] = [];
-    let dialogueBlockHeight = totalHeightPt;
+    /**
+     * The block this element opens, measured once — the same grouping
+     * `computeBreaks` paginates the editor with, because a group that fits on
+     * screen has to be a group that fits in the file.
+     *
+     * Part 0 is the element itself. A character name takes the paragraphs that
+     * follow it; a scene heading takes the element after it so it is never left
+     * alone at a page foot, and when that element is a character it takes the
+     * whole speech, not just the name.
+     */
+    interface BlockPart {
+      nodeIndex: number; sbPt: number; wrapped: TextRun[][]; lines: number; heightPt: number;
+    }
+    const measure = (at: number): BlockPart => {
+      const n = nodes[at];
+      const w = wrapForDrawing(
+        n.runs, CHARS_PER_LINE[n.typeName] || 62, UPPERCASE_TYPES.has(n.typeName),
+      );
+      const sb = spaceBeforePtOf(n);
+      return {
+        nodeIndex: at, sbPt: sb, wrapped: w, lines: w.length,
+        heightPt: sb + w.length * LINE_HEIGHT_PT,
+      };
+    };
+    const parts: BlockPart[] = [{
+      nodeIndex: i, sbPt: spaceBeforePt, wrapped: wrappedLines,
+      lines: wrappedLines.length, heightPt: totalHeightPt,
+    }];
+    /** Index in `parts` of the character name, when this block is a speech. */
+    let speechAt = -1;
 
-    if (typeName === 'character') {
-      isDialogueBlock = true;
-      dialogueBlockNodes = [i];
-      let j = i + 1;
-      // Never absorb an element that opens its own page — it has to be laid out
-      // separately so its forced break is honoured.
-      while (j < nodes.length && DIALOGUE_BLOCK_TYPES.has(nodes[j].typeName)
-             && !startsOwnPage({ type: nodes[j].typeName, attrs: nodes[j].attrs }, forceBreakIds)) {
-        const dNode = nodes[j];
-        const dMaxChars = CHARS_PER_LINE[dNode.typeName] || 36;
-        const dSb = (SPACE_BEFORE[dNode.typeName] ?? 0) * LINE_HEIGHT_PT;
-        const dLines = wordWrapRuns(dNode.runs, dMaxChars, UPPERCASE_TYPES.has(dNode.typeName));
-        dialogueBlockHeight += dSb + dLines.length * LINE_HEIGHT_PT;
-        dialogueBlockNodes.push(j);
+    // Never absorb an element that opens its own page — it has to be laid out
+    // separately so its forced break is honoured.
+    // ...and never one that is drawn by a pass of its own: it is not a run of
+    // text, so a block holding it would measure it as nothing and draw it as
+    // nothing. See laysItselfOut.
+    const absorbable = (at: number) => at < nodes.length
+      && !startsOwnPage({ type: nodes[at].typeName, attrs: nodes[at].attrs }, forceBreakIds, { lockedPages: true })
+      && !laysItselfOut(nodes[at].typeName);
+
+    if (typeName === 'character' && i + 1 < nodes.length) {
+      speechAt = 0;
+    } else if (typeName === 'sceneHeading' && absorbable(i + 1)) {
+      parts.push(measure(i + 1));
+      if (nodes[i + 1].typeName === 'character' && i + 2 < nodes.length) speechAt = 1;
+    }
+
+    if (speechAt >= 0) {
+      let j = parts[speechAt].nodeIndex + 1;
+      while (j < nodes.length && DIALOGUE_BLOCK_TYPES.has(nodes[j].typeName) && absorbable(j)) {
+        parts.push(measure(j));
         j++;
       }
+      // Nothing was said after all — there is no speech to split.
+      if (parts.length - 1 === speechAt) speechAt = -1;
     }
 
-    // Scene heading: try to keep with the next element
-    let keepWithNext = false;
-    let nextElementHeight = 0;
-    if (typeName === 'sceneHeading' && i + 1 < nodes.length
-        && !startsOwnPage({ type: nodes[i + 1].typeName, attrs: nodes[i + 1].attrs }, forceBreakIds)) {
-      keepWithNext = true;
-      const nNode = nodes[i + 1];
-      const nMaxChars = CHARS_PER_LINE[nNode.typeName] || 62;
-      const nSb = (SPACE_BEFORE[nNode.typeName] ?? 0) * LINE_HEIGHT_PT;
-      const nLines = wordWrapRuns(nNode.runs, nMaxChars, UPPERCASE_TYPES.has(nNode.typeName));
-      nextElementHeight = nSb + nLines.length * LINE_HEIGHT_PT;
-    }
+    const blockHeightPt = parts.reduce((h, p) => h + p.heightPt, 0);
 
-    // Determine if we need a page break
-    const projectedY = currentY + spaceBeforePt + elementHeightPt;
+    /** Draw one measured part of the block at the cursor. */
+    const drawPart = (part: BlockPart, withSpaceBefore = true): void => {
+      const dNode = nodes[part.nodeIndex];
+      const dIndents = FD_INDENTS[dNode.typeName] || FD_INDENTS.general;
+      if (withSpaceBefore) currentY += part.sbPt;
+      renderElement(
+        pdf, part.wrapped, dIndents[0] * PTS_PER_INCH, dIndents[1] * PTS_PER_INCH,
+        currentY, dNode.typeName, fonts, revisionMarkX,
+      );
+      const partNumber = elementNumberOf(dNode);
+      if (partNumber) drawElementNumber(pdf, partNumber, dIndents[0] * PTS_PER_INCH, currentY, fonts);
+      currentY += part.lines * LINE_HEIGHT_PT;
+    };
+
+    /**
+     * Where to break a speech that will not fit — the index of the last part
+     * staying on this page, or -1 to move the whole block down.
+     *
+     * This is the rule `computeBreaks` paginates the editor with, and it has to
+     * stay that rule: any other answer puts the (MORE) on a different line on
+     * screen than in the file (issue #123). Final Draft keeps at least two
+     * lines of dialogue on each side of the turn, so the page is filled as far
+     * as it will go and then backed off a paragraph at a time until what is
+     * carried over is worth carrying.
+     */
+    const chooseDialogueSplit = (): number => {
+      const MIN_DIALOGUE_LINES = 2;
+      const remaining = bottomPt() - currentY;
+      // The name, and the scene heading above it when one introduces the
+      // speech: nothing down to there can be divided.
+      let headPt = 0;
+      for (let p = 0; p <= speechAt; p++) headPt += parts[p].heightPt;
+      if (remaining < headPt + MIN_DIALOGUE_LINES * LINE_HEIGHT_PT) return -1;
+      /** Dialogue lines left in the speech after a break following part `p`. */
+      const linesAfter = (p: number): number => {
+        let n = 0;
+        for (let q = p + 1; q < parts.length; q++) n += parts[q].lines;
+        return n;
+      };
+      let fittedPt = headPt;
+      let fittedLines = 0;
+      let chosen = -1;
+      for (let p = speechAt + 1; p < parts.length; p++) {
+        if (fittedPt + parts[p].heightPt > remaining) break;
+        fittedPt += parts[p].heightPt;
+        fittedLines += parts[p].lines;
+        // The fullest boundary that satisfies both sides wins; a fuller one
+        // that would leave a single line behind is passed over for it.
+        if (fittedLines >= MIN_DIALOGUE_LINES && linesAfter(p) >= MIN_DIALOGUE_LINES) chosen = p;
+      }
+      return chosen;
+    };
 
     if (forcedBreak) {
       // Template rule or manual "start on new page" flag — unconditional break.
-      newPage();
-    } else if (isDialogueBlock && currentY + dialogueBlockHeight > usableBottomPt && currentY > topMarginPt + LINE_HEIGHT_PT) {
-      // Try to split dialogue block across pages
-      const remaining = usableBottomPt - currentY;
+      breakForBlock();
+    } else if (currentY + blockHeightPt > bottomPt() && currentY > topMarginPt) {
+      const splitAfter = speechAt >= 0 ? chooseDialogueSplit() : -1;
 
-      // Can we fit at least the character name + 2 lines of dialogue?
-      const charHeight = spaceBeforePt + elementHeightPt;
-      const MIN_DIALOGUE_LINES = 2;
-      const minSplitHeight = charHeight + MIN_DIALOGUE_LINES * LINE_HEIGHT_PT;
-
-      if (remaining >= minSplitHeight) {
-        // Render character name
-        currentY += spaceBeforePt;
-        renderElement(pdf, wrappedLines, leftPt, rightPt, currentY, typeName, charSpace, documentFont);
-        currentY += elementHeightPt;
+      if (splitAfter > 0) {
+        // The head, then the paragraphs that stay on this page.
+        for (let p = 0; p <= splitAfter; p++) drawPart(parts[p]);
         isFirstElement = false;
 
-        // Render as many dialogue/parenthetical nodes as fit
-        let dIdx = 1;
-
-        while (dIdx < dialogueBlockNodes.length) {
-          const dNodeIdx = dialogueBlockNodes[dIdx];
-          const dNode = nodes[dNodeIdx];
-          const dIndents = FD_INDENTS[dNode.typeName] || FD_INDENTS.general;
-          const dLeftPt = dIndents[0] * PTS_PER_INCH;
-          const dRightPt = dIndents[1] * PTS_PER_INCH;
-          const dMaxChars = CHARS_PER_LINE[dNode.typeName] || 36;
-          const dSb = (SPACE_BEFORE[dNode.typeName] ?? 0) * LINE_HEIGHT_PT;
-          const dWrapped = wordWrapRuns(dNode.runs, dMaxChars, UPPERCASE_TYPES.has(dNode.typeName));
-          const dHeight = dSb + dWrapped.length * LINE_HEIGHT_PT;
-
-          if (currentY + dHeight > usableBottomPt) {
-            break;
-          }
-
-          currentY += dSb;
-          renderElement(pdf, dWrapped, dLeftPt, dRightPt, currentY, dNode.typeName, charSpace, documentFont);
-          currentY += dWrapped.length * LINE_HEIGHT_PT;
-          dIdx++;
+        const charIndents = FD_INDENTS.character || FD_INDENTS.general;
+        const charLeftPt = charIndents[0] * PTS_PER_INCH;
+        const charName = nodes[parts[speechAt].nodeIndex].plainText.trim().toUpperCase();
+        if (mc.dialogueBreakContd && currentY + LINE_HEIGHT_PT <= bottomPt()) {
+          drawPlain(pdf, mc.moreText, charLeftPt, currentY + LINE_HEIGHT_PT, fonts);
         }
 
-        // Check if we still have dialogue nodes to render on next page
-        if (dIdx < dialogueBlockNodes.length) {
-          // Render (MORE) indicator
-          const moreIndents = FD_INDENTS.character || FD_INDENTS.general;
-          const moreLeftPt = moreIndents[0] * PTS_PER_INCH;
-          if (mc.dialogueBreakContd && currentY + LINE_HEIGHT_PT <= usableBottomPt) {
-            setFontStyle(pdf, false, false);
-            pdf.text(mc.moreText, moreLeftPt, currentY + LINE_HEIGHT_PT, { charSpace });
-          }
+        breakForBlock();
 
-          newPage();
+        /** Open the continued page: the CONT'D line costs a line only when it
+         *  is actually printed, which is how the editor counts it too. */
+        const openContinuation = () => {
+          if (!mc.dialogueBreakContd) return;
+          drawPlain(pdf, `${charName} ${mc.contdText}`, charLeftPt, currentY + LINE_HEIGHT_PT, fonts);
+          currentY += LINE_HEIGHT_PT;
+        };
+        openContinuation();
 
-          // Render CONT'D character name
-          const charName = node.plainText.trim().toUpperCase();
-          const contdIndents = FD_INDENTS.character || FD_INDENTS.general;
-          const contdLeftPt = contdIndents[0] * PTS_PER_INCH;
-          if (mc.dialogueBreakContd) {
-            setFontStyle(pdf, false, false);
-            pdf.text(`${charName} ${mc.contdText}`, contdLeftPt, currentY + LINE_HEIGHT_PT, { charSpace });
-            currentY += LINE_HEIGHT_PT;
-          }
-
-          // Render remaining dialogue nodes
-          while (dIdx < dialogueBlockNodes.length) {
-            const dNodeIdx = dialogueBlockNodes[dIdx];
-            const dNode = nodes[dNodeIdx];
-            const dIndents = FD_INDENTS[dNode.typeName] || FD_INDENTS.general;
-            const dLeftPt = dIndents[0] * PTS_PER_INCH;
-            const dRightPt = dIndents[1] * PTS_PER_INCH;
-            const dMaxChars = CHARS_PER_LINE[dNode.typeName] || 36;
-            const dSb = (SPACE_BEFORE[dNode.typeName] ?? 0) * LINE_HEIGHT_PT;
-            const dWrapped = wordWrapRuns(dNode.runs, dMaxChars, UPPERCASE_TYPES.has(dNode.typeName));
-            const dHeight = dSb + dWrapped.length * LINE_HEIGHT_PT;
-
-            // Check for another page break within continued dialogue
-            if (currentY + dHeight > usableBottomPt) {
-              if (mc.dialogueBreakContd && currentY + LINE_HEIGHT_PT <= usableBottomPt) {
-                setFontStyle(pdf, false, false);
-                pdf.text(mc.moreText, contdLeftPt, currentY + LINE_HEIGHT_PT, { charSpace });
-              }
-              newPage();
-              if (mc.dialogueBreakContd) {
-                setFontStyle(pdf, false, false);
-                pdf.text(`${charName} ${mc.contdText}`, contdLeftPt, currentY + LINE_HEIGHT_PT, { charSpace });
-                currentY += LINE_HEIGHT_PT;
-              }
+        let drawnHere = false;
+        for (let p = splitAfter + 1; p < parts.length; p++) {
+          // A speech longer than a whole page turns again, paragraph by
+          // paragraph, as `computeBreaks` turns it. The editor used to lay the
+          // whole remainder out in one run instead, so a monologue ran off the
+          // foot of the page on screen and the file put the rest elsewhere.
+          if (drawnHere && currentY + parts[p].heightPt > bottomPt()) {
+            if (mc.dialogueBreakContd && currentY + LINE_HEIGHT_PT <= bottomPt()) {
+              drawPlain(pdf, mc.moreText, charLeftPt, currentY + LINE_HEIGHT_PT, fonts);
             }
-
-            currentY += dSb;
-            renderElement(pdf, dWrapped, dLeftPt, dRightPt, currentY, dNode.typeName, charSpace, documentFont);
-            currentY += dWrapped.length * LINE_HEIGHT_PT;
-            dIdx++;
+            breakForBlock();
+            openContinuation();
+            drawnHere = false;
           }
+          // The first paragraph after a turn sits at the top of the page, with
+          // no space above it — as every element pushed to a new page does.
+          drawPart(parts[p], drawnHere);
+          drawnHere = true;
         }
 
-        // Skip past all dialogue block nodes
-        i = dialogueBlockNodes[dialogueBlockNodes.length - 1] + 1;
+        i = parts[parts.length - 1].nodeIndex + 1;
         continue;
-      } else {
-        // Not enough room to split — push entire block to next page
-        newPage();
       }
-    } else if (keepWithNext && projectedY + nextElementHeight > usableBottomPt && currentY > topMarginPt + LINE_HEIGHT_PT) {
-      // Scene heading won't fit with at least its next element — push to next page
-      newPage();
-    } else if (projectedY > usableBottomPt && currentY > topMarginPt + LINE_HEIGHT_PT) {
-      // Regular page break
-      newPage();
+      // Either it is not a speech, or no boundary leaves enough on both sides:
+      // the whole block moves down together.
+      breakForBlock();
     }
 
-    // Apply space before. An element that was forced onto its own page sits at
-    // the very top of it — matching the editor, which drops the space-before of
-    // any element pushed to a new page.
-    if (!isFirstElement && !forcedBreak) {
+    // Space before — unless the element has just landed at the top of a page.
+    // The editor drops it there: its page-break decoration sets the element's
+    // margin-top outright rather than adding to it, so on screen nothing ever
+    // stands above the first element of a page. Only a *forced* break used to
+    // be treated that way here, so every ordinary page turn started its page
+    // one or two lines lower in the file than on screen — and being a whole
+    // line, the error stayed for the rest of the page and moved its last
+    // element off it (issue #123).
+    if (!isFirstElement && currentY > topMarginPt) {
       currentY += spaceBeforePt;
     }
 
     // Render the element
-    renderElement(pdf, wrappedLines, leftPt, rightPt, currentY, typeName, charSpace, documentFont);
+    renderElement(pdf, wrappedLines, leftPt, rightPt, currentY, typeName, fonts, revisionMarkX);
+    const number = elementNumberOf(node);
+    if (number) drawElementNumber(pdf, number, leftPt, currentY, fonts);
 
     // Render scene numbers on both sides if enabled
     if (typeName === 'sceneHeading' && options?.sceneNumbersVisible && node.attrs?.sceneNumber) {
       const sceneNum = String(node.attrs.sceneNumber);
       const y = currentY + LINE_HEIGHT_PT; // baseline of first line
-      const numFace = pdfFontFor(documentFont);
-      setFontStyle(pdf, true, false, numFace); // bold like scene heading
       pdf.setFontSize(12);
-      const numSpace = numFace === 'courier' ? charSpace : 0;
       // Left side: just inside left margin
       const leftNumX = 1.0 * PTS_PER_INCH;
-      pdf.text(sceneNum, leftNumX, y, { charSpace: numSpace });
+      drawPlain(pdf, sceneNum, leftNumX, y, fonts, { bold: true });
       // Right side: near right margin, right-aligned
-      const numWidth = numFace === 'courier'
-        ? sceneNum.length * FD_CHAR_WIDTH_PT
-        : pdf.getTextWidth(sceneNum);
-      const rightNumX = 7.75 * PTS_PER_INCH - numWidth;
-      pdf.text(sceneNum, rightNumX, y, { charSpace: numSpace });
+      const rightNumX = 7.75 * PTS_PER_INCH
+        - measurePlain(pdf, sceneNum, fonts, { bold: true }); // bold like scene heading
+      drawPlain(pdf, sceneNum, rightNumX, y, fonts, { bold: true });
     }
 
     currentY += elementHeightPt;
     isFirstElement = false;
 
-    // If this is a dialogue block, render the rest of the block
-    if (isDialogueBlock && dialogueBlockNodes.length > 1) {
-      for (let dIdx = 1; dIdx < dialogueBlockNodes.length; dIdx++) {
-        const dNodeIdx = dialogueBlockNodes[dIdx];
-        const dNode = nodes[dNodeIdx];
-        const dIndents = FD_INDENTS[dNode.typeName] || FD_INDENTS.general;
-        const dLeftPt = dIndents[0] * PTS_PER_INCH;
-        const dRightPt = dIndents[1] * PTS_PER_INCH;
-        const dMaxChars = CHARS_PER_LINE[dNode.typeName] || 36;
-        const dSb = (SPACE_BEFORE[dNode.typeName] ?? 0) * LINE_HEIGHT_PT;
-        const dWrapped = wordWrapRuns(dNode.runs, dMaxChars, UPPERCASE_TYPES.has(dNode.typeName));
-
-        currentY += dSb;
-        renderElement(pdf, dWrapped, dLeftPt, dRightPt, currentY, dNode.typeName, charSpace, documentFont);
-        currentY += dWrapped.length * LINE_HEIGHT_PT;
-      }
-      i = dialogueBlockNodes[dialogueBlockNodes.length - 1] + 1;
+    // Whatever else the block holds — the speech under a character name, or
+    // the element a scene heading was kept with — follows it on this page.
+    if (parts.length > 1) {
+      for (let p = 1; p < parts.length; p++) drawPart(parts[p]);
+      i = parts[parts.length - 1].nodeIndex + 1;
       continue;
     }
 
     i++;
   }
 
-  // Final pass: render headers and footers on all pages (now that totalPages is known)
-  const totalPages = pageNumber;
-  const hContent = layout.headerContent || DEFAULT_HEADER_CONTENT;
-  const fContent = layout.footerContent || DEFAULT_FOOTER_CONTENT;
-  const hStart = layout.headerStartPage ?? 2;
-  const fStart = layout.footerStartPage ?? 1;
-  const docTitle = options?.documentTitle || title;
-  const revColor = options?.revisionColor || '';
+  // The last page has no break after it, so nothing has drawn its footnotes yet.
+  flushFootnotes();
 
-  for (let p = 1; p <= totalPages; p++) {
-    pdf.setPage(p);
+
+  // Endnote mode: the notes collect on their own sheets at the end of the
+  // script, packed by the same helper the editor draws from, so the two agree
+  // on how many sheets there are and what is on each.
+  // Whatever the script ran out of room to continue finishes on the sheets at
+  // the end, exactly as the editor lays it out.
+  if (plan && (plan.endnoteEntries.length > 0 || pendingSlices.length > 0)) {
+    const endnoteLeftPt = FD_INDENTS.action[0] * PTS_PER_INCH;
+    const endnoteRightPt = FD_INDENTS.action[1] * PTS_PER_INCH;
+    for (const page of buildEndnotePages(plan.endnoteEntries, linesPerPage, pendingSlices)) {
+      pdf.addPage([pageWidthPt, pageHeightPt]);
+      pageNumber++;
+      let y = topMarginPt + LINE_HEIGHT_PT;
+      if (page.hasHeading) {
+        const heading = 'NOTES';
+        const x = (endnoteLeftPt + endnoteRightPt) / 2 - measurePlain(pdf, heading, fonts) / 2;
+        drawPlain(pdf, heading, x, y, fonts, {});
+        y += ENDNOTE_HEADING_LINES * LINE_HEIGHT_PT;
+      }
+      for (const slice of page.slices) {
+        const entry = plan.entryById.get(slice.noteId);
+        if (!entry) continue;
+        const lines = noteLines(entry, slice.isStart ? entry.entryLabel : null);
+        // Only this slice's share of the note; the rest is on the next sheet.
+        for (const line of lines.slice(slice.fromLine, slice.fromLine + slice.lines)) {
+          renderLine(pdf, line, endnoteLeftPt, y, fonts);
+          y += LINE_HEIGHT_PT;
+        }
+      }
+    }
+  }
+
+  // Final pass: render headers and footers on all pages (now that totalPages is known)
+  //
+  // A title page is not a script page. It carries no number and does not count
+  // towards `{pages}`, which is how the editor's page count and every other
+  // exporter treat it — but this loop used the physical sheet index for both,
+  // so a script with a title page printed "2." on its own first page and
+  // reported one page more than the editor did.
+  const titleSheets = hasTitlePage ? 1 : 0;
+  const totalSheets = pageNumber;
+  const scriptPages = Math.max(1, totalSheets - titleSheets);
+  // Printed numbers, not sheet indices: the starting-number offset shifts every
+  // page, so `{pages}` has to be the number on the LAST page for "{page} of
+  // {pages}" to stay coherent.
+  const totalPages = printedPageNumber(scriptPages, hf.startingPageNumber);
+  const hStart = hf.headerStartPage;
+  const fStart = hf.footerStartPage;
+
+  const labels = options?.pageLabels ?? null;
+  for (let sheet = 1; sheet <= totalSheets; sheet++) {
+    if (sheet <= titleSheets) continue; // the title page is never numbered
+    const p = printedPageNumber(sheet - titleSheets, hf.startingPageNumber);
+    // A locked page prints its label ("12A"); the start-page rules still go by
+    // where the page falls.
+    const label = labels?.[sheet - titleSheets - 1] || p;
+    pdf.setPage(sheet);
     // Header
     if (p >= hStart && (hContent.left || hContent.center || hContent.right)) {
       const headerY = layout.headerMargin + 12;
-      renderHFLine(pdf, hContent, p, totalPages, docTitle, revColor, headerY, layout, charSpace, documentFont);
+      renderHFLine(pdf, hContent, label, totalPages, docTitle, revColor, headerY, layout, fonts);
     }
     // Footer
     if (p >= fStart && (fContent.left || fContent.center || fContent.right)) {
       const footerY = pageHeightPt - layout.footerMargin;
-      renderHFLine(pdf, fContent, p, totalPages, docTitle, revColor, footerY, layout, charSpace, documentFont);
+      renderHFLine(pdf, fContent, label, totalPages, docTitle, revColor, footerY, layout, fonts);
     }
   }
 
-  await saveFile(new Uint8Array(pdf.output('arraybuffer')), filename, [{ name: 'PDF', extensions: ['pdf'] }]);
+  if (options?.colorRevisedPages) {
+    for (const [sheet, color] of sheetRevisions) {
+      if (sheet <= titleSheets) continue;
+      const paper = revisionPaper(color);
+      if (paper) tintPage(pdf, sheet, paper, pageWidthPt, pageHeightPt);
+    }
+  }
+
+  if (options?.revisedPagesOnly) {
+    const keep = new Set([...sheetRevisions.keys()].filter((sheet) => sheet > titleSheets));
+    if (keep.size === 0) {
+      throw new Error('This script has no revised pages. Revision marks are added while Revision Mode is on.');
+    }
+    // Back to front, so deleting a sheet does not renumber the ones still to go.
+    for (let sheet = totalSheets; sheet >= 1; sheet--) {
+      if (!keep.has(sheet)) pdf.deletePage(sheet);
+    }
+  }
+
+  return {
+    bytes: new Uint8Array(pdf.output('arraybuffer')),
+    filename,
+    warning: fallbackWarning(fonts.fallbacks),
+  };
+}
+
+/**
+ * Render the script and put it somewhere the writer chose.
+ *
+ * Returns whatever the writer needs telling about the file, or nothing — see
+ * `RenderedPDF.warning`.
+ */
+export async function exportPDF(
+  doc: JSONContent, title: string, layout: PageLayout, options?: PDFExportOptions,
+): Promise<string | undefined> {
+  const { saveFile } = await import('./fileOps');
+  const { bytes, filename, warning } = await renderPDF(doc, title, layout, options);
+  await saveFile(bytes, filename, [{ name: 'PDF', extensions: ['pdf'] }]);
+  return warning;
 }
 
 // --- Render helpers ---
@@ -683,44 +1519,38 @@ export async function exportPDF(doc: JSONContent, title: string, layout: PageLay
 function renderHFLine(
   pdf: jsPDF,
   content: HeaderFooterContent,
-  pageNum: number,
+  pageNum: number | string,
   totalPages: number,
   title: string,
   revisionColor: string,
   y: number,
   layout: PageLayout,
-  charSpace: number,
-  documentFont?: string,
+  fonts: FontContext,
 ): void {
   const leftMarginPt = layout.leftMargin * PTS_PER_INCH;
   const rightMarginPt = (layout.pageWidth - layout.rightMargin) * PTS_PER_INCH;
   const centerPt = (leftMarginPt + rightMarginPt) / 2;
 
-  // Page furniture is set in the script's own face, as Final Draft does.
-  const face = pdfFontFor(documentFont);
-  const hfSpace = face === 'courier' ? charSpace : 0;
-  const widthOf = (text: string) =>
-    face === 'courier' ? text.length * FD_CHAR_WIDTH_PT : pdf.getTextWidth(text);
-
-  setFontStyle(pdf, false, false, face);
+  // Page furniture is set in the script's own face, as Final Draft does — or
+  // in the fallback, when a Cyrillic title reaches the header.
   pdf.setFontSize(12);
 
   // Left
   const leftText = resolveFields(content.left, pageNum, totalPages, title, revisionColor);
   if (leftText) {
-    pdf.text(leftText, leftMarginPt, y, { charSpace: hfSpace });
+    drawPlain(pdf, leftText, leftMarginPt, y, fonts);
   }
 
   // Center
   const centerText = resolveFields(content.center, pageNum, totalPages, title, revisionColor);
   if (centerText) {
-    pdf.text(centerText, centerPt - widthOf(centerText) / 2, y, { charSpace: hfSpace });
+    drawPlain(pdf, centerText, centerPt - measurePlain(pdf, centerText, fonts) / 2, y, fonts);
   }
 
   // Right
   const rightText = resolveFields(content.right, pageNum, totalPages, title, revisionColor);
   if (rightText) {
-    pdf.text(rightText, rightMarginPt - widthOf(rightText), y, { charSpace: hfSpace });
+    drawPlain(pdf, rightText, rightMarginPt - measurePlain(pdf, rightText, fonts), y, fonts);
   }
 }
 
@@ -732,8 +1562,9 @@ function renderElement(
   rightPt: number,
   startY: number,
   typeName: string,
-  charSpace: number,
-  documentFont?: string,
+  fonts: FontContext,
+  /** Where to draw a revised line's margin mark; null draws none. */
+  revisionMarkX: RevisionMarker | null = null,
 ): void {
   const isCentered = CENTERED_TYPES.has(typeName);
   const isRightAligned = RIGHT_ALIGNED_TYPES.has(typeName);
@@ -744,21 +1575,58 @@ function renderElement(
     const y = startY + (lineIdx + 1) * LINE_HEIGHT_PT; // +1 because jsPDF text baseline
 
     if (isCentered) {
-      const totalWidth = measureLine(pdf, lineRuns, documentFont);
+      const totalWidth = measureLine(pdf, lineRuns, fonts);
       const centerX = leftPt + (maxWidthPt - totalWidth) / 2;
-      renderLine(pdf, lineRuns, centerX, y, charSpace, documentFont);
+      renderLine(pdf, lineRuns, centerX, y, fonts);
     } else if (isRightAligned) {
-      const totalWidth = measureLine(pdf, lineRuns, documentFont);
+      const totalWidth = measureLine(pdf, lineRuns, fonts);
       const rightX = rightPt - totalWidth;
-      renderLine(pdf, lineRuns, rightX, y, charSpace, documentFont);
+      renderLine(pdf, lineRuns, rightX, y, fonts);
     } else {
-      renderLine(pdf, lineRuns, leftPt, y, charSpace, documentFont);
+      renderLine(pdf, lineRuns, leftPt, y, fonts);
     }
+    drawRevisionMark(pdf, lineRuns, y, fonts, revisionMarkX);
   }
 }
 
-function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_\- ]/g, '') || 'Untitled';
+/** Where and how revised lines are marked, and who hears about each mark. */
+interface RevisionMarker {
+  /** The mark's x position, in the right margin. */
+  x: number;
+  settings: RevisionSettings | null;
+  /** Called for every mark drawn, with the line's revision colour. */
+  onMark: (color: string) => void;
+}
+
+/** The margin mark beside one line, when the line holds revised text. */
+function drawRevisionMark(
+  pdf: jsPDF, line: TextRun[], y: number, fonts: FontContext, marker: RevisionMarker | null,
+): void {
+  if (!marker) return;
+  const color = lineRevision(line);
+  if (color === null) return;
+  drawPlain(pdf, revisionMarkFor(marker.settings, color), marker.x, y, fonts, { bold: true });
+  marker.onMark(color);
+}
+
+/**
+ * Lay a revision's paper colour under everything already on a sheet.
+ *
+ * jsPDF draws in order and has no blend modes, so the tint goes in at the
+ * front of the sheet's content stream — painted first, beneath the text —
+ * rather than being drawn over it. `q`/`Q` keep its fill colour from leaking
+ * into what follows.
+ */
+function tintPage(pdf: jsPDF, sheet: number, hex: string, widthPt: number, heightPt: number): void {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  const pages = (pdf as unknown as { internal: { pages?: unknown[] } }).internal.pages;
+  const stream = pages?.[sheet];
+  if (!m || !Array.isArray(stream)) {
+    console.warn(`[pdf] could not colour page ${sheet}: unexpected page structure`);
+    return;
+  }
+  const [r, g, b] = [m[1], m[2], m[3]].map((h) => (parseInt(h, 16) / 255).toFixed(3));
+  stream.unshift(`q ${r} ${g} ${b} rg 0 0 ${widthPt.toFixed(2)} ${heightPt.toFixed(2)} re f Q`);
 }
 
 // Convenience download function matching the pattern of other exporters

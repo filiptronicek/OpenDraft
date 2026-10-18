@@ -1,9 +1,12 @@
+import type { JSONContent } from '@tiptap/react';
 import React, { useMemo } from 'react';
 import { useEditorStore, ELEMENT_LABELS, type BuiltInElementType } from '../stores/editorStore';
 import { useProjectStore } from '../stores/projectStore';
+import { useLinkedFileStore } from '../stores/linkedFileStore';
 import { useFormattingTemplateStore } from '../stores/formattingTemplateStore';
-import { computeSceneTiming, formatRuntime } from '../utils/scriptTiming';
+import { activeTimingOptions, computeSceneTiming, formatRuntime } from '../utils/scriptTiming';
 import { computeScriptStructure } from '../utils/scriptStructure';
+import { DEFAULT_PACING, pacingOption } from '../utils/scriptProfile';
 
 const SAVE_STATUS_DISPLAY: Record<string, { label: string; className: string }> = {
   idle: { label: '', className: '' },
@@ -27,10 +30,37 @@ const StatusBar: React.FC<StatusBarProps> = ({ editorDoc = null }) => {
     documentTitle,
     saveStatus,
     documentOrigin,
+    pageLabels,
+    pageLayout,
+    sceneHeadingSpaceBefore,
+    scriptProfile,
+    setScriptProfileOpen,
   } = useEditorStore();
+  // Locked pages read by their label ("Page 12A"), which is what the writer
+  // will be asked for by the production.
+  const currentLabel = pageLabels?.[currentPage - 1];
 
-  const { currentProject } = useProjectStore();
+  const { currentProject, currentScriptId } = useProjectStore();
+  // The file on disk a library script also saves to (issue #135), and whether
+  // the last save reached it.
+  const openScriptFile = useLinkedFileStore((s) => s.openScriptFile);
+  const linkedStatus = useLinkedFileStore((s) => (currentScriptId ? s.byScript[currentScriptId] : undefined));
+  const linkedPath = openScriptFile && openScriptFile.scriptId === currentScriptId
+    ? (linkedStatus?.path || openScriptFile.path)
+    : null;
+  const linkedName = linkedPath ? linkedPath.split(/[/\\]/).pop() || linkedPath : '';
+  const linkedProblem =
+    linkedStatus?.state === 'pending' && linkedStatus.error ? 'not saved to file'
+    : linkedStatus?.state === 'missing' ? 'file not found'
+    : linkedStatus?.state === 'conflict' ? 'changed outside OpenDraft'
+    : '';
+  const retryLinkedFile = () => {
+    void import('../services/linkedFiles')
+      .then((lf) => lf.retryPendingWrites())
+      .catch((err) => console.error('[linked-files] retry failed:', err));
+  };
   const getActiveTemplate = useFormattingTemplateStore((s) => s.getActiveTemplate);
+  const activeTemplateId = useFormattingTemplateStore((s) => s.activeTemplateId);
 
   const saveDisplay = SAVE_STATUS_DISPLAY[saveStatus] || SAVE_STATUS_DISPLAY.idle;
 
@@ -48,12 +78,17 @@ const StatusBar: React.FC<StatusBarProps> = ({ editorDoc = null }) => {
   const estimatedRuntime = useMemo(() => {
     if (!editorDoc) return '';
     try {
-      const result = computeSceneTiming(editorDoc as any);
+      const result = computeSceneTiming(editorDoc as JSONContent, activeTimingOptions(pageLayout));
       return result.totalSeconds > 0 ? formatRuntime(result.totalSeconds) : '';
-    } catch {
+    } catch (err) {
+      console.warn('[StatusBar] runtime estimate failed', err);
       return '';
     }
-  }, [editorDoc]);
+    // The estimate is measured against the page — its size, the template's
+    // spacing and page time — so any of those changing re-measures it. The
+    // template and spacing are read from their stores, hence the lint pragma.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorDoc, pageLayout, sceneHeadingSpaceBefore, activeTemplateId, scriptProfile.pacing]);
 
   const currentAct = useMemo(() => {
     if (!editorDoc) return '';
@@ -89,6 +124,21 @@ const StatusBar: React.FC<StatusBarProps> = ({ editorDoc = null }) => {
             </span>
           </>
         )}
+        {linkedPath && (
+          <>
+            <span className="status-sep">&middot;</span>
+            <span
+              className={`status-item status-origin${linkedProblem ? ' status-save-error' : ''}`}
+              title={linkedProblem
+                ? `${linkedPath}\n${linkedStatus?.error || linkedProblem}${linkedStatus?.state === 'pending' ? '\nClick to try again.' : ''}`
+                : `Every save also writes ${linkedPath}`}
+              onClick={linkedStatus?.state === 'pending' ? retryLinkedFile : undefined}
+              style={linkedStatus?.state === 'pending' ? { cursor: 'pointer' } : undefined}
+            >
+              {linkedName}{linkedProblem ? ` — ${linkedProblem}` : ''}
+            </span>
+          </>
+        )}
         {saveDisplay.label && (
           <>
             <span className="status-sep">&middot;</span>
@@ -108,9 +158,17 @@ const StatusBar: React.FC<StatusBarProps> = ({ editorDoc = null }) => {
           </span>
         )}
         {estimatedRuntime && (
-          <span className="status-item status-timing" title="Estimated runtime">
+          <button
+            type="button"
+            className="status-item status-timing"
+            title={`Estimated runtime at ${pacingOption(scriptProfile.pacing).label.toLowerCase()} pacing — click to set genre & pacing`}
+            onClick={() => setScriptProfileOpen(true)}
+          >
             Est. {estimatedRuntime}
-          </span>
+            {scriptProfile.pacing !== DEFAULT_PACING && (
+              <span className="status-timing-pacing"> · {pacingOption(scriptProfile.pacing).label.toLowerCase()}</span>
+            )}
+          </button>
         )}
         {revisionMode && (
           <span className="status-item status-revision">
@@ -118,7 +176,9 @@ const StatusBar: React.FC<StatusBarProps> = ({ editorDoc = null }) => {
           </span>
         )}
         <span className="status-item status-page">
-          Page {currentPage} of {pageCount}
+          {currentLabel
+            ? <>Page {currentLabel} <span className="status-locked" title="Pages are locked">(locked)</span></>
+            : <>Page {currentPage} of {pageCount}</>}
         </span>
       </div>
     </div>
