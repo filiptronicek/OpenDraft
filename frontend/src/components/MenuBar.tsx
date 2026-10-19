@@ -197,6 +197,7 @@ import {
   FaUnlock,
   FaSlidersH,
   FaBan,
+  FaMobileAlt,
 } from 'react-icons/fa';
 import { REVISION_COLORS, nextRevisionColor } from '../editor/revisionColors';
 import RevisionSettingsDialog from './RevisionSettingsDialog';
@@ -326,6 +327,8 @@ const MenuBar: React.FC<MenuBarProps> = ({
     setAppearance,
     toolbarMode,
     setToolbarMode,
+    viewLayout,
+    setViewLayout,
     zoomLevel,
     setZoomLevel,
     navPanelWidth,
@@ -2801,6 +2804,13 @@ const MenuBar: React.FC<MenuBarProps> = ({
             { icon: <FaHighlighter />, label: tagsVisible ? '\u2713 Tag Highlights' : 'Tag Highlights', action: () => setTagsVisible(!tagsVisible) },
           ],
         },
+        {
+          icon: <FaMobileAlt />, label: 'Layout',
+          children: [
+            { icon: <FaRegFileAlt />, label: viewLayout === 'page' ? '\u2713 Page' : 'Page', action: () => setViewLayout('page') },
+            { icon: <FaMobileAlt />, label: viewLayout === 'phone' ? '\u2713 Phone' : 'Phone', action: () => setViewLayout('phone') },
+          ],
+        },
         { separator: true, label: '' },
         {
           icon: <FaAdjust />, label: 'Theme',
@@ -3519,12 +3529,27 @@ const MenuBar: React.FC<MenuBarProps> = ({
           <div className="dialog-header">About Open Draft</div>
           <div className="dialog-body about-body">
             <div className="about-title">Open Draft</div>
-            <div className="about-version">Version 2.5.4</div>
+            <div className="about-version">Version 2.7.0</div>
             <div className="about-tagline">Free, open-source screenwriting software</div>
 
             <div className="about-whats-new">
-              <div className="about-section-title">What's New in 2.5.4</div>
+              <div className="about-section-title">What's New in 2.7.0</div>
               <div className="about-changelog">
+              <div className="about-subsection-title">v2.7.0</div>
+              <ul className="about-list">
+                <li><strong>Phone View</strong> &mdash; Phones now open in <em>Phone View</em> instead of a whole page shrunk to fit the screen: the text runs the width of the screen at full size, indents are narrowed to fit, character names are centred, and each page break is a thin line marked <em>Page 2</em>, <em>Page 3</em>&hellip;. Pages break on exactly the same lines as on paper, so the page count, print and every export are unchanged. Pinch to change the text size &mdash; the lines rewrap instead of running off the side. <em>View &rarr; Layout</em> switches between <em>Phone</em> and the real <em>Page</em>. Android and iPhone, app and mobile browser alike.</li>
+                <li><strong>Built For Fingers On A Phone</strong> &mdash; Full-size toolbar buttons on a phone, an element pulldown wide enough to read, and Search and Go To in the <em>&#8942;</em> menu to make room &mdash; on the narrowest phones Notes and Tags join them, so the zoom button always fits. The page count in the status bar no longer gets pushed off the edge.</li>
+                <li><strong>iPhone Keyboard</strong> &mdash; The menu and toolbar now stay put when the keyboard opens, instead of sliding under the camera cut-out, and the line you tapped is scrolled into view above the keyboard.</li>
+                <li><strong>Also Fixed</strong> &mdash; Zoomed in past the width of the window, the left side of the page could not be scrolled to (#154).</li>
+              </ul>
+              <div className="about-subsection-title">v2.6.0</div>
+              <ul className="about-list">
+                <li><strong>Element Numbering</strong> &mdash; Number any element, not only scene headings: every line of dialogue, every sound effect, every shot. In the format editor, tick <em>Number this element</em>, then choose which elements restart the count, a prefix such as <em>FX</em>, the first number, and a plain (3) or scene-prefixed (12.3) style. The numbers sit in the left margin on screen, in print and in PDF, Word and Final Draft exports, and renumber themselves as you write. <em>Tools &rarr; Production &rarr; Show Element Numbers</em> hides them for a reading draft; <em>Element Numbering&hellip;</em> opens the formats. Fountain has no way to carry them.</li>
+                <li><strong>Podcast Format</strong> &mdash; A new built-in format for podcasts and audio drama, with numbering already on: every line of dialogue is numbered through the script, and sound effects and music cues count on their own as FX 1, FX 2&hellip; and MX 1, MX 2&hellip;.</li>
+                <li><strong>Collaborators Follow You Between Scripts</strong> &mdash; When the host opens another script during a session, guests are now taken to it &mdash; including guests who are not signed in, and guests who joined through an invite link for a different collaboration server than the one in their own Settings. A guest who cannot follow is told why and stays on the previous script. <em>End Session</em> now ends the session in every script it used, not just the open one, and guests are told at once that it has ended instead of showing <em>Reconnecting</em>.</li>
+                <li><strong>Staying Signed In</strong> &mdash; In the browser, and when signing in to collaborate, OpenDraft could sign you out after a quarter of an hour, when the server was busy, or when it was open in two tabs at once. It now renews your sign-in quietly; only a sign-in the server no longer accepts asks you to sign in again, and a passing connection problem asks you to try again instead.</li>
+                <li><strong>Also Fixed</strong> &mdash; Applying a copy of any built-in format other than Industry Standard left a blank window. The Scenes search box could draw over the Element pulldown&rsquo;s list, and over the toolbar&rsquo;s <em>&#8942;</em> menu; pulldown lists and toolbar menus now open on top.</li>
+              </ul>
               <div className="about-subsection-title">v2.5.4</div>
               <ul className="about-list">
                 <li><strong>Runtime To The Second</strong> &mdash; The <em>Est.</em> runtime in the status bar, Script Statistics, the Timing Report and the <em>Genre &amp; Pacing</em> previews now show minutes and seconds &mdash; <em>1h 47m 12s</em> rather than <em>1h 47m</em> &mdash; so a short film or a single scene no longer rounds to a whole minute. A scene just short of two minutes read <em>1:60</em> in the Timing Report; it now reads <em>2:00</em>.</li>
